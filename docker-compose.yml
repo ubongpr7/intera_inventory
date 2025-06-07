@@ -1,0 +1,51 @@
+services:
+  # redis:
+  #   image: redis:latest
+  #   ports:
+  #     - "6379:6370"
+  #   volumes:
+  #     - redis_data:/data
+  #   networks:
+  #     - intera_network
+  #   restart: unless-stopped
+
+  web:
+    image: ubongpr7/inventoryv2:latest
+    env_file:
+      - .env
+    command: >
+      sh -c "
+        python manage.py makemigrations &&
+        python manage.py migrate &&
+        python manage.py runserver 0.0.0.0:8001
+      "
+    volumes:
+      - .:/app
+    ports:
+      - "8001:8001"
+    # depends_on:
+    #   - redis
+    # networks:
+    #   - intera_network
+    restart: unless-stopped
+
+#   celery:
+#     image: ubongpr7/inventoryv2:latest
+#     env_file:
+#       - .env
+#     command: celery -A core worker --loglevel=info --pool=solo
+#     depends_on:
+#       - redis
+#       - web
+#     volumes:
+#       - .:/app
+#     networks:
+#       - intera_network
+#     restart: unless-stopped
+
+# volumes:
+#   redis_data:
+
+networks:
+  intera_network:
+

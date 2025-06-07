@@ -1,0 +1,45 @@
+<!-- templates/pdf/return_order.html -->
+<!DOCTYPE html>
+<html>
+<head>
+    <style>
+        /* Similar to purchase order template with return-specific styling */
+        .return-header { border-color: #ff4444; }
+    </style>
+</head>
+<body>
+    <div class="header return-header">
+        <h1>Return Order #{{ return_order.reference }}</h1>
+        <p>Original PO: {{ return_order.purchase_order.reference }}</p>
+        <p>Return Date: {{ return_order.created_at|date:"M d, Y" }}</p>
+    </div>
+    
+    <div class="return-reason">
+        <h3>Return Reason:</h3>
+        <p>{{ return_order.return_reason }}</p>
+    </div>
+    
+    <table>
+        <thead>
+            <tr>
+                <th>Item</th>
+                <th>Quantity Returned</th>
+                <th>Reason</th>
+                <th>Unit Price</th>
+                <th>Total</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for item in line_items %}
+            <tr>
+                <td>{{ item.original_line_item.stock_item_name }}</td>
+                <td>{{ item.quantity_returned }}</td>
+                <td>{{ item.return_reason }}</td>
+                <td>{{ item.unit_price }}</td>
+                <td>{{ item.total_price }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</body>
+</html>

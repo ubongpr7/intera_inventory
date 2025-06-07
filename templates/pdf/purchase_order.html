@@ -1,0 +1,274 @@
+{% load math_filters %}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Purchase Order - {{ po.reference }}</title>
+    <style>
+        @page {
+            size: A4 landscape;
+            margin: 1cm;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 0;
+            padding: 0 1cm;
+            color: #333;
+            font-size: 12px;
+            line-height: 1.4;
+        }
+
+        header {
+            border-bottom: 2px solid #4CAF50;
+            padding-bottom: 1rem;
+            margin-bottom: 1.5rem;
+        }
+
+        h1 {
+            color: #4CAF50;
+            font-size: 24px;
+            margin: 0 0 0.5rem 0;
+        }
+
+        .header-info {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 1rem;
+        }
+
+        .company-info {
+            margin-bottom: 2rem;
+        }
+
+        .grid-container {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 2rem;
+            margin-bottom: 2rem;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 1rem 0;
+            table-layout: fixed;
+        }
+
+        th, td {
+            border: 1px solid #ddd;
+            padding: 8px;
+            word-wrap: break-word;
+            vertical-align: top;
+        }
+
+        th {
+            background-color: #f8f9fa;
+            font-weight: 600;
+        }
+
+        .totals-table {
+            width: 50%;
+            margin-left: auto;
+            margin-top: 1.5rem;
+        }
+
+        .footer {
+            margin-top: 2rem;
+            padding-top: 1rem;
+            border-top: 1px solid #eee;
+            font-size: 0.9rem;
+            color: #666;
+            text-align: center;
+        }
+
+        /* Column Widths */
+        .col-1 { width: 2%; }
+        .col-2 { width: 10%; }
+        .col-3 { width: 10%; }
+        .col-4 { width: 10%; }
+        .col-5 { width: 10%; }
+        .col-6 { width: 10%; }
+        .col-7 { width: 12%; }
+        .col-8 { width: 22%; }
+        .page-break {
+        page-break-before: always;
+        break-before: page;
+        margin-top: 2rem;
+    }
+    
+    .keep-together {
+        page-break-inside: avoid;
+    }
+    </style>
+</head>
+<body>
+
+<header>
+    <div class="header-info">
+        <div class="company-info">
+            <h1>{{ company_profile.name }}</h1>
+            {% if company_profile.headquarters_address %}
+            {% with addr=company_profile.headquarters_address %}
+            {% if addr.apartment_number %}
+                Apt. {{ addr.apartment_number }}<br>
+            {% endif %}
+            {% if addr.street_number %}
+                {{ addr.street_number }},
+            {% endif %}
+            {{ addr.street }}<br>
+            {{ addr.city }},  {{ addr.subregion }}, {{ addr.state }} {{ addr.postal_code }}<br>
+            {{ addr.country }}
+            {% endwith %}
+            
+            {% endif %}
+        </div>
+        
+        <div>
+            <h1>PURCHASE ORDER</h1>
+            <p><strong>PO Number:</strong> {{ po.reference }}</p>
+            <p><strong>Date Issued:</strong> {{ po.issue_date|date:"M d, Y" }}</p>
+            {% if po.delivery_date %}
+                <p><strong>Delivery Date:</strong> {{ po.delivery_date|date:"M d, Y" }}</p>
+            {% endif %}
+        </div>
+    </div>
+</header>
+
+<div class="grid-container">
+    <div>
+        <h3>Supplier Information</h3>
+        <p>
+            {{ po.supplier.name }}<br>
+            {% if po.supplier.address %}
+                {{ po.supplier.address.street }}<br>
+                {{ po.supplier.address.city }}, {{ po.supplier.address.state }}<br>
+                {{ po.supplier.address.country }}<br>
+            {% endif %}
+            {% if po.contact %}
+                Attn: {{ po.contact.name }}<br>
+                {{ po.contact.email }}
+            {% endif %}
+        </p>
+    </div>
+
+    <div>
+        <h3>Shipping Address</h3>
+        <p>
+            {% if po.delivery_address %}
+                {{ po.delivery_address|linebreaksbr }}
+            {% else %}
+                {% with addr=company_profile.headquarters_address %}
+                    {% if addr.apartment_number %}
+                        Apt. {{ addr.apartment_number }}<br>
+                    {% endif %}
+                    {% if addr.street_number %}
+                        {{ addr.street_number }},
+                    {% endif %}
+                    {{ addr.street }}<br>
+                    {{ addr.city }},  {{ addr.subregion }}, {{ addr.state }} {{ addr.postal_code }}<br>
+                    {{ addr.country }}
+                {% endwith %}
+            {% endif %}
+        </p>
+    </div>
+</div>
+
+<table>
+    <thead>
+        <tr>
+            <th class="col-1">#</th>
+            <th class="col-2">Item Code</th>
+            <th class="col-3">Qty</th>
+            <th class="col-4">Unit Price ({{po.supplier.currency.code}})</th>
+            <th class="col-5">Discount ({{po.supplier.currency.code}})</th>
+            <th class="col-6">Tax ({{po.supplier.currency.code}})</th>
+            <th class="col-7">Total ({{po.supplier.currency.code}})</th>
+            <!-- <th class="col-2">Packaging</th> -->
+            <th class="col-8">Description</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for item in line_items %}
+        <tr>
+            <td>{{ forloop.counter }}</td>
+            <td>{{ item.stock_item.name|default:"N/A" }}</td>
+            <td>{{ item.quantity }} {{item.stock_item.variant.product.unit.abbreviated_name}}</td>
+            <td>{{ item.unit_price }}</td>
+            <td>{{ item.discount }}</td>
+            <td>{{ item.tax_amount }}</td>
+            <td>{{ item.total_price }}</td>
+            <!-- <td>{{ item.stock_item.packaging }}</td> -->
+            <td>{{ item.stock_item.description|truncatechars:100 }}</td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+
+<table class="totals-table">
+    <tr>
+        <td><strong>Subtotal:</strong></td>
+        <td>{{po.supplier.currency.code}} {{ po.total_price|add:discount|sub:tax }}</td>
+    </tr>
+    <tr>
+        <td><strong>Total Discount:</strong></td>
+        <td>{{po.supplier.currency.code}} {{ discount }}</td>
+    </tr>
+    <tr>
+        <td><strong>Total Tax:</strong></td>
+        <td>{{po.supplier.currency.code}} {{ tax }}</td>
+    </tr>
+    <tr>
+        <td><strong>Grand Total:</strong></td>
+        <td>{{po.supplier.currency.code}} {{ po.total_price }}</td>
+    </tr>
+</table>
+<!-- I want from this section of the code to appear on a new page in the pdf -->
+ <div class="page-break">
+
+<div class="terms">
+    <h3>Terms & Conditions</h3>
+    <ul>
+        <li>Goods must be delivered in original packaging</li>
+        <li>Invoice must reference PO {{ po.reference }}</li>
+        <li>5% penalty for late deliveries</li>
+        <li>Defective goods subject to return within 30 days</li>
+    </ul>
+</div>
+<p class="validity">
+    <strong>Order Valid Until:</strong> 
+    {{ po.issue_date|add_days:30|date:"M d, Y" }}
+</p>
+
+<div class="currency-notice">
+    <p>All amounts in {{ po.supplier.currency.code }} unless otherwise stated</p>
+</div>
+<div class="notes">
+    <h3>Special Instructions</h3>
+    <p>{{ po.notes|default:"No special instructions"|linebreaks }}</p>
+</div>
+<div class="tax-info">
+    <p>Withholding Tax Certificate: {{ company_profile.tax_id }}</p>
+</div>
+<div class="returns">
+    <h3>Return Policy</h3>
+    <p>
+        Defective items must be reported within 7 business days of receipt.<br>
+        <!-- Return shipping costs: {{ company_profile.return_shipping_responsibility }} -->
+    </p>
+</div>
+<div class="references">
+    <p>
+        <strong>Contract #:</strong> {{ po.responsible.first_name }} {{ po.responsible.email }}<br>
+        <strong>RFQ #:</strong> {{ po.reference|default:"N/A" }}
+    </p>
+</div>
+<div class="footer">
+    <p>{{ company_profile.name }} | {{ company_profile.phone }} | {{ company_profile.email }}</p>
+    <p>This is an automatically generated purchase order. Please contact us for any discrepancies.</p>
+</div>
+</div>
+
+
+</body>
+</html>
