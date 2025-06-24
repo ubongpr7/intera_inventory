@@ -13,6 +13,7 @@ services:
     image: ubongpr7/inventoryv2:latest
     env_file:
       - .env
+    container_name: inventory-service
     command: >
       sh -c "
         python manage.py makemigrations &&
@@ -25,8 +26,8 @@ services:
       - "8001:8001"
     # depends_on:
     #   - redis
-    # networks:
-    #   - intera_network
+    networks:
+      - microservice-net
     restart: unless-stopped
 
 #   celery:
@@ -47,5 +48,7 @@ services:
 #   redis_data:
 
 networks:
-  intera_network:
+  microservice-net:
+    external: true
+  
 

@@ -85,13 +85,6 @@ class Company(ProfileMixin):
         null=True,
     )
 
-    created_by = models.CharField(
-        max_length=255,
-        blank=True,
-        null=True,
-        verbose_name=_('Created By'),
-        help_text=_('User  ID of the creator'),
-    )
 
     def __str__(self):
         if self.created_by:

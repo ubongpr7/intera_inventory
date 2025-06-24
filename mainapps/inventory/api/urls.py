@@ -7,5 +7,7 @@ router.register(r'categories', InventoryCategoryViewSet, basename='inventory-cat
 router.register(r'inventories', InventoryViewSet, basename='inventory')
 
 urlpatterns = [
-    path('api/v1/', include(router.urls)),
+    path('', include(router.urls)),
+    path('units/', UnitListView.as_view(), name='unit-of-list'),
+
 ]

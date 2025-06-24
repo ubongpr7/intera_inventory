@@ -74,16 +74,16 @@ class PurchaseOrderViewSet(PermissionRequiredMixin, viewsets.ModelViewSet):
     
     def perform_create(self, serializer):
         """Set created_by and profile on creation"""
-        current_user = UserService.get_current_user(self.request)
+        current_user_id= self.request.user.id
         profile_id = self.request.headers.get('X-Profile-ID')
         
         extra_fields = {
             'status': PurchaseOrderStatus.PENDING,
         }
         
-        if current_user:
-            extra_fields['created_by'] = current_user.get('id')
-            extra_fields['responsible'] = current_user.get('id')
+        if current_user_id:
+            extra_fields['created_by'] = current_user_id
+            extra_fields['responsible'] = current_user_id
         if profile_id:
             extra_fields['profile_id'] = profile_id
             
@@ -97,12 +97,12 @@ class PurchaseOrderViewSet(PermissionRequiredMixin, viewsets.ModelViewSet):
     
     def perform_update(self, serializer):
         """Set modified_by on update and log changes"""
-        current_user = UserService.get_current_user(self.request)
+        current_user_id= self.request.user.id
         original_data = self.get_serializer(serializer.instance).data
         
         extra_fields = {}
-        if current_user:
-            extra_fields['modified_by'] = current_user.get('id')
+        if current_user_id:
+            extra_fields['modified_by'] = current_user_id
         
         instance = serializer.save(**extra_fields)
         
@@ -244,7 +244,7 @@ class PurchaseOrderViewSet(PermissionRequiredMixin, viewsets.ModelViewSet):
         
         with transaction.atomic():
             purchase_order.status = PurchaseOrderStatus.APPROVED
-            purchase_order.approved_by = current_user.get('id')
+            purchase_order.approved_by = current_user_id
             purchase_order.approved_at = timezone.now()
             purchase_order.save()
             
@@ -278,7 +278,7 @@ class PurchaseOrderViewSet(PermissionRequiredMixin, viewsets.ModelViewSet):
         with transaction.atomic():
             purchase_order.status = PurchaseOrderStatus.RECEIVED
             purchase_order.received_date = timezone.now()
-            purchase_order.received_by = current_user.get('id')
+            purchase_order.received_by = current_user_id
             purchase_order.save()
             
             # Log activity
@@ -357,7 +357,7 @@ class PurchaseOrderViewSet(PermissionRequiredMixin, viewsets.ModelViewSet):
                         item=stock_item,
                         tracking_type=10,  # RECEIVED
                         notes=f"Received {quantity_received} units from PO {purchase_order.reference}",
-                        user=current_user.get('id'),
+                        user=current_user_id,
                         deltas={
                             'quantity_received': float(quantity_received),
                             'purchase_price': float(line_item.unit_price),
@@ -375,7 +375,7 @@ class PurchaseOrderViewSet(PermissionRequiredMixin, viewsets.ModelViewSet):
                 if purchase_order.status == PurchaseOrderStatus.ISSUED:
                     purchase_order.status = PurchaseOrderStatus.RECEIVED
                     purchase_order.received_date = timezone.now()
-                    purchase_order.received_by = current_user.get('id')
+                    purchase_order.received_by = current_user_id
                     purchase_order.save()
                 
                 # Log activity
@@ -415,7 +415,7 @@ class PurchaseOrderViewSet(PermissionRequiredMixin, viewsets.ModelViewSet):
             with transaction.atomic():
                 purchase_order.status = PurchaseOrderStatus.COMPLETED
                 purchase_order.complete_date = timezone.now()
-                purchase_order.completed_by = current_user.get('id')
+                purchase_order.completed_by = current_user_id
                 purchase_order.save()
                 
                 # Create inventory transactions for audit
@@ -459,7 +459,7 @@ class PurchaseOrderViewSet(PermissionRequiredMixin, viewsets.ModelViewSet):
         
         with transaction.atomic():
             purchase_order.status = PurchaseOrderStatus.CANCELLED
-            purchase_order.cancelled_by = current_user.get('id')
+            purchase_order.cancelled_by = current_user_id
             purchase_order.cancelled_at = timezone.now()
             purchase_order.cancellation_reason = serializer.validated_data.get('notes', '')
             purchase_order.save()
@@ -507,8 +507,8 @@ class PurchaseOrderViewSet(PermissionRequiredMixin, viewsets.ModelViewSet):
                     address=purchase_order.address,
                     status=ReturnOrderStatus.PENDING,
                     return_reason=return_reason,
-                    created_by=current_user.get('id'),
-                    responsible=current_user.get('id')
+                    created_by=current_user_id,
+                    responsible=current_user_id
                 )
                 
                 # Create return line items
@@ -670,7 +670,7 @@ class PurchaseOrderViewSet(PermissionRequiredMixin, viewsets.ModelViewSet):
         purchase_order.total_price = int(total * 100)  # Store as cents
         purchase_order.save(update_fields=['total_price'])
     
-    def _create_inventory_transactions(self, purchase_order, current_user):
+    def _create_inventory_transactions(self, purchase_order, current_user_id):
         """Create inventory transaction records for audit"""
         transactions = []
         for line_item in purchase_order.line_items.all():
@@ -682,7 +682,7 @@ class PurchaseOrderViewSet(PermissionRequiredMixin, viewsets.ModelViewSet):
                         unit_price=line_item.unit_price,
                         transaction_type=TransactionType.PO_COMPLETE,
                         reference=purchase_order.reference,
-                        user=current_user.get('id'),
+                        user=current_user_id,
                         profile_id=purchase_order.profile_id,
                         notes=f"Completed from PO {purchase_order.reference}"
                     )
@@ -833,12 +833,12 @@ class PurchaseOrderViewSet(PermissionRequiredMixin, viewsets.ModelViewSet):
     def _log_activity(self, action, instance, details):
         """Log user activity for audit trail"""
         try:
-            current_user = UserService.get_current_user(self.request)
-            if current_user:
+            current_user_id= self.request.user.id
+            if current_user_id:
                 # Call activity logging service
                 # This would be implemented based on your activity logging requirements
                 logger.info(
-                    f"User {current_user.get('id')} performed {action} "
+                    f"User {current_user_id} performed {action} "
                     f"on PO {instance.reference}: {details}"
                 )
         except Exception as e:
@@ -927,7 +927,7 @@ class PurchaseOrderViewSet(PermissionRequiredMixin, viewsets.ModelViewSet):
                 purchase_order.total_price = int(total_price * 100)  # Store as cents
                 purchase_order.status = PurchaseOrderStatus.ISSUED
                 purchase_order.issue_date = timezone.now()
-                purchase_order.issued_by = current_user.get('id')
+                purchase_order.issued_by = current_user_id
                 purchase_order.save()
                 
                 # Send email notification if requested
@@ -1048,7 +1048,7 @@ class PurchaseOrderViewSet(PermissionRequiredMixin, viewsets.ModelViewSet):
             # Log activity
             current_user = UserService.get_current_user(request)
             self._log_activity('RESEND_EMAIL', purchase_order, {
-                'resent_by': current_user.get('full_name') if current_user else 'Unknown'
+                'resent_by': current_user.get('full_name') if current_user_id else 'Unknown'
             })
             
             return Response({

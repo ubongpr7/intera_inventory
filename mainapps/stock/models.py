@@ -125,13 +125,17 @@ class StockLocation(ProfileMixin, MPTTModel):
         verbose_name=_('Description'),
         help_text=_('Longer form description of the stock location (optional)'),
     )
-    
+    physical_address= models.CharField(max_length=255, null=True,blank=True)
     def __str__(self):
         return f"{self.name}- {self.code} ({self.location_type.name})" if self.location_type else self.name
     
     def save(self, *args, **kwargs):
         """Auto-generate location code on first save"""
-        if not self.pk and self.location_type and self.profile:
+        if self.parent and not self.physical_address:
+            self.physical_address =self.parent.physical_address
+            
+        if  self.location_type and self.profile and not self.code:
+            
             base = self.location_type.name.upper().replace(' ', '_')
             profile_id = self.profile
             
@@ -160,6 +164,7 @@ class StockItem(MPTTModel, InventoryMixin):
         verbose_name=_('Name'),
         help_text=_('Name of the stock item'),
     )
+    inventory = models.ForeignKey('inventory.Inventory', on_delete=models.CASCADE, null=True,related_name='stock_items')
     
     parent = TreeForeignKey(
         'self',
@@ -328,15 +333,38 @@ class StockItem(MPTTModel, InventoryMixin):
         """Return a string representation of the StockItem."""
         return f"{self.name} {self.serial or ''} - {self.quantity}"
     
-    def save(self, *args, **kwargs):
-        if not self.sku:
-            company_id = self.inventory.profile.id
-            inv_id = self.inventory.id
-            inv_type = self.inventory.inventory_type.name[:4].upper()
-            category_code = self.inventory.category.name[:5].upper()
+    @property
+    def quantity_w_unit(self):
+        return f'{self.quantity} {self.inventory.get_unit}'
 
-            count = StockItem.objects.filter(inventory=self.inventory).count() + 1
-            self.sku = f"C{company_id}-{inv_type}-{category_code}-{inv_id:05d}-{count:05d}"
+    def save(self, *args, **kwargs):
+        try:
+
+            if not self.location:
+                if self.parent:
+                    if self.parent.location:
+                        self.location=self.parent.location
+                elif self.inventory.category.default_location:
+                    self.location=self.inventory.category.default_location
+                # else:
+                #     raise
+        except Exception as e:
+            print('Error occurred: ',e)
+
+
+        if not self.sku:
+            company_id = self.inventory.profile
+            inv_type = self.inventory.inventory_type[:4].upper()
+            category_code = ''.join([word[0] for word in self.inventory.category.name.split() if word])[:4].upper()
+
+            last_item = StockItem.objects.filter(inventory=self.inventory).order_by('-created_at').last()
+            if last_item:
+                count =int(last_item.sku.split('-')[0])
+            else:
+                count=0
+            count+=1
+
+            self.sku = f"C{company_id}-{inv_type}-{category_code}-{count:04d}"
         super().save(*args, **kwargs)
 
     class Meta:

@@ -41,11 +41,20 @@ class ProfileMixin(UUIDBaseModel):
     profile=models.CharField(
         max_length=400,
         null=False,
-        blank=False,
+        blank=True,
         verbose_name=_('Profile'),
-        help_text=_('Profile of the user or entity associated with this model.')
+        help_text=_('Profile of the user or entity associated with this model.'),
+        editable=False
     )
-    
+    created_by = models.CharField(
+        max_length=255,
+        blank=True,
+        null=True,
+        verbose_name=_('Created By'),
+        help_text=_('User  ID of the creator'),
+        editable=False
+    )
+
 
     class Meta:
         abstract = True

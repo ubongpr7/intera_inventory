@@ -19,7 +19,7 @@ class HasModelRequestPermission(permissions.BasePermission):
         if not current_user:
             return False
         
-        user_id = current_user.get('id')
+        user_id = request.user.id
         profile_id = request.headers.get('X-Profile-ID')
         
         if not user_id:
@@ -84,7 +84,7 @@ class IsOwnerOrHasPermission(permissions.BasePermission):
         if not current_user:
             return False
         
-        user_id = current_user.get('id')
+        user_id = request.user.id
         profile_id = request.headers.get('X-Profile-ID')
         
         # Check ownership first

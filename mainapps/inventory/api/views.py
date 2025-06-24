@@ -1,4 +1,4 @@
-from rest_framework import viewsets, status, filters
+from rest_framework import viewsets, status, filters,generics
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
@@ -15,39 +15,45 @@ from ..models import (
 )
 from .serializers import *
 
+class UnitListView(generics.ListAPIView):
+    queryset = Unit.objects.all()
+    serializer_class = UnitSerializer
+
 class BaseInventoryViewSet(viewsets.ModelViewSet):
     """Base viewset with common functionality"""
-    permission_classes = [IsAuthenticated]
+    # permission_classes = [IsAuthenticated]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     
     def get_queryset(self):
         """Filter by profile (tenant)"""
+        
         queryset = super().get_queryset()
-        # Assuming profile is determined from request user or headers
         profile_id = self.request.headers.get('X-Profile-ID')
+        print('profile_id ', profile_id)
         if profile_id:
-            queryset = queryset.filter(profile_id=profile_id)
+            queryset = queryset.filter(profile=profile_id)
         return queryset
     
     def perform_create(self, serializer):
         """Set created_by and profile on creation"""
-        current_user = UserService.get_current_user(self.request)
-        profile_id = self.request.headers.get('X-Profile-ID')
+        # current_user_id= self.request.user.id
+        profile_id = str(self.request.headers.get('X-Profile-ID'))
+        current_user_id= str(self.request.user.id)
+        if not serializer.is_valid:
+            print('Invalid')
+        else:
+            print('valid')
         
-        extra_fields = {}
-        if current_user:
-            extra_fields['created_by'] = current_user.get('id')
-        if profile_id:
-            extra_fields['profile_id'] = profile_id
-            
-        serializer.save(**extra_fields)
+        serializer.save(profile = profile_id, created_by=current_user_id)
     
     def perform_update(self, serializer):
         """Set modified_by on update"""
-        current_user = UserService.get_current_user(self.request)
+        # current_user_id= self.request.user.id
+        current_user_id= self.request.user.id
+
         extra_fields = {}
-        if current_user:
-            extra_fields['modified_by'] = current_user.get('id')
+        if current_user_id:
+            extra_fields['modified_by'] = current_user_id
         serializer.save(**extra_fields)
 
 class InventoryCategoryViewSet(BaseInventoryViewSet):
@@ -171,7 +177,12 @@ class InventoryViewSet(BaseInventoryViewSet):
         summary['stock_status'] = inventory.stock_status
         
         return Response(summary)
-    
+    @action(detail=True, methods=['get'])
+    def minimal_inventory(self,request,pk=None):
+        inventory = self.get_object()
+        serializer = InventoryListSerializer(inventory)
+        return Response(serializer.data)
+        
     @action(detail=True, methods=['post'])
     def adjust_stock(self, request, pk=None):
         """Adjust stock levels for inventory"""
@@ -232,6 +243,7 @@ class InventoryViewSet(BaseInventoryViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
     
+
     @action(detail=False, methods=['get'])
     def analytics(self, request):
         """Get comprehensive inventory analytics"""

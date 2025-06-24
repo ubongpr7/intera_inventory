@@ -9,8 +9,9 @@ logger = logging.getLogger(__name__)
 class UserService:
     """Service for communicating with the user microservice"""
     
-    BASE_URL = getattr(settings, 'USER_SERVICE_URL', 'http://localhost:8000')
-    CACHE_TIMEOUT = 300  # 5 minutes
+    BASE_URL = getattr(settings, 'USER_SERVICE_URL', 'http://user-service:8000')
+    CACHE_TIMEOUT = 300  
+    USERS_BASE_ENDPOINT='api/v1/accounts'
     
     @classmethod
     def get_user_details(cls, user_id: str) -> Optional[Dict[str, Any]]:
@@ -26,7 +27,7 @@ class UserService:
         
         try:
             response = requests.get(
-                f"{cls.BASE_URL}/account_api/users/{user_id}/",
+                f"{cls.BASE_URL}/{cls.USERS_BASE_ENDPOINT}/users/{user_id}/",
                 timeout=5
             )
             
@@ -48,12 +49,13 @@ class UserService:
         """Get current user details from request"""
         # Assuming you have authentication middleware that sets user info
         auth_header = request.META.get('HTTP_AUTHORIZATION')
+        print(auth_header)
         if not auth_header:
             return None
             
         try:
             response = requests.get(
-                f"{cls.BASE_URL}/account_api/user/me/",
+                f"{cls.BASE_URL}/auth-api/users/me/",
                 headers={'Authorization': auth_header},
                 timeout=5
             )

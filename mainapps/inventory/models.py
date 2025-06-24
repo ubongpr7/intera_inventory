@@ -18,6 +18,155 @@ from django.utils import timezone
 from mainapps.content_type_linking_models.models import ProfileMixin, UUIDBaseModel
 from django.db import transaction
 from django.db.models import F
+from django.core.validators import RegexValidator
+from django.core.exceptions import ValidationError
+
+
+class Address(models.Model):
+
+    
+    country = models.CharField(
+        max_length=255,
+        verbose_name=_('Country'),
+        help_text=_('Country of the address'),
+        null=True,
+        blank=True
+    )
+    region = models.CharField(
+        max_length=255,
+        verbose_name=_('Region/State'),
+        help_text=_('Region or state within the country'),
+        null=True,
+        blank=True
+    )
+    subregion = models.CharField(
+        max_length=255,
+        verbose_name=_('Subregion/Province'),
+        help_text=_('Subregion or province within the region'),
+        null=True,
+        blank=True
+    )
+    city = models.CharField(
+        max_length=255,
+        verbose_name=_('City'),
+        help_text=_('City of the address'),
+        null=True,
+        blank=True
+    )
+    apt_number = models.PositiveIntegerField(
+        verbose_name=_('Apartment number'),
+        null=True,
+        blank=True
+    )
+    street_number = models.PositiveIntegerField(
+        verbose_name=_('Street number'),
+        null=True,
+        blank=True
+    )
+    street = models.CharField(max_length=255,blank=False,null=True)
+
+    postal_code = models.CharField(
+        max_length=10,
+        verbose_name=_('Postal code'),
+        help_text=_('Postal code'),
+        blank=True,
+        null=True,
+    )
+    latitude = models.DecimalField(
+        max_digits=9,
+        decimal_places=6,
+        verbose_name=_('Latitude'),
+        help_text=_('Geographical latitude of the address'),
+        null=True,
+        blank=True
+    )
+    longitude = models.DecimalField(
+        max_digits=9,
+        decimal_places=6,
+        verbose_name=_('Longitude'),
+        help_text=_('Geographical longitude of the address'),
+        null=True,
+        blank=True
+    )
+
+class Unit(models.Model):
+    class DimensionType(models.TextChoices):
+        MASS = 'mass', _('Mass')
+        VOLUME = 'volume', _('Volume')
+        LENGTH = 'length', _('Length')
+        PIECE = 'piece', _('Piece')
+        TIME = 'time', _('Time')
+        CUSTOM = 'custom', _('Custom')
+
+    dimension_type = models.CharField(
+        max_length=50,
+        choices=DimensionType.choices,
+        default=DimensionType.CUSTOM,
+        verbose_name=_('Dimension Category'),
+        help_text=_('Type of measurement this unit belongs to')
+    )
+    name = models.CharField(
+        max_length=255,
+        verbose_name=_('Unit Name'),
+        help_text=_('Full name of the unit (e.g., Kilogram)')
+    )
+    abbreviated_name = models.CharField(
+        max_length=10,
+        null=True,
+        verbose_name=_('Abbreviation'),
+        help_text=_('Standard short form (e.g., kg, L, m)'),
+        validators=[
+            RegexValidator(
+                regex='^[A-Za-z]+$',
+                message='Abbreviation can only contain letters',
+                code='invalid_abbreviation'
+            )
+        ]
+    )
+    base_unit = models.ForeignKey(
+        'self',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        verbose_name=_('Base Unit'),
+        help_text=_('Reference to base unit for conversions')
+    )
+    conversion_factor = models.DecimalField(
+        max_digits=30,
+        decimal_places=8,
+        default=1.0,
+        help_text=_('Conversion factor to base unit')
+    )
+
+    class Meta:
+        ordering=['id']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['dimension_type', 'name'],
+                name='unique_unit_per_dimension'
+            ),
+            models.UniqueConstraint(
+                fields=['abbreviated_name', 'dimension_type'],
+                name='unique_abbreviation_per_dimension'
+            )
+        ]
+        indexes = [
+            models.Index(fields=['dimension_type', 'name']),
+            models.Index(fields=['abbreviated_name']),
+        ]
+
+    def __str__(self):
+        return f"{self.name} ({self.abbreviated_name}) - {self.get_dimension_type_display()}"
+
+    def clean(self):
+        """Add validation logic for conversion factors"""
+        if self.base_unit and self.base_unit.dimension_type != self.dimension_type:
+            raise ValidationError(_("Base unit must be of the same dimension type"))
+        
+        if self.base_unit and self.conversion_factor <= 0:
+            raise ValidationError(_("Conversion factor must be a positive number"))   
+
+
 
 class RecallPolicies(models.TextChoices):
     REMOVE = "0", _("Remove from Stock")
@@ -54,7 +203,7 @@ class InventoryPolicy(ProfileMixin):
     
     class Meta:
         abstract = True
-
+    unit =models.ForeignKey(Unit, null=True,blank=False, on_delete=models.SET_NULL)
     minimum_stock_level = models.IntegerField(
         _("Minimum Stock Level"),
         default=0,
@@ -73,11 +222,6 @@ class InventoryPolicy(ProfileMixin):
         help_text=_("Standard quantity for automated replenishment")
     )
     
-    automate_reorder = models.BooleanField(
-        _("Auto-Replenish"),
-        default=False,
-        help_text=_("Enable automatic purchase orders at reorder point")
-    )
 
     # Safety Stock Parameters
     safety_stock_level = models.IntegerField(
@@ -114,36 +258,30 @@ class InventoryPolicy(ProfileMixin):
         help_text=_("Days before expiry to trigger alerts")
     )
     
-    batch_tracking_enabled = models.BooleanField(
-        _("Batch Tracking"),
-        default=False,
-        help_text=_("Enable batch/lot number tracking for items")
-    )
-
-    # Cost Parameters
-    holding_cost_per_unit = models.DecimalField(
-        _("Holding Cost"),
-        max_digits=10,
-        decimal_places=2,
-        default=0.0,
-        help_text=_("Annual storage cost per unit")
-    )
+    # # Cost Parameters
+    # holding_cost_per_unit = models.DecimalField(
+    #     _("Holding Cost"),
+    #     max_digits=10,
+    #     decimal_places=2,
+    #     default=0.0,
+    #     help_text=_("Annual storage cost per unit")
+    # )
     
-    ordering_cost = models.DecimalField(
-        _("Ordering Cost"),
-        max_digits=10,
-        decimal_places=2,
-        default=0.0,
-        help_text=_("Fixed cost per replenishment order")
-    )
+    # ordering_cost = models.DecimalField(
+    #     _("Ordering Cost"),
+    #     max_digits=10,
+    #     decimal_places=2,
+    #     default=0.0,
+    #     help_text=_("Fixed cost per replenishment order")
+    # )
     
-    stockout_cost = models.DecimalField(
-        _("Stockout Cost"),
-        max_digits=10,
-        decimal_places=2,
-        default=0.0,
-        help_text=_("Estimated cost per unit of stockout")
-    )
+    # stockout_cost = models.DecimalField(
+    #     _("Stockout Cost"),
+    #     max_digits=10,
+    #     decimal_places=2,
+    #     default=0.0,
+    #     help_text=_("Estimated cost per unit of stockout")
+    # )
 
     # Expiration Handling Policies
     expiration_policy = models.CharField(
@@ -209,6 +347,7 @@ class InventoryPolicy(ProfileMixin):
         default=365,
         help_text=_("Days of inactivity before archiving inventory")
     )
+
     @property
     def calculated_safety_stock(self):
         """Calculate safety stock based on demand variability and lead time"""
@@ -225,6 +364,17 @@ class InventoryProperty(InventoryPolicy):
         help_text=_('Can this Inventory be built from other Inventory?'),
     )
 
+    batch_tracking_enabled = models.BooleanField(
+        _("Batch Tracking"),
+        default=False,
+        help_text=_("Enable batch/lot number tracking for items")
+    )
+
+    automate_reorder = models.BooleanField(
+        _("Auto-Replenish"),
+        default=False,
+        help_text=_("Enable automatic purchase orders at reorder point")
+    )
     component = models.BooleanField(
         default=False,
         verbose_name=_('Component'),
@@ -347,7 +497,10 @@ class InventoryCategory(ProfileMixin, MPTTModel):
         return self.get_descendants(include_self=True)
     
     def save(self, *args, **kwargs):
-        self.slug = f"{get_random_string(6)}{slugify(self.name)}-{self.pk}-{get_random_string(5)}"
+        if not self.default_location and self.parent:
+            self.default_location = self.parent.default_location
+            
+        self.slug = f"{get_random_string(6)}{slugify(self.name)}-{self.profile}-{get_random_string(5)}"
         super(InventoryCategory, self).save(*args, **kwargs)
     
     def __str__(self):
@@ -446,13 +599,6 @@ class Inventory(InventoryProperty):
         help_text=_("Hierarchical grouping for inventory items")
     )
     
-    IPN = models.CharField(
-        max_length=100,
-        blank=True,
-        null=True,
-        verbose_name=_('IPN'),
-        help_text=_('Internal Part Number'),
-    )
     sync_status = models.CharField(
         max_length=20,
         choices=[
@@ -492,34 +638,34 @@ class Inventory(InventoryProperty):
                 fields=['external_system_id', 'profile'], 
                 name='unique_inventory_external_system_id_profile'
             ),
-            models.UniqueConstraint(
-                fields=['IPN', 'profile'], 
-                name='unique_ipn_profile',
-                condition=models.Q(IPN__isnull=False)
-            )
+            
         ]    
     def generate_external_id(self):
         """Atomically generate unique external ID in PROFILE_INITIALS-SEQ format"""
         with transaction.atomic():
-            profile = self.profile
-            
-            initials = ''.join([word[0] for word in profile.name.split() if word])[:3].upper()
+            last_inventory= Inventory.objects.filter(profile=self.profile).order_by('-created_at').last()
+            number_in_category= Inventory.objects.filter(category=self.category).count()+1
+            if last_inventory:
+                last_reference=last_inventory.external_system_id.split('-')[-1]
+                print(last_reference)
+
+                last_reference=int(last_inventory.external_system_id.split('-')[-1])
+                print(last_reference)
+            else:
+                last_reference=0
+            last_reference+=1
+
+            initials = ''.join([word[0] for word in self.category.name.split() if word])[:3].upper()+'-'
+            initials+= ''.join([word[0] for word in self.inventory_type.split('_') if word])[:3].upper()
             if len(initials) < 2:
-                initials = profile.name[:2].upper()
+                initials = self.category.name[:3].upper()
                 
-            # Get and increment the sequence number atomically
-            sequence_number = profile.inventory_sequence + 1
-            profile.inventory_sequence = F('inventory_sequence') + 1
-            profile.save(update_fields=['inventory_sequence'])
             
-            # Refresh to get updated value
-            profile.refresh_from_db()
-            
-            return f"{initials}-{self.category.pk}{self.profile.owner.pk}{self.profile.pk}-{profile.inventory_sequence:04d}"
+            return f"{initials}-{self.profile}{number_in_category}-{last_reference:04d}"
 
     def save(self, *args, **kwargs):
-        if not self.external_system_id:
-            self.external_system_id = self.generate_external_id()
+        # if not self.external_system_id:
+        self.external_system_id = self.generate_external_id()
         super().save(*args, **kwargs)
     
     def clean(self):
@@ -550,6 +696,13 @@ class Inventory(InventoryProperty):
             total=models.Sum('quantity')
         )['total'] or 0
     
+    
+    @property
+    def get_unit(self):
+        return f'{self.unit.name} ({self.unit.dimension_type})'
+
+
+
     @property
     def stock_status(self):
         """Determine stock status based on current levels"""
@@ -568,6 +721,9 @@ class Inventory(InventoryProperty):
         # This would require historical consumption data
         # Implementation depends on your tracking requirements
         pass
+    def __str__(self):
+        return self.name
+
 class InventoryBatch(UUIDBaseModel):
     """Batch/lot tracking for inventory items"""
     inventory = models.ForeignKey(
@@ -710,5 +866,5 @@ class InventoryTransaction(ProfileMixin):
         verbose_name = 'Inventory Transaction'
         verbose_name_plural = 'Inventory Transactions'
 
-registerable_models = [Inventory, InventoryCategory]
+registerable_models = [Inventory, InventoryCategory,Unit]
 

@@ -6,28 +6,38 @@ from mainapps.content_type_linking_models.serializers import UserDetailMixin
 from mainapps.stock.models import StockItem
 
 from ..models import (
-    Inventory, InventoryCategory, InventoryBatch,
+    Inventory, InventoryCategory, InventoryBatch, Unit,
 )
+class UnitSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Unit
+        fields = ['id', 'name','dimension_type']
 
 class InventoryCategoryListSerializer(serializers.ModelSerializer):
     """Lightweight serializer for category lists"""
     inventory_count = serializers.ReadOnlyField()
+    parent_name= serializers.SerializerMethodField()
     
     class Meta:
         model = InventoryCategory
-        fields = ['id', 'name', 'slug', 'is_active', 'inventory_count', 'parent']
-
+        fields = ['id', 'name', 'slug', 'is_active', 'inventory_count', 'parent','parent_name']
+    def get_parent_name(self,obj):
+        return obj.parent.name if obj.parent else None
+    
 class InventoryCategoryDetailSerializer(UserDetailMixin, serializers.ModelSerializer):
     """Detailed serializer for category CRUD operations"""
     inventory_count = serializers.ReadOnlyField()
     children = InventoryCategoryListSerializer(many=True, read_only=True)
     created_by_details = serializers.SerializerMethodField()
     modified_by_details = serializers.SerializerMethodField()
+    parent_name= serializers.SerializerMethodField()
     
     class Meta:
         model = InventoryCategory
         fields = '__all__'
         read_only_fields = ['slug', 'created_at', 'modified_at']
+    def get_parent_name(self,obj):
+        return obj.parent.name if obj.parent else None
     
     def get_created_by_details(self, obj):
         return self.get_user_details(getattr(obj, 'created_by', None))
@@ -40,15 +50,17 @@ class InventoryListSerializer(serializers.ModelSerializer):
     category_name = serializers.CharField(source='category.name', read_only=True)
     current_stock = serializers.SerializerMethodField()
     stock_status = serializers.ReadOnlyField()
+    unit_name=serializers.SerializerMethodField()
     
     class Meta:
         model = Inventory
         fields = [
-            'id', 'name', 'IPN', 'external_system_id', 'inventory_type',
+            'id', 'name', 'external_system_id', 'inventory_type','unit_name',
             'category_name', 'current_stock', 'stock_status', 'active',
-            'minimum_stock_level', 're_order_point', 'created_at'
+            'minimum_stock_level', 're_order_point', 'created_at','re_order_quantity','reorder_strategy'
         ]
-    
+    def get_unit_name(self,obj):
+        return f'{obj.unit.name} ({obj.unit.dimension_type})'
     def get_current_stock(self, obj):
         return obj.current_stock_level
 
@@ -64,6 +76,7 @@ class InventoryDetailSerializer(UserDetailMixin, serializers.ModelSerializer):
     officer_in_charge_details = serializers.SerializerMethodField()
     created_by_details = serializers.SerializerMethodField()
     modified_by_details = serializers.SerializerMethodField()
+    unit_name=serializers.SerializerMethodField()
     
     # Stock analytics
     stock_analytics = serializers.SerializerMethodField()
@@ -79,6 +92,9 @@ class InventoryDetailSerializer(UserDetailMixin, serializers.ModelSerializer):
     def get_total_stock_value(self, obj):
         return obj.total_stock_value
     
+    def get_unit_name(self,obj):
+        return obj.get_unit
+
     def get_officer_in_charge_details(self, obj):
         return self.get_user_details(obj.officer_in_charge)
     

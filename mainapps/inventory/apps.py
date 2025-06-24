@@ -6,3 +6,4 @@ class InventoryConfig(AppConfig):
     name = 'mainapps.inventory'
     def ready(self):
         import mainapps.inventory.signals
+        

@@ -89,7 +89,6 @@ TEMPLATES = [
 
 WSGI_APPLICATION = 'core.wsgi.application'
 
-"""
 
 DATABASES = {
     'default': {
@@ -109,6 +108,7 @@ DATABASES = {
         'PORT': os.getenv('DB_PORT'),
     }
 }
+"""
 
 AUTH_PASSWORD_VALIDATORS = [
     {
@@ -250,6 +250,19 @@ CORS_ALLOW_METHODS = (
     "POST",
     "PUT",
 )
+CORS_ALLOW_HEADERS = [
+    'accept',
+    'accept-encoding',
+    'authorization',
+    'content-type',
+    'dnt',
+    'origin',
+    'user-agent',
+    'x-csrftoken',
+    'x-requested-with',
+    'X-profile-id',  
+    'X-user-id'
+]
 
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:3000",
@@ -268,7 +281,7 @@ TINYMCE_DEFAULT_CONFIG = {
     'selector': 'textarea',
     'theme': 'modern',
 }
-
+"""
 CACHES = {
     "default": {
         "BACKEND": "django_redis.cache.RedisCache",
@@ -278,8 +291,11 @@ CACHES = {
         }
     }
 }
+"""
 
 CELERY_BROKER_URL = os.getenv('CELERY_BROKER_URL', 'redis://redis:6379/0')  
 CELERY_RESULT_BACKEND = os.getenv('CELERY_RESULT_BACKEND', 'redis://redis:6379/0')
 USE_L10N = True
 USE_THOUSAND_SEPARATOR = True
+
+USER_SERVICE_URL=os.getenv('USER_SERVICE_URL')

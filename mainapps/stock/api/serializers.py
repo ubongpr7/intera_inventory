@@ -6,21 +6,28 @@ from mainapps.content_type_linking_models.serializers import UserDetailMixin
 from mainapps.inventory.models import Inventory
 
 from ..models import (
-     StockItem, StockLocation, StockItemTracking
+     StockItem, StockLocation, StockItemTracking, StockLocationType
 )
 from subapps.services.user_service import UserService
 
+class StockLocationTypeSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = StockLocationType
+        fields='__all__'
 class StockLocationListSerializer(serializers.ModelSerializer):
     """Lightweight serializer for location lists"""
     location_type_name = serializers.CharField(source='location_type.name', read_only=True)
     stock_count = serializers.SerializerMethodField()
+    parent_name=serializers.SerializerMethodField()
     
     class Meta:
         model = StockLocation
-        fields = ['id', 'name', 'code', 'location_type_name', 'stock_count', 'structural', 'external']
+        fields = ['id', 'name', 'code','parent_name','location_type_name', 'stock_count', 'structural', 'external','physical_address']
     
     def get_stock_count(self, obj):
         return obj.stock_items.count()
+    def get_parent_name(self, obj):
+        return f'{obj.parent.name} - {obj.parent.code}' if obj.parent else ''
 
 class StockLocationDetailSerializer(UserDetailMixin, serializers.ModelSerializer):
     """Detailed serializer for location CRUD operations"""
@@ -28,6 +35,7 @@ class StockLocationDetailSerializer(UserDetailMixin, serializers.ModelSerializer
     children = StockLocationListSerializer(many=True, read_only=True)
     official_details = serializers.SerializerMethodField()
     stock_summary = serializers.SerializerMethodField()
+    parent_name=serializers.SerializerMethodField()
     
     class Meta:
         model = StockLocation
@@ -36,6 +44,8 @@ class StockLocationDetailSerializer(UserDetailMixin, serializers.ModelSerializer
     
     def get_official_details(self, obj):
         return self.get_user_details(obj.official)
+    def get_parent_name(self, obj):
+        return f'{obj.parent.name} - {obj.parent.code}' if obj.parent else ''
     
     def get_stock_summary(self, obj):
         """Get stock summary for this location"""
@@ -66,7 +76,7 @@ class StockItemListSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'name', 'sku', 'serial', 'quantity', 'status',
             'inventory_name', 'location_name', 'expiry_date', 'days_to_expiry',
-            'purchase_price', 'created_at'
+            'purchase_price', 'created_at','quantity_w_unit'
         ]
     
     def get_days_to_expiry(self, obj):
@@ -84,10 +94,14 @@ class StockInventoryListSerializer(serializers.ModelSerializer):
     class Meta:
         model = Inventory
         fields = [
-            'id', 'name', 'IPN', 'external_system_id', 'inventory_type',
+            'id', 'name', 'external_system_id', 'inventory_type',
             'category_name', 'current_stock', 'stock_status', 'active',
             'minimum_stock_level', 're_order_point', 'created_at'
         ]
+      
+    def get_current_stock(self, obj):
+        return obj.current_stock_level
+  
 
 
 class StockItemDetailSerializer(UserDetailMixin, serializers.ModelSerializer):

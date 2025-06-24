@@ -12,10 +12,14 @@ from decimal import Decimal
 
 from mainapps.inventory.api.serializers import StockAnalyticsSerializer
 from mainapps.inventory.api.views import BaseInventoryViewSet
-from mainapps.stock.api.serializers import StockItemDetailSerializer, StockItemListSerializer, StockLocationDetailSerializer, StockLocationListSerializer
-from mainapps.stock.models import StockItem, StockLocation
+from mainapps.inventory.models import Inventory
+from mainapps.stock.api.serializers import StockItemDetailSerializer, StockItemListSerializer, StockLocationDetailSerializer, StockLocationListSerializer, StockLocationTypeSerializer
+from mainapps.stock.models import StockItem, StockLocation, StockLocationType
+from rest_framework import viewsets
 
-
+class ReadStockLocationType(viewsets.ReadOnlyModelViewSet):
+    serializer_class= StockLocationTypeSerializer
+    queryset = StockLocationType.objects.all()
 class StockLocationViewSet(BaseInventoryViewSet):
     """ViewSet for stock location management"""
     queryset = StockLocation.objects.select_related('location_type', 'parent')
@@ -125,7 +129,46 @@ class StockLocationViewSet(BaseInventoryViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-class StockItemViewSet(BaseInventoryViewSet):
+
+class BaseInventoryViewSetMixin(viewsets.ModelViewSet):
+    """Base viewset with common functionality"""
+    # permission_classes = [IsAuthenticated]
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    
+    def get_queryset(self):
+        """Filter by profile (tenant)"""
+        
+        queryset = super().get_queryset()
+        profile_id = self.request.headers.get('X-Profile-ID')
+        print('profile_id ', profile_id)
+        if profile_id:
+            queryset = queryset.filter(inventory__profile=profile_id)
+        return queryset
+    
+    # def perform_create(self, serializer):
+    #     """Set created_by and profile on creation"""
+    #     # current_user_id= self.request.user.id
+    #     profile_id = str(self.request.headers.get('X-Profile-ID'))
+    #     current_user_id= str(self.request.user.id)
+    #     if not serializer.is_valid:
+    #         print('Invalid')
+    #     else:
+    #         print('valid')
+        
+    #     serializer.save(profile = profile_id, created_by=current_user_id)
+    
+    # def perform_update(self, serializer):
+    #     """Set modified_by on update"""
+    #     # current_user_id= self.request.user.id
+    #     current_user_id= self.request.user.id
+
+    #     extra_fields = {}
+    #     if current_user_id:
+    #         extra_fields['modified_by'] = current_user_id
+    #     serializer.save(**extra_fields)
+
+
+class StockItemViewSet(BaseInventoryViewSetMixin):
     """ViewSet for stock item management"""
     queryset = StockItem.objects.select_related('inventory', 'location', 'purchase_order')
     filterset_fields = ['status', 'location', 'inventory', 'purchase_order', 'sales_order']
@@ -213,6 +256,13 @@ class StockItemViewSet(BaseInventoryViewSet):
             'old_status': old_status,
             'new_status': new_status
         })
+    @action(detail=False, methods=['get'])
+    def get_inventory_items(self,request, ):
+        inventory_id = request.query_params.get('inventory_id')
+        inventory = Inventory.objects.get(id=inventory_id)
+        stock_items=StockItem.objects.filter(inventory=inventory)
+        serializer = StockItemListSerializer(stock_items, many=True)
+        return Response(serializer.data)
     
     @action(detail=True, methods=['get'])
     def tracking_history(self, request, pk=None):
@@ -223,6 +273,7 @@ class StockItemViewSet(BaseInventoryViewSet):
         serializer = StockItemTrackingListSerializer(tracking, many=True)
         return Response(serializer.data)
     
+
     @action(detail=False, methods=['get'])
     def analytics(self, request):
         """Get stock analytics"""
@@ -278,3 +329,5 @@ class StockItemViewSet(BaseInventoryViewSet):
         
         serializer = StockAnalyticsSerializer(analytics_data)
         return Response(serializer.data)
+    
+
