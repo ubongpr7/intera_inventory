@@ -134,3 +134,12 @@ PURCHASE_ORDER_PERMISSIONS = {
     'add_line_item': CombinedPermissions.CREATE_PURCHASE_ORDER_LINE_ITEM,
     'analytics': CombinedPermissions.VIEW_INVENTORY_REPORTS,
 }
+
+UNIFIED_PERMISSION_DICT= {
+    'inventory':INVENTORY_PERMISSIONS,
+    'inventory_category':INVENTORY_CATEGORY_PERMISSIONS,
+    'stock_item':STOCK_ITEM_PERMISSIONS,
+    'stock_location':STOCK_LOCATION_PERMISSIONS,
+    'purchase_order':PURCHASE_ORDER_PERMISSIONS
+
+}

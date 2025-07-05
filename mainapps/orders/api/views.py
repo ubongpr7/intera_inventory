@@ -12,11 +12,11 @@ import logging
 
 from mainapps.inventory.models import InventoryTransaction, TransactionType
 from mainapps.orders.api.serializers import PurchaseOrderDetailSerializer, PurchaseOrderListSerializer
-from subapps.permissions.constants import PURCHASE_ORDER_PERMISSIONS
+from subapps.permissions.constants import PURCHASE_ORDER_PERMISSIONS, UNIFIED_PERMISSION_DICT
 from subapps.permissions.microservice_permissions import HasModelRequestPermission, PermissionRequiredMixin
 from subapps.services.emails.email_services import EmailService
 from subapps.services.pdf.pdf_service import PDFService
-from subapps.services.user_service import UserService
+from subapps.services.microservices.user_service import UserService
 
 from ..models import (
     PurchaseOrder, PurchaseOrderLineItem, PurchaseOrderStatus,
@@ -29,8 +29,9 @@ class PurchaseOrderViewSet(PermissionRequiredMixin, viewsets.ModelViewSet):
     Enhanced ViewSet for comprehensive purchase order management
     Includes workflow management, receiving, returns, and analytics
     """
+    required_permission = UNIFIED_PERMISSION_DICT.get('purchase_order')
+
     queryset = PurchaseOrder.objects.select_related('supplier', 'contact', 'address').prefetch_related('line_items')
-    required_permission = PURCHASE_ORDER_PERMISSIONS
     permission_classes = [IsAuthenticated, HasModelRequestPermission]
     
     filterset_fields = ['status', 'supplier', 'issue_date', 'delivery_date']
@@ -48,7 +49,9 @@ class PurchaseOrderViewSet(PermissionRequiredMixin, viewsets.ModelViewSet):
         queryset = super().get_queryset()
         profile_id = self.request.headers.get('X-Profile-ID')
         if profile_id:
-            queryset = queryset.filter(profile_id=profile_id)
+            queryset = queryset.filter(profile=profile_id)
+        else:
+            return Response(status=status.HTTP_401_UNAUTHORIZED)
         
         # Additional filters
         status_filter = self.request.query_params.get('status_filter')
@@ -85,7 +88,7 @@ class PurchaseOrderViewSet(PermissionRequiredMixin, viewsets.ModelViewSet):
             extra_fields['created_by'] = current_user_id
             extra_fields['responsible'] = current_user_id
         if profile_id:
-            extra_fields['profile_id'] = profile_id
+            extra_fields['profile'] = profile_id
             
         instance = serializer.save(**extra_fields)
         
@@ -502,7 +505,7 @@ class PurchaseOrderViewSet(PermissionRequiredMixin, viewsets.ModelViewSet):
                 # Create return order
                 return_order = ReturnOrder.objects.create(
                     purchase_order=purchase_order,
-                    profile_id=purchase_order.profile_id,
+                    profile=purchase_order.profile,
                     contact=purchase_order.contact,
                     address=purchase_order.address,
                     status=ReturnOrderStatus.PENDING,
@@ -683,7 +686,7 @@ class PurchaseOrderViewSet(PermissionRequiredMixin, viewsets.ModelViewSet):
                         transaction_type=TransactionType.PO_COMPLETE,
                         reference=purchase_order.reference,
                         user=current_user_id,
-                        profile_id=purchase_order.profile_id,
+                        profile=purchase_order.profile,
                         notes=f"Completed from PO {purchase_order.reference}"
                     )
                 )

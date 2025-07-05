@@ -1,5 +1,5 @@
 
-from subapps.services.user_service import UserService
+from subapps.services.microservices.user_service import UserService
 
 class UserDetailMixin:
     """Mixin to add user details to serializers"""

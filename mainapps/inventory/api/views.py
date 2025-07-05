@@ -8,18 +8,17 @@ from django.utils import timezone
 from datetime import timedelta, datetime
 from decimal import Decimal
 
-from subapps.services.user_service import UserService
+from subapps.permissions.constants import UNIFIED_PERMISSION_DICT
+from subapps.permissions.microservice_permissions import PermissionRequiredMixin
+from subapps.services.microservices.user_service import UserService
 
 from ..models import (
     Inventory, InventoryCategory, InventoryBatch,
 )
 from .serializers import *
 
-class UnitListView(generics.ListAPIView):
-    queryset = Unit.objects.all()
-    serializer_class = UnitSerializer
 
-class BaseInventoryViewSet(viewsets.ModelViewSet):
+class BaseInventoryViewSet(PermissionRequiredMixin,viewsets.ModelViewSet):
     """Base viewset with common functionality"""
     # permission_classes = [IsAuthenticated]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
@@ -29,7 +28,6 @@ class BaseInventoryViewSet(viewsets.ModelViewSet):
         
         queryset = super().get_queryset()
         profile_id = self.request.headers.get('X-Profile-ID')
-        print('profile_id ', profile_id)
         if profile_id:
             queryset = queryset.filter(profile=profile_id)
         return queryset
@@ -39,10 +37,7 @@ class BaseInventoryViewSet(viewsets.ModelViewSet):
         # current_user_id= self.request.user.id
         profile_id = str(self.request.headers.get('X-Profile-ID'))
         current_user_id= str(self.request.user.id)
-        if not serializer.is_valid:
-            print('Invalid')
-        else:
-            print('valid')
+        
         
         serializer.save(profile = profile_id, created_by=current_user_id)
     
@@ -58,16 +53,18 @@ class BaseInventoryViewSet(viewsets.ModelViewSet):
 
 class InventoryCategoryViewSet(BaseInventoryViewSet):
     """ViewSet for inventory categories with hierarchical support"""
+    required_permission = UNIFIED_PERMISSION_DICT.get('inventory_category')
     queryset = InventoryCategory.objects.all()
     filterset_fields = ['is_active', 'structural', 'parent']
     search_fields = ['name', 'description']
     ordering_fields = ['name', 'created_at']
     ordering = ['name']
+    serializer_class=InventoryCategoryDetailSerializer
     
-    def get_serializer_class(self):
-        if self.action == 'list':
-            return InventoryCategoryListSerializer
-        return InventoryCategoryDetailSerializer
+    # def get_serializer_class(self):
+    #     if self.action == 'list':
+    #         return InventoryCategoryListSerializer
+    #     return InventoryCategoryDetailSerializer
     
     @action(detail=False, methods=['get'])
     def tree(self, request):
@@ -94,6 +91,8 @@ class InventoryCategoryViewSet(BaseInventoryViewSet):
 
 class InventoryViewSet(BaseInventoryViewSet):
     """Comprehensive ViewSet for inventory management"""
+    required_permission = UNIFIED_PERMISSION_DICT.get('inventory')
+
     queryset = Inventory.objects.select_related('category', 'default_supplier')
     filterset_fields = [
         'active', 'inventory_type', 'category', 'assembly', 'component',

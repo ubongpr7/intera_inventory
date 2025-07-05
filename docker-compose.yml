@@ -10,7 +10,9 @@ services:
   #   restart: unless-stopped
 
   web:
-    image: ubongpr7/inventoryv2:latest
+    # image: ubongpr7/inventoryv2:latest
+    image: ubongpr7/intera_users:latest
+
     env_file:
       - .env
     container_name: inventory-service
@@ -18,12 +20,12 @@ services:
       sh -c "
         python manage.py makemigrations &&
         python manage.py migrate &&
-        python manage.py runserver 0.0.0.0:8001
+        python manage.py runserver 0.0.0.0:8000
       "
     volumes:
       - .:/app
     ports:
-      - "8001:8001"
+      - "8002:8000"
     # depends_on:
     #   - redis
     networks:

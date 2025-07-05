@@ -17,11 +17,16 @@ from mainapps.stock.api.serializers import StockItemDetailSerializer, StockItemL
 from mainapps.stock.models import StockItem, StockLocation, StockLocationType
 from rest_framework import viewsets
 
+from subapps.permissions.constants import UNIFIED_PERMISSION_DICT
+from subapps.permissions.microservice_permissions import PermissionRequiredMixin
+
 class ReadStockLocationType(viewsets.ReadOnlyModelViewSet):
     serializer_class= StockLocationTypeSerializer
     queryset = StockLocationType.objects.all()
 class StockLocationViewSet(BaseInventoryViewSet):
     """ViewSet for stock location management"""
+    required_permission = UNIFIED_PERMISSION_DICT.get('stock_location')
+
     queryset = StockLocation.objects.select_related('location_type', 'parent')
     filterset_fields = ['structural', 'external', 'location_type', 'parent']
     search_fields = ['name', 'code', 'description']
@@ -130,9 +135,9 @@ class StockLocationViewSet(BaseInventoryViewSet):
             )
 
 
-class BaseInventoryViewSetMixin(viewsets.ModelViewSet):
+class BaseInventoryViewSetMixin(PermissionRequiredMixin,viewsets.ModelViewSet):
     """Base viewset with common functionality"""
-    # permission_classes = [IsAuthenticated]
+
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     
     def get_queryset(self):
@@ -140,50 +145,31 @@ class BaseInventoryViewSetMixin(viewsets.ModelViewSet):
         
         queryset = super().get_queryset()
         profile_id = self.request.headers.get('X-Profile-ID')
-        print('profile_id ', profile_id)
+        
         if profile_id:
             queryset = queryset.filter(inventory__profile=profile_id)
         return queryset
     
-    # def perform_create(self, serializer):
-    #     """Set created_by and profile on creation"""
-    #     # current_user_id= self.request.user.id
-    #     profile_id = str(self.request.headers.get('X-Profile-ID'))
-    #     current_user_id= str(self.request.user.id)
-    #     if not serializer.is_valid:
-    #         print('Invalid')
-    #     else:
-    #         print('valid')
-        
-    #     serializer.save(profile = profile_id, created_by=current_user_id)
-    
-    # def perform_update(self, serializer):
-    #     """Set modified_by on update"""
-    #     # current_user_id= self.request.user.id
-    #     current_user_id= self.request.user.id
-
-    #     extra_fields = {}
-    #     if current_user_id:
-    #         extra_fields['modified_by'] = current_user_id
-    #     serializer.save(**extra_fields)
-
 
 class StockItemViewSet(BaseInventoryViewSetMixin):
     """ViewSet for stock item management"""
+    required_permission = UNIFIED_PERMISSION_DICT.get('stock_item')
+
     queryset = StockItem.objects.select_related('inventory', 'location', 'purchase_order')
     filterset_fields = ['status', 'location', 'inventory', 'purchase_order', 'sales_order']
-    search_fields = ['name', 'sku', 'serial', 'batch']
+    search_fields = ['name', 'sku', 'serial', 'batch','inventory']
     ordering_fields = ['name', 'quantity', 'expiry_date', 'created_at']
     ordering = ['-created_at']
-    
-    def get_serializer_class(self):
-        if self.action == 'list':
-            return StockItemListSerializer
-        return StockItemDetailSerializer
+    serializer_class=StockItemDetailSerializer
+    # def get_serializer_class(self):
+    #     if self.action == 'list':
+    #         return StockItemListSerializer
+    #     return StockItemDetailSerializer
     
     def get_queryset(self):
         queryset = super().get_queryset()
-        
+        inventory = self.request.query_params.get('inventory')
+               
         # Filter by expiry status
         expiry_filter = self.request.query_params.get('expiry_status')
         if expiry_filter == 'expired':

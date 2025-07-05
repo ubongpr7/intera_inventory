@@ -9,7 +9,6 @@ from django.db import models
 from django.contrib.auth.models import Permission, Group
 from django.core.exceptions import ValidationError
 from django.conf import settings
-from mainapps.inventory.helpers.field_validators import validate_currency_code
 from mptt.models import MPTTModel, TreeForeignKey
 from django.utils.crypto import get_random_string
 from django.utils.text import slugify
@@ -89,84 +88,6 @@ class Address(models.Model):
         blank=True
     )
 
-class Unit(models.Model):
-    class DimensionType(models.TextChoices):
-        MASS = 'mass', _('Mass')
-        VOLUME = 'volume', _('Volume')
-        LENGTH = 'length', _('Length')
-        PIECE = 'piece', _('Piece')
-        TIME = 'time', _('Time')
-        CUSTOM = 'custom', _('Custom')
-
-    dimension_type = models.CharField(
-        max_length=50,
-        choices=DimensionType.choices,
-        default=DimensionType.CUSTOM,
-        verbose_name=_('Dimension Category'),
-        help_text=_('Type of measurement this unit belongs to')
-    )
-    name = models.CharField(
-        max_length=255,
-        verbose_name=_('Unit Name'),
-        help_text=_('Full name of the unit (e.g., Kilogram)')
-    )
-    abbreviated_name = models.CharField(
-        max_length=10,
-        null=True,
-        verbose_name=_('Abbreviation'),
-        help_text=_('Standard short form (e.g., kg, L, m)'),
-        validators=[
-            RegexValidator(
-                regex='^[A-Za-z]+$',
-                message='Abbreviation can only contain letters',
-                code='invalid_abbreviation'
-            )
-        ]
-    )
-    base_unit = models.ForeignKey(
-        'self',
-        on_delete=models.SET_NULL,
-        null=True,
-        blank=True,
-        verbose_name=_('Base Unit'),
-        help_text=_('Reference to base unit for conversions')
-    )
-    conversion_factor = models.DecimalField(
-        max_digits=30,
-        decimal_places=8,
-        default=1.0,
-        help_text=_('Conversion factor to base unit')
-    )
-
-    class Meta:
-        ordering=['id']
-        constraints = [
-            models.UniqueConstraint(
-                fields=['dimension_type', 'name'],
-                name='unique_unit_per_dimension'
-            ),
-            models.UniqueConstraint(
-                fields=['abbreviated_name', 'dimension_type'],
-                name='unique_abbreviation_per_dimension'
-            )
-        ]
-        indexes = [
-            models.Index(fields=['dimension_type', 'name']),
-            models.Index(fields=['abbreviated_name']),
-        ]
-
-    def __str__(self):
-        return f"{self.name} ({self.abbreviated_name}) - {self.get_dimension_type_display()}"
-
-    def clean(self):
-        """Add validation logic for conversion factors"""
-        if self.base_unit and self.base_unit.dimension_type != self.dimension_type:
-            raise ValidationError(_("Base unit must be of the same dimension type"))
-        
-        if self.base_unit and self.conversion_factor <= 0:
-            raise ValidationError(_("Conversion factor must be a positive number"))   
-
-
 
 class RecallPolicies(models.TextChoices):
     REMOVE = "0", _("Remove from Stock")
@@ -203,13 +124,16 @@ class InventoryPolicy(ProfileMixin):
     
     class Meta:
         abstract = True
-    unit =models.ForeignKey(Unit, null=True,blank=False, on_delete=models.SET_NULL)
-    minimum_stock_level = models.IntegerField(
-        _("Minimum Stock Level"),
-        default=0,
-        help_text=_("Trigger point for low stock alerts (units)")
+    unit =models.CharField(
+        max_length=23,
+        null=True,
+        blank=True,
     )
-    
+    unit_name =models.CharField(
+        max_length=23,
+        null=True,
+        blank=True,
+    )
     re_order_point = models.IntegerField(
         _("Reorder Point"),
         default=10,
@@ -223,12 +147,19 @@ class InventoryPolicy(ProfileMixin):
     )
     
 
-    # Safety Stock Parameters
+        # Safety Stock Parameters
     safety_stock_level = models.IntegerField(
         _("Safety Stock"),
         default=0,
         help_text=_("Buffer stock for demand/supply fluctuations")
     )
+    
+    minimum_stock_level = models.IntegerField(
+        _("Safety Stock"),
+        default=0,
+        help_text=_("Buffer stock for demand/supply fluctuations")
+    )
+    
     
     supplier_lead_time = models.IntegerField(
         _("Supplier Lead Time"),
@@ -292,7 +223,6 @@ class InventoryPolicy(ProfileMixin):
         help_text=_("Procedure for expired inventory items")
     )
 
-    # Recall Management Policies
     recall_policy = models.CharField(
         _("Recall Procedure"),
         max_length=200,
@@ -353,6 +283,9 @@ class InventoryPolicy(ProfileMixin):
         """Calculate safety stock based on demand variability and lead time"""
         return max(self.safety_stock_level, 10)  
 
+    @property
+    def get_unit(self):
+        return self.unit_name
     
 class InventoryProperty(InventoryPolicy):
     class Meta:
@@ -647,10 +580,8 @@ class Inventory(InventoryProperty):
             number_in_category= Inventory.objects.filter(category=self.category).count()+1
             if last_inventory:
                 last_reference=last_inventory.external_system_id.split('-')[-1]
-                print(last_reference)
 
                 last_reference=int(last_inventory.external_system_id.split('-')[-1])
-                print(last_reference)
             else:
                 last_reference=0
             last_reference+=1
@@ -661,7 +592,7 @@ class Inventory(InventoryProperty):
                 initials = self.category.name[:3].upper()
                 
             
-            return f"{initials}-{self.profile}{number_in_category}-{last_reference:04d}"
+            return f"INV-{initials}-{self.profile}{number_in_category}-{last_reference:04d}"
 
     def save(self, *args, **kwargs):
         # if not self.external_system_id:
@@ -697,9 +628,6 @@ class Inventory(InventoryProperty):
         )['total'] or 0
     
     
-    @property
-    def get_unit(self):
-        return f'{self.unit.name} ({self.unit.dimension_type})'
 
 
 
@@ -866,5 +794,5 @@ class InventoryTransaction(ProfileMixin):
         verbose_name = 'Inventory Transaction'
         verbose_name_plural = 'Inventory Transactions'
 
-registerable_models = [Inventory, InventoryCategory,Unit]
+registerable_models = [Inventory, InventoryCategory]
 

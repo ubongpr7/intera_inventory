@@ -17,14 +17,13 @@ from mptt.models import TreeForeignKey
 
 from django.utils import timezone
 from mainapps.company.models import  Company, CompanyAddress, Contact 
-from mainapps.inventory.helpers.field_validators import validate_currency_code
 from mainapps.inventory.models import InventoryMixin 
-from mainapps.utils.statuses import *
+from subapps.utils.statuses import *
 from decimal import Decimal, ROUND_HALF_UP
 
 class PurchaseOrderLineItem(UUIDBaseModel):
     purchase_order = models.ForeignKey('PurchaseOrder', on_delete=models.CASCADE, related_name='line_items')
-    stock_item = models.ForeignKey('stock.StockItem', on_delete=models.CASCADE,null=True, blank=True)
+    stock_item = models.ForeignKey('stock.StockItem',related_name='po_line_items', on_delete=models.CASCADE,null=True, blank=True)
     quantity = models.PositiveIntegerField()
     unit_price = models.DecimalField(max_digits=15, decimal_places=2)
     discount_rate = models.DecimalField(max_digits=5, decimal_places=2, default=0.0, help_text="Discount rate as a percentage (e.g. 5.0)")
@@ -69,7 +68,6 @@ class TotalPriceMixin(UUIDBaseModel):
         blank=True,
         null=True,
         verbose_name=_('Order Currency'),
-        validators=[validate_currency_code],
     )
 
 class Order(ProfileMixin):
@@ -110,7 +108,7 @@ class Order(ProfileMixin):
         blank=True, verbose_name=_('Link'), help_text=_('Link to an external page')
     )
 
-    delivery_date = models.DateTimeField(
+    delivery_date = models.DateField(
         blank=True,
         null=True,
         verbose_name=_('Delivery Date'),
@@ -118,7 +116,7 @@ class Order(ProfileMixin):
             'Expected date for order delivery. Order will be overdue after this date.'
         ),
     )
-    received_date=models.DateTimeField(
+    received_date=models.DateField(
         blank=True,
         null=True,
         verbose_name=_('Received Date'),
@@ -164,25 +162,24 @@ class Order(ProfileMixin):
     )
     
     
-    def generate_reference(self, prefix):
+    def generate_reference(self, prefix:str,instance:models.Model):
         """Atomically generate unique PO reference in PREFIX-YYYYMMDD-SEQ format"""
         with transaction.atomic():
             profile = self.profile
-            
+            order=instance.objects.filter(profile= self.profile).order_by('-created_at').first()
+
+            sequence=0
+            if order:
+                sequence = int(order.reference.split('-')[-1])
+            sequence +=1
             date_str = timezone.now().strftime("%Y%m%d")
             
-            sequence_number = profile.po_sequence + 1  # Add 'po_sequence' field to CompanyProfile
-            profile.po_sequence = F('po_sequence') + 1
-            profile.save(update_fields=['po_sequence'])
             
-            # Refresh to get updated value
-            profile.refresh_from_db()
-            
-            # Build reference components
             components = [
                 prefix.upper(),
+                profile,
                 date_str, 
-                f"{profile.po_sequence:04d}"
+                f"{sequence:04d}"
             ]
             
             return '-'.join(components)
@@ -300,7 +297,7 @@ class PurchaseOrder(TotalPriceMixin, Order):
         return total
     def save(self, *args, **kwargs):
         if not self.reference:
-            self.reference = self.generate_reference("PO")
+            self.reference = self.generate_reference("PO",PurchaseOrder)
         super().save(*args, **kwargs)
 
 class SalesOrder(TotalPriceMixin, Order):
@@ -477,7 +474,7 @@ class ReturnOrder(TotalPriceMixin, Order):
     
     def save(self, ):
         if not self.reference:
-            self.reference = self.generate_reference("RO")
+            self.reference = self.generate_reference("RO",ReturnOrder)
         return super().save()
     
    

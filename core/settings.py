@@ -8,7 +8,7 @@ load_dotenv()
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 
-SECRET_KEY = 'django-insecure-pvc)e7cia$y25l0lc^b@#j+5c628x8+b(^eirvpgk3$z6^t8wh'
+SECRET_KEY = os.getenv('SECRET_KEY')
 
 DEBUG = True
 
@@ -64,11 +64,9 @@ MIDDLEWARE = [
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
     'corsheaders.middleware.CorsMiddleware',
-    'middleware.ip_address_middleware.IPBlackListMiddleware',
-    'middleware.time_zone.TimezoneMiddleware'
+   
 ]
 
-BANNED_IPS=['127.0.0.']
 
 ROOT_URLCONF = 'core.urls'
 TEMPLATES = [
@@ -298,4 +296,8 @@ CELERY_RESULT_BACKEND = os.getenv('CELERY_RESULT_BACKEND', 'redis://redis:6379/0
 USE_L10N = True
 USE_THOUSAND_SEPARATOR = True
 
+# SERVICES
 USER_SERVICE_URL=os.getenv('USER_SERVICE_URL')
+COMMON_SERVICE_URL=os.getenv('COMMON_SERVICE_URL')
+PRODUCT_SERVICE_URL=os.getenv('PRODUCT_SERVICE_URL')
+

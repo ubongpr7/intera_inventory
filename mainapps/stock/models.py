@@ -157,6 +157,8 @@ class StockLocation(ProfileMixin, MPTTModel):
         super().save(*args, **kwargs)
 
 class StockItem(MPTTModel, InventoryMixin):
+
+
     name = models.CharField(
         max_length=200,
         null=True,
@@ -164,8 +166,16 @@ class StockItem(MPTTModel, InventoryMixin):
         verbose_name=_('Name'),
         help_text=_('Name of the stock item'),
     )
-    inventory = models.ForeignKey('inventory.Inventory', on_delete=models.CASCADE, null=True,related_name='stock_items')
     
+    product_variant = models.CharField(
+        max_length=200,
+        null=True,
+        blank=True,
+        verbose_name=_('Name'),
+        help_text=_('Name of the stock item'),
+    )
+
+    inventory = models.ForeignKey('inventory.Inventory', on_delete=models.CASCADE, null=True,related_name='stock_items')
     parent = TreeForeignKey(
         'self',
         verbose_name=_('Parent Stock Item'),
@@ -335,9 +345,15 @@ class StockItem(MPTTModel, InventoryMixin):
     
     @property
     def quantity_w_unit(self):
-        return f'{self.quantity} {self.inventory.get_unit}'
+        if self.inventory.unit:
+
+            if self.inventory.unit.dimension_type == 'piece':
+                return f'{int(self.quantity)} {self.inventory.get_unit}'
+            return f'{self.quantity} {self.inventory.get_unit}'
+        return f'{self.quantity}'
 
     def save(self, *args, **kwargs):
+        
         try:
 
             if not self.location:
@@ -356,15 +372,14 @@ class StockItem(MPTTModel, InventoryMixin):
             company_id = self.inventory.profile
             inv_type = self.inventory.inventory_type[:4].upper()
             category_code = ''.join([word[0] for word in self.inventory.category.name.split() if word])[:4].upper()
-
-            last_item = StockItem.objects.filter(inventory=self.inventory).order_by('-created_at').last()
+            last_item = StockItem.objects.filter(inventory=self.inventory).order_by('created_at').last()
             if last_item:
-                count =int(last_item.sku.split('-')[0])
+                count =int(last_item.sku.split('-')[-1])
             else:
                 count=0
             count+=1
 
-            self.sku = f"C{company_id}-{inv_type}-{category_code}-{count:04d}"
+            self.sku = f"STO-C{company_id}-{inv_type}-{category_code}-{count:04d}"
         super().save(*args, **kwargs)
 
     class Meta:
@@ -375,6 +390,7 @@ class StockItem(MPTTModel, InventoryMixin):
             models.Index(fields=['location']),
             models.Index(fields=['batch', 'serial']),
         ]
+
 
 class StockPricing(models.Model):
     stock_item = models.ForeignKey(StockItem, on_delete=models.CASCADE, related_name='pricings')

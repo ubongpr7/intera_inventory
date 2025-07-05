@@ -8,7 +8,7 @@ from mainapps.inventory.models import Inventory
 from ..models import (
      StockItem, StockLocation, StockItemTracking, StockLocationType
 )
-from subapps.services.user_service import UserService
+from subapps.services.microservices.user_service import UserService
 
 class StockLocationTypeSerializer(serializers.ModelSerializer):
     class Meta:

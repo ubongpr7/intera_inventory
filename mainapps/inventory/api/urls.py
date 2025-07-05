@@ -8,6 +8,5 @@ router.register(r'inventories', InventoryViewSet, basename='inventory')
 
 urlpatterns = [
     path('', include(router.urls)),
-    path('units/', UnitListView.as_view(), name='unit-of-list'),
 
 ]

@@ -81,3 +81,4 @@ graphviz
 weasyprint
 django-sync-model
 django-synchro
+modal

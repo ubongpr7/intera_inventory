@@ -6,7 +6,7 @@ from mainapps.stock.models import StockItem, StockLocation, StockItemTracking
 from mainapps.inventory.models import Inventory
 from mainapps.orders.models import PurchaseOrder, PurchaseOrderLineItem
 
-class InventoryStockItemListSerializer(serializers.ModelSerializer):
+class InventoryStockItemListSerializer(UserDetailMixin,serializers.ModelSerializer):
     """Lightweight serializer for stock item lists"""
     inventory_name = serializers.CharField(source='inventory.name', read_only=True)
     location_name = serializers.CharField(source='location.name', read_only=True)
@@ -26,7 +26,7 @@ class InventoryStockItemListSerializer(serializers.ModelSerializer):
             return (obj.expiry_date - timezone.now().date()).days
         return None
 
-class PurchaseOrderLineItemSerializer(serializers.ModelSerializer):
+class PurchaseOrderLineItemSerializer(UserDetailMixin,serializers.ModelSerializer):
     """Serializer for purchase order line items"""
     stock_item_details = InventoryStockItemListSerializer(source='stock_item', read_only=True)
     
@@ -35,7 +35,7 @@ class PurchaseOrderLineItemSerializer(serializers.ModelSerializer):
         fields = '__all__'
         read_only_fields = ['total_price']
 
-class PurchaseOrderListSerializer(serializers.ModelSerializer):
+class PurchaseOrderListSerializer(UserDetailMixin,serializers.ModelSerializer):
     """Lightweight serializer for purchase order lists"""
     supplier_name = serializers.CharField(source='supplier.name', read_only=True)
     line_items_count = serializers.SerializerMethodField()
