@@ -15,7 +15,10 @@ DEBUG = True
 ALLOWED_HOSTS = [
     'localhost',
     '127.0.0.1',
-    'dev.inventory.destinybuilders.africa'
+    'dev.inventory.destinybuilders.africa',
+     'inventory-service:8000'
+    'common-service:8000',
+    'product-service:8000',
 ]
 
 
