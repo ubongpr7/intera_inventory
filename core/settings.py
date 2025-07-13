@@ -12,7 +12,11 @@ SECRET_KEY = os.getenv('SECRET_KEY')
 
 DEBUG = True
 
-ALLOWED_HOSTS = ['*']
+ALLOWED_HOSTS = [
+    'localhost',
+    '127.0.0.1',
+    'dev.inventory.destinybuilders.africa'
+]
 
 
 # Application definition
@@ -87,7 +91,7 @@ TEMPLATES = [
 
 WSGI_APPLICATION = 'core.wsgi.application'
 
-
+"""
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.sqlite3',
@@ -106,7 +110,6 @@ DATABASES = {
         'PORT': os.getenv('DB_PORT'),
     }
 }
-"""
 
 AUTH_PASSWORD_VALIDATORS = [
     {
@@ -271,6 +274,16 @@ CORS_ALLOWED_ORIGINS = [
 
 ]
 
+
+SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+SESSION_COOKIE_SECURE = True
+SECURE_SSL_REDIRECT = True
+
+CSRF_COOKIE_SECURE = True
+FILE_UPLOAD_TIMEOUT = 3600
+DATA_UPLOAD_MAX_MEMORY_SIZE = 2147483648  # 2GB
+FILE_UPLOAD_MAX_MEMORY_SIZE = 2147483648  # 2GB
+
 TINYMCE_DEFAULT_CONFIG = {
     'height': 360,
     'width': 800,
@@ -279,6 +292,7 @@ TINYMCE_DEFAULT_CONFIG = {
     'selector': 'textarea',
     'theme': 'modern',
 }
+
 """
 CACHES = {
     "default": {

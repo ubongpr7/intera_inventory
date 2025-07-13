@@ -18,7 +18,7 @@ from mainapps.stock.models import StockItem, StockLocation, StockLocationType
 from rest_framework import viewsets
 
 from subapps.permissions.constants import UNIFIED_PERMISSION_DICT
-from subapps.permissions.microservice_permissions import PermissionRequiredMixin
+from subapps.permissions.microservice_permissions import CachingMixin, PermissionRequiredMixin
 
 class ReadStockLocationType(viewsets.ReadOnlyModelViewSet):
     serializer_class= StockLocationTypeSerializer
@@ -135,9 +135,9 @@ class StockLocationViewSet(BaseInventoryViewSet):
             )
 
 
-class BaseInventoryViewSetMixin(PermissionRequiredMixin,viewsets.ModelViewSet):
+class BaseInventoryViewSetMixin(CachingMixin,PermissionRequiredMixin,viewsets.ModelViewSet):
     """Base viewset with common functionality"""
-
+    
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     
     def get_queryset(self):
@@ -242,6 +242,34 @@ class StockItemViewSet(BaseInventoryViewSetMixin):
             'old_status': old_status,
             'new_status': new_status
         })
+    @action(detail=False, methods=['POST'])
+    def create_for_variants(self,request, ):
+        """Create stock items for product variants"""
+        data = request.data
+        inventory_id = data.get('inventory')
+        product_variant = data.get('product_variant', )
+        
+        if not inventory_id or not product_variant:
+            return Response(
+                {'error': 'inventory_id and product_variants are required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        inventory = Inventory.objects.get(id=inventory_id)
+        stock_item,created = StockItem.objects.get_or_create(
+            inventory=inventory,
+            product_variant=product_variant,
+            defaults={
+                'name': request.data.get('name', ''),
+                'quantity': 0,
+                'delete_on_deplete': request.data.get('delete_on_deplete', False),
+            }
+        )
+        serializer = self.get_serializer(stock_item)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+        
+
+    
     @action(detail=False, methods=['get'])
     def get_inventory_items(self,request, ):
         inventory_id = request.query_params.get('inventory_id')
@@ -250,6 +278,7 @@ class StockItemViewSet(BaseInventoryViewSetMixin):
         serializer = StockItemListSerializer(stock_items, many=True)
         return Response(serializer.data)
     
+
     @action(detail=True, methods=['get'])
     def tracking_history(self, request, pk=None):
         """Get complete tracking history for stock item"""

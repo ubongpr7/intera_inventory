@@ -9,7 +9,7 @@ from datetime import timedelta, datetime
 from decimal import Decimal
 
 from subapps.permissions.constants import UNIFIED_PERMISSION_DICT
-from subapps.permissions.microservice_permissions import PermissionRequiredMixin
+from subapps.permissions.microservice_permissions import BaseCachePermissionViewset, PermissionRequiredMixin
 from subapps.services.microservices.user_service import UserService
 
 from ..models import (
@@ -18,7 +18,7 @@ from ..models import (
 from .serializers import *
 
 
-class BaseInventoryViewSet(PermissionRequiredMixin,viewsets.ModelViewSet):
+class BaseInventoryViewSet(BaseCachePermissionViewset):
     """Base viewset with common functionality"""
     # permission_classes = [IsAuthenticated]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]

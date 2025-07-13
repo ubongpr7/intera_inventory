@@ -3,7 +3,7 @@ from rest_framework import viewsets, status
 from rest_framework.response import Response
 
 from mainapps.inventory.api.views import BaseInventoryViewSet
-from subapps.permissions.microservice_permissions import PermissionRequiredMixin
+from subapps.permissions.microservice_permissions import BaseCachePermissionViewset, PermissionRequiredMixin
 from ..models import Company, CompanyAddress, Contact
 from .serializers import CompanyAddressSerializer, CompanySerializer, ContactSerializer
 from rest_framework.decorators import action
@@ -27,12 +27,12 @@ class CompanyViewSet(BaseInventoryViewSet):
         return Response(serializer.data)    
 
     
-class CompanyAddressViewSet(PermissionRequiredMixin,viewsets.ModelViewSet):
+class CompanyAddressViewSet(BaseCachePermissionViewset):
     serializer_class = CompanyAddressSerializer
     queryset=CompanyAddress.objects.all()
 
     
-class ContactPersonViewSet(PermissionRequiredMixin,viewsets.ModelViewSet):
+class ContactPersonViewSet(BaseCachePermissionViewset):
     serializer_class = ContactSerializer
     queryset= Contact.objects.all()
     

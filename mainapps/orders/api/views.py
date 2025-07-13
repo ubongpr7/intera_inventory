@@ -13,7 +13,7 @@ import logging
 from mainapps.inventory.models import InventoryTransaction, TransactionType
 from mainapps.orders.api.serializers import PurchaseOrderDetailSerializer, PurchaseOrderListSerializer
 from subapps.permissions.constants import PURCHASE_ORDER_PERMISSIONS, UNIFIED_PERMISSION_DICT
-from subapps.permissions.microservice_permissions import HasModelRequestPermission, PermissionRequiredMixin
+from subapps.permissions.microservice_permissions import BaseCachePermissionViewset, HasModelRequestPermission, PermissionRequiredMixin
 from subapps.services.emails.email_services import EmailService
 from subapps.services.pdf.pdf_service import PDFService
 from subapps.services.microservices.user_service import UserService
@@ -24,7 +24,7 @@ from ..models import (
 )
 logger = logging.getLogger(__name__)
 
-class PurchaseOrderViewSet(PermissionRequiredMixin, viewsets.ModelViewSet):
+class PurchaseOrderViewSet(BaseCachePermissionViewset):
     """
     Enhanced ViewSet for comprehensive purchase order management
     Includes workflow management, receiving, returns, and analytics
