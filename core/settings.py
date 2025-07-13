@@ -19,6 +19,8 @@ ALLOWED_HOSTS = [
      'inventory-service:8000'
     'common-service:8000',
     'product-service:8000',
+    '16.16.25.132'
+
 
 
 ]
