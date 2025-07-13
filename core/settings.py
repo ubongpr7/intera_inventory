@@ -276,13 +276,17 @@ CORS_ALLOW_HEADERS = [
 
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:3000",
+    "http://localhost:8001",
     "http://127.0.0.1:3000",
     'http://3.212.68.52:3000',
     "https://intera-inventory.vercel.app",
-    "http://3.84.22.207:3000"
-
+    "http://3.84.22.207:3000",
+    'https://agentic-caller-gvlu.onrender.com',
+    'https://intera-inventory.vercel.app',
+    'https://dev.product.destinybuilders.africa',
+    'https://dev.inventory.destinybuilders.africa',
+    'https://dev.pos.destinybuilders.africa',
 ]
-
 
 SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
 SESSION_COOKIE_SECURE = True
