@@ -11,7 +11,8 @@ from decimal import Decimal
 import logging
 
 from mainapps.inventory.models import InventoryTransaction, TransactionType
-from mainapps.orders.api.serializers import PurchaseOrderDetailSerializer, PurchaseOrderListSerializer
+from mainapps.orders.api.serializers import PurchaseOrderDetailSerializer, PurchaseOrderListSerializer,ReceiveItemsSerializer
+from mainapps.stock.models import StockItem
 from subapps.permissions.constants import PURCHASE_ORDER_PERMISSIONS, UNIFIED_PERMISSION_DICT
 from subapps.permissions.microservice_permissions import BaseCachePermissionViewset, HasModelRequestPermission, PermissionRequiredMixin
 from subapps.services.emails.email_services import EmailService
@@ -121,7 +122,6 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
         """Add line item to purchase order"""
         purchase_order = self.get_object()
         
-        # Check if order can be modified
         if purchase_order.status not in [PurchaseOrderStatus.PENDING, 'draft']:
             return Response(
                 {'error': 'Cannot modify order in current status'},
@@ -233,7 +233,7 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
         """Approve purchase order"""
         purchase_order = self.get_object()
         
-        if purchase_order.status != PurchaseOrderStatus.PENDING:
+        if purchase_order.status not in [PurchaseOrderStatus.PENDING,'draft']:
             return Response(
                 {'error': 'Only pending orders can be approved'},
                 status=status.HTTP_400_BAD_REQUEST
@@ -328,31 +328,22 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
                         line_item = purchase_order.line_items.get(id=line_item_id)
                     except PurchaseOrderLineItem.DoesNotExist:
                         raise ValueError(f"Line item {line_item_id} not found")
-                    
+                    total_q_r=line_item.quantity_received+ quantity_received
                     # Validate quantity
-                    if quantity_received > line_item.quantity:
+                    if total_q_r > line_item.quantity :
                         raise ValueError(
-                            f"Cannot receive {quantity_received} items, "
+                            f"Cannot receive {quantity_received} items,{line_item.quantity_received, 'received already' if line_item.quantity_received>0 else ''}"
                             f"only {line_item.quantity} ordered"
                         )
                     
                     # Create or update stock item
-                    stock_item, created = StockItem.objects.get_or_create(
-                        inventory=line_item.stock_item.inventory if line_item.stock_item else None,
-                        location_id=location_id,
-                        purchase_order=purchase_order,
-                        defaults={
-                            'name': line_item.description or 'Received Item',
-                            'quantity': quantity_received,
-                            'purchase_price': line_item.unit_price,
-                            'status': 'ok'
-                        }
-                    )
+                    stock_item= line_item.stock_item
                     
-                    if not created:
+                    if  stock_item:
                         stock_item.quantity = F('quantity') + quantity_received
                         stock_item.save()
                         stock_item.refresh_from_db()
+                    
                     
                     # Create tracking record
                     StockItemTracking.objects.create(
@@ -681,7 +672,7 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
                 transactions.append(
                     InventoryTransaction(
                         item=line_item.stock_item,
-                        quantity=line_item.quantity,
+                        quantity=line_item.quantity if line_item.quantity_received<=0 else line_item.quantity_received,
                         unit_price=line_item.unit_price,
                         transaction_type=TransactionType.PO_COMPLETE,
                         reference=purchase_order.reference,
@@ -838,8 +829,7 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
         try:
             current_user_id= self.request.user.id
             if current_user_id:
-                # Call activity logging service
-                # This would be implemented based on your activity logging requirements
+
                 logger.info(
                     f"User {current_user_id} performed {action} "
                     f"on PO {instance.reference}: {details}"

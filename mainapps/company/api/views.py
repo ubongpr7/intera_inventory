@@ -3,6 +3,7 @@ from rest_framework import viewsets, status
 from rest_framework.response import Response
 
 from mainapps.inventory.api.views import BaseInventoryViewSet
+from subapps.permissions.constants import UNIFIED_PERMISSION_DICT
 from subapps.permissions.microservice_permissions import BaseCachePermissionViewset, PermissionRequiredMixin
 from ..models import Company, CompanyAddress, Contact
 from .serializers import CompanyAddressSerializer, CompanySerializer, ContactSerializer
@@ -11,6 +12,7 @@ from rest_framework.decorators import action
 class CompanyViewSet(BaseInventoryViewSet):
     serializer_class = CompanySerializer
     queryset=Company.objects.all()
+    # required_permission=UNIFIED_PERMISSION_DICT.get('company')
 
     @action(methods=['GET'], detail=True)
     def addresses(self, request, pk=None):

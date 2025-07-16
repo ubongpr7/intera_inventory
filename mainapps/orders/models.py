@@ -4,6 +4,7 @@ import os
 import sys
 from datetime import datetime
 from decimal import Decimal
+import uuid
 from django.core.exceptions import ValidationError
 from django.core.validators import MinValueValidator
 from django.db import IntegrityError, models, transaction
@@ -23,7 +24,7 @@ from decimal import Decimal, ROUND_HALF_UP
 
 class PurchaseOrderLineItem(UUIDBaseModel):
     purchase_order = models.ForeignKey('PurchaseOrder', on_delete=models.CASCADE, related_name='line_items')
-    stock_item = models.ForeignKey('stock.StockItem',related_name='po_line_items', on_delete=models.CASCADE,null=True, blank=True)
+    stock_item = models.ForeignKey('stock.StockItem',related_name='po_line_items', on_delete=models.CASCADE,null=True, blank=False)
     quantity = models.PositiveIntegerField()
     unit_price = models.DecimalField(max_digits=15, decimal_places=2)
     discount_rate = models.DecimalField(max_digits=5, decimal_places=2, default=0.0, help_text="Discount rate as a percentage (e.g. 5.0)")
@@ -32,8 +33,19 @@ class PurchaseOrderLineItem(UUIDBaseModel):
     discount = models.DecimalField(max_digits=10, decimal_places=2, default=0.0)
     total_price = models.DecimalField(max_digits=18, decimal_places=2, editable=False)
     description=models.TextField(null=True, blank=True)
-    
+    expiry_date =models.DateField(null=True,blank=True, )
+    manufactured_date =models.DateField(null=True,blank=True)
+    batch_number= models.CharField(max_length=30, blank=True)
+    fully_received= models.BooleanField(default=False)
+    def generate_batch_number(self)->str:
+        while True:
+            code = str(uuid.uuid4().int)[:12]
+            if not PurchaseOrderLineItem.objects.filter(batch_number=code).exists():
+                return code
+
     def save(self, *args, **kwargs):
+        if not self.batch_number:
+            self.batch_number = self.generate_batch_number()
         self.full_clean()
         self.total_price = (self.quantity * self.unit_price) + self.tax_amount- self.discount
         self.total_price = Decimal(self.total_price).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
@@ -187,7 +199,6 @@ class Order(ProfileMixin):
 
 class PurchaseOrderStatus(models.TextChoices):
     """Defines a set of status codes for a PurchaseOrder."""
-
     PENDING = 'pending', _('Pending')
     ISSUED = 'issued', _('Isshued')
     COMPLETED = 'completed', _('Complete')
