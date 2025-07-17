@@ -31,6 +31,7 @@ class PurchaseOrderLineItemSerializer(UserDetailMixin,serializers.ModelSerialize
     stock_item_details = InventoryStockItemListSerializer(source='stock_item', read_only=True)
     unit = serializers.CharField(source='stock_item.inventory.unit_name', read_only=True)
     
+    
     class Meta:
         model = PurchaseOrderLineItem
         fields = '__all__'
