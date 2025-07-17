@@ -51,6 +51,7 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
         profile_id = self.request.headers.get('X-Profile-ID')
         if profile_id:
             queryset = queryset.filter(profile=profile_id)
+
         else:
             return Response(status=status.HTTP_401_UNAUTHORIZED)
         
@@ -73,7 +74,7 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
             queryset = queryset.filter(created_at__gte=date_from)
         if date_to:
             queryset = queryset.filter(created_at__lte=date_to)
-        
+        print(queryset)
         return queryset
     
     def perform_create(self, serializer):
