@@ -117,7 +117,7 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
         })
     
     # ==================== LINE ITEM MANAGEMENT ====================
-    @action(detail=True, methods=['post'])
+    @action(detail=True, methods=['get'])
     def line_items(self, request, pk=None):
         """List line items for purchase order"""    
         purchase_order = self.get_object()
