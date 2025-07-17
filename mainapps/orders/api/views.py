@@ -11,7 +11,7 @@ from decimal import Decimal
 import logging
 
 from mainapps.inventory.models import InventoryTransaction, TransactionType
-from mainapps.orders.api.serializers import PurchaseOrderDetailSerializer, PurchaseOrderListSerializer,ReceiveItemsSerializer
+from mainapps.orders.api.serializers import PurchaseOrderDetailSerializer, PurchaseOrderLineItemSerializer,PurchaseOrderLineItemCreateSerializer, PurchaseOrderListSerializer,ReceiveItemsSerializer
 from mainapps.stock.models import StockItem
 from subapps.permissions.constants import PURCHASE_ORDER_PERMISSIONS, UNIFIED_PERMISSION_DICT
 from subapps.permissions.microservice_permissions import BaseCachePermissionViewset, HasModelRequestPermission, PermissionRequiredMixin
@@ -117,6 +117,13 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
         })
     
     # ==================== LINE ITEM MANAGEMENT ====================
+    @action(detail=True, methods=['post'])
+    def line_items(self, request, pk=None):
+        """List line items for purchase order"""    
+        purchase_order = self.get_object()
+        line_items = purchase_order.line_items.all()
+        serializer = PurchaseOrderLineItemSerializer(line_items, many=True)
+        return Response(serializer.data)
     
     @action(detail=True, methods=['post'])
     def add_line_item(self, request, pk=None):

@@ -23,7 +23,7 @@ from subapps.utils.statuses import *
 from decimal import Decimal, ROUND_HALF_UP
 
 class PurchaseOrderLineItem(UUIDBaseModel):
-    purchase_order = models.ForeignKey('PurchaseOrder', on_delete=models.CASCADE, related_name='line_items')
+    purchase_order = models.ForeignKey('PurchaseOrder',blank=True, on_delete=models.CASCADE, related_name='line_items')
     stock_item = models.ForeignKey('stock.StockItem',related_name='po_line_items', on_delete=models.CASCADE,null=True, blank=False)
     quantity = models.PositiveIntegerField()
     unit_price = models.DecimalField(max_digits=15, decimal_places=2)
