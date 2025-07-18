@@ -1,14 +1,14 @@
 from rest_framework import permissions
 import logging
 from rest_framework.response import Response
+
 import hashlib
 from django.core.cache import cache
 from functools import wraps
-from rest_framework_simplejwt.tokens import UntypedToken
-from rest_framework import status
-from rest_framework import viewsets
 
 logger = logging.getLogger(__name__)
+
+from rest_framework_simplejwt.tokens import UntypedToken
 
 class HasModelRequestPermission(permissions.BasePermission):
     """
@@ -52,15 +52,17 @@ class PermissionRequiredMixin:
     required_permission = None
     permission_classes = [ HasModelRequestPermission]
     
+
 class CachingMixin:
     """
-    Caching mixin for DRF ViewSets with multi-tenant support
+    Reusable caching mixin for DRF ViewSets
     """
+    # Default cache configuration
     CACHE_ENABLED = True
-    CACHE_TTL = 60 * 60  # 1 hour
+    CACHE_TTL = 60*60
     CACHE_VERSION_KEY = "{model_name}_cache_version"
     CACHE_KEY_PREFIX = "{model_name}_cache"
-    INCLUDE_HEADERS_IN_KEY = ['X-Profile-ID']  # Ensure tenant-based cache separation
+    INCLUDE_HEADERS_IN_KEY = ['X-Profile-ID']
     INCLUDE_QUERY_PARAMS = True
 
     def __init__(self, *args, **kwargs):
@@ -78,26 +80,26 @@ class CachingMixin:
 
     def _generate_cache_key(self, request, *args, **kwargs):
         """
-        Generate unique cache key based on request, tenant (X-Profile-ID), and view specifics
+        Generate unique cache key based on request and view specifics
         """
         path = request.path
         version = cache.get(self.CACHE_VERSION_KEY, 1)
-
-        # Get relevant headers (especially tenant identifier)
+        
+        # Get relevant headers
         headers = {
-            h: request.headers.get(h)
-            for h in self.INCLUDE_HEADERS_IN_KEY
+            h: request.headers.get(h) 
+            for h in self.INCLUDE_HEADERS_IN_KEY 
             if request.headers.get(h)
         }
-
+        
         # Get query params if enabled
         params = {}
         if self.INCLUDE_QUERY_PARAMS and hasattr(request, 'query_params'):
             params = request.query_params.dict()
-
+        
         # Include view-specific args if needed
         view_specific = self._get_view_specific_cache_components(request, *args, **kwargs)
-
+        
         # Stable key components
         components = {
             'path': path,
@@ -106,7 +108,7 @@ class CachingMixin:
             'params': '_'.join(f"{k}={v}" for k, v in sorted(params.items())),
             'view_specific': view_specific
         }
-
+        
         # Hash to avoid long keys
         key_str = '|'.join(f"{k}:{v}" for k, v in components.items() if v)
         return f"{self.CACHE_KEY_PREFIX}_{hashlib.md5(key_str.encode()).hexdigest()}"
@@ -124,74 +126,83 @@ class CachingMixin:
         except ValueError:  # Key doesn't exist
             cache.set(self.CACHE_VERSION_KEY, 2, timeout=None)
 
-    def cache_action(self, ttl=None):
+    def cache_response(self, func=None, *, ttl=None):
         """
-        Decorator to cache custom actions like approve, reject, etc.
+        Decorator to cache view responses
         """
-        def decorator(func):
-            @wraps(func)
-            def wrapper(viewset, request, *args, **kwargs):
-                if not getattr(viewset, 'CACHE_ENABLED', True):
-                    return func(viewset, request, *args, **kwargs)
-
-                cache_key = viewset._generate_cache_key(request, *args, **kwargs)
+        def decorator(view_method):
+            @wraps(view_method)
+            def wrapper(self, request, *args, **kwargs):
+                if not getattr(self, 'CACHE_ENABLED', True):
+                    return view_method(self, request, *args, **kwargs)
+                    
+                cache_ttl = ttl if ttl is not None else getattr(self, 'CACHE_TTL', 300)
+                cache_key = self._generate_cache_key(request, *args, **kwargs)
                 cached_data = cache.get(cache_key)
-
+                
                 if cached_data is not None:
-                    return Response(cached_data, status=status.HTTP_200_OK)
-
-                response = func(viewset, request, *args, **kwargs)
-
-                if isinstance(response, Response) and response.status_code == status.HTTP_200_OK:
-                    cache.set(cache_key, response.data, ttl or viewset.CACHE_TTL)
-
+                    return cached_data
+                    
+                response = view_method(self, request, *args, **kwargs)
+                
+                if response.status_code == 200:  # Only cache successful responses
+                    cache.set(cache_key, response.data, cache_ttl)
+                    
                 return response
             return wrapper
-        return decorator
-
-    def cache_response(self, ttl=None):
-        """
-        Decorator to wrap DRF list/retrieve methods
-        """
-        def decorator(func):
-            @wraps(func)
-            def wrapper(viewset, request, *args, **kwargs):
-                if not getattr(viewset, 'CACHE_ENABLED', True):
-                    return func(viewset, request, *args, **kwargs)
-
-                cache_key = viewset._generate_cache_key(request, *args, **kwargs)
-                cached_data = cache.get(cache_key)
-
-                if cached_data is not None:
-                    return Response(cached_data, status=status.HTTP_200_OK)
-
-                response = func(viewset, request, *args, **kwargs)
-
-                if isinstance(response, Response) and response.status_code == status.HTTP_200_OK:
-                    cache.set(cache_key, response.data, ttl or viewset.CACHE_TTL)
-
-                return response
-            return wrapper
-        return decorator
+        
+        if func is None:
+            return decorator
+        return decorator(func)
 
     def perform_create(self, serializer):
-        super().perform_create(serializer)
+        instance = super().perform_create(serializer)
         self._invalidate_cache()
+        return instance
 
     def perform_update(self, serializer):
-        super().perform_update(serializer)
+        instance = super().perform_update(serializer)
         self._invalidate_cache()
+        return instance
 
     def perform_destroy(self, instance):
-        super().perform_destroy(instance)
+        result = super().perform_destroy(instance)
         self._invalidate_cache()
-
-    @cache_response()
+        return result
     def list(self, request, *args, **kwargs):
-        return super().list(request, *args, **kwargs)
+        if not getattr(self, 'CACHE_ENABLED', True):
+            return super().list(request, *args, **kwargs)
+            
+        cache_key = self._generate_cache_key(request, *args, **kwargs)
+        cached_data = cache.get(cache_key)
+        
+        if cached_data is not None:
+            return Response(cached_data)
+            
+        response = super().list(request, *args, **kwargs)
+        
+        if response.status_code == 200:
+            cache.set(cache_key, response.data, getattr(self, 'CACHE_TTL', 300))
+            
+        return response
 
-    @cache_response()
     def retrieve(self, request, *args, **kwargs):
-        return super().retrieve(request, *args, **kwargs)
+        if not getattr(self, 'CACHE_ENABLED', True):
+            return super().retrieve(request, *args, **kwargs)
+            
+        cache_key = self._generate_cache_key(request, *args, **kwargs)
+        cached_data = cache.get(cache_key)
+        
+        if cached_data is not None:
+            return Response(cached_data)
+            
+        response = super().retrieve(request, *args, **kwargs)
+        
+        if response.status_code == 200:
+            cache.set(cache_key, response.data, getattr(self, 'CACHE_TTL', 300))
+            
+        return response
+    
+from rest_framework import viewsets
 class BaseCachePermissionViewset(CachingMixin,PermissionRequiredMixin,viewsets.ModelViewSet):
     pass
