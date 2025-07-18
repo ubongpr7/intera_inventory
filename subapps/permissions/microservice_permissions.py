@@ -64,6 +64,7 @@ def cache_response(ttl=None):
 
                 cache_key = viewset._generate_cache_key(request, *args, **kwargs)
                 cached_data = cache.get(cache_key)
+                print(cached_data)
 
                 if cached_data is not None:
                     return Response(cached_data, status=status.HTTP_200_OK)
