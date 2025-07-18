@@ -31,7 +31,8 @@ class PurchaseOrderLineItem(UUIDBaseModel):
     stock_item = models.ForeignKey(
         'stock.StockItem',
         related_name='po_line_items',
-        on_delete=models.CASCADE
+        on_delete=models.CASCADE,
+        null=True
     )
     quantity = models.PositiveIntegerField(
         validators=[MinValueValidator(1)]
