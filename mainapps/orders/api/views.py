@@ -289,9 +289,6 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        serializer = PurchaseOrderWorkflowSerializer(data=request.data)
-        if not serializer.is_valid():
-            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
         
         current_user = UserService.get_current_user(request)
         
@@ -521,9 +518,6 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        serializer = PurchaseOrderWorkflowSerializer(data=request.data)
-        if not serializer.is_valid():
-            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
         
         current_user = UserService.get_current_user(request)
         

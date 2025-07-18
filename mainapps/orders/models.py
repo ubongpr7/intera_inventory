@@ -23,21 +23,36 @@ from subapps.utils.statuses import *
 from decimal import Decimal, ROUND_HALF_UP
 
 class PurchaseOrderLineItem(UUIDBaseModel):
-    purchase_order = models.ForeignKey('PurchaseOrder',blank=True, on_delete=models.CASCADE, related_name='line_items')
-    stock_item = models.ForeignKey('stock.StockItem',related_name='po_line_items', on_delete=models.CASCADE,null=True, blank=False)
-    quantity = models.PositiveIntegerField()
+    purchase_order = models.ForeignKey(
+        'PurchaseOrder',
+        on_delete=models.CASCADE,
+        related_name='line_items'
+    )
+    stock_item = models.ForeignKey(
+        'stock.StockItem',
+        related_name='po_line_items',
+        on_delete=models.CASCADE
+    )
+    quantity = models.PositiveIntegerField(
+        validators=[MinValueValidator(1)]
+    )
     unit_price = models.DecimalField(max_digits=15, decimal_places=2)
-    discount_rate = models.DecimalField(max_digits=5, decimal_places=2, default=0.0, help_text="Discount rate as a percentage (e.g. 5.0)")
-    tax_rate = models.DecimalField(max_digits=5, decimal_places=2, default=0.0, help_text="Discount rate as a percentage (e.g. 5.0)")
-    tax_amount = models.DecimalField(max_digits=10, decimal_places=2, default=0.0)
-    discount = models.DecimalField(max_digits=10, decimal_places=2, default=0.0)
-    total_price = models.DecimalField(max_digits=18, decimal_places=2, editable=False)
-    description=models.TextField(null=True, blank=True)
-    expiry_date =models.DateField(null=True,blank=True, )
-    manufactured_date =models.DateField(null=True,blank=True)
-    batch_number= models.CharField(max_length=30, blank=True)
-    fully_received= models.BooleanField(default=False)
-    def generate_batch_number(self)->str:
+    discount_rate = models.DecimalField(
+        max_digits=5, decimal_places=2,
+        default=0.0,
+        help_text="Discount rate as a percentage (e.g. 5.0)"
+    )
+    tax_rate = models.DecimalField(
+        max_digits=5, decimal_places=2,
+        default=0.0
+    )
+    description = models.TextField(null=True, blank=True)
+    expiry_date = models.DateField(null=True, blank=True)
+    manufactured_date = models.DateField(null=True, blank=True)
+    batch_number = models.CharField(max_length=30, blank=True)
+    fully_received = models.BooleanField(default=False)
+
+    def generate_batch_number(self) -> str:
         while True:
             code = str(uuid.uuid4().int)[:12]
             if not PurchaseOrderLineItem.objects.filter(batch_number=code).exists():
@@ -47,16 +62,32 @@ class PurchaseOrderLineItem(UUIDBaseModel):
         if not self.batch_number:
             self.batch_number = self.generate_batch_number()
         self.full_clean()
-        self.total_price = (self.quantity * self.unit_price) + self.tax_amount- self.discount
-        self.total_price = Decimal(self.total_price).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
         super().save(*args, **kwargs)
+
     def clean(self):
         if self.quantity <= 0:
             raise ValidationError("Quantity must be greater than zero.")
         if self.unit_price < 0:
             raise ValidationError("Unit price must be non-negative.")
+
+    @property
+    def tax_amount(self):
+        return (self.unit_price * self.quantity) * (self.tax_rate / Decimal("100"))
+
+    @property
+    def discount_amount(self):
+        return (self.unit_price * self.quantity) * (self.discount_rate / Decimal("100"))
+
+    @property
+    def total_price(self):
+        subtotal = self.quantity * self.unit_price
+        return (subtotal + self.tax_amount - self.discount_amount).quantize(
+            Decimal('0.00'), rounding=ROUND_HALF_UP
+        )
+
     def __str__(self):
-        return f"{self.quantity} x {self.stock_item} @ {self.unit_price} (Total: {self.total_price})"
+        return f"{self.quantity} x {self.stock_item} @ {self.unit_price}"
+
 
 class TotalPriceMixin(UUIDBaseModel):
 
@@ -68,12 +99,6 @@ class TotalPriceMixin(UUIDBaseModel):
         abstract = True
 
     
-    total_price = models.PositiveBigIntegerField(
-        null=True,
-        blank=True,
-        verbose_name=_('Total Price'),
-        help_text=_('Total price for this order'),
-    )
 
     order_currency =models.CharField(
         max_length=10,
@@ -305,17 +330,20 @@ class PurchaseOrder(TotalPriceMixin, Order):
     department = models.CharField(max_length=100, blank=True)
     
     def calculate_total(self):
-        """Calculate total from line items"""
+        """Dynamic total from line items"""
         total = self.line_items.aggregate(
             total=models.Sum('total_price')
         )['total'] or Decimal('0.00')
-        
-        self.total_price = int(total * 100)  # Store as cents
         return total
+
+    @property
+    def total_price(self):
+        return self.calculate_total()
     def save(self, *args, **kwargs):
         if not self.reference:
             self.reference = self.generate_reference("PO",PurchaseOrder)
         super().save(*args, **kwargs)
+
 
 class SalesOrder(TotalPriceMixin, Order):
     """A SalesOrder represents a list of goods shipped outwards to a customer."""
