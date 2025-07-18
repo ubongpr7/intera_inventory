@@ -29,10 +29,10 @@ class InventoryStockItemListSerializer(UserDetailMixin,serializers.ModelSerializ
 class PurchaseOrderLineItemSerializer(UserDetailMixin,serializers.ModelSerializer):
     """Serializer for purchase order line items"""
     stock_item_details = InventoryStockItemListSerializer(source='stock_item', read_only=True)
-    unit = serializers.SerializerMethodField()
+    quantity_w_unit = serializers.SerializerMethodField()
     
-    def get_unit(self, obj):
-        return obj.stock_item.inventory.unit if obj.stock_item else 'pieces'
+    def get_quantity_w_unit(self, obj):
+        return f"{obj.quantity} {obj.stock_item.inventory.unit}"
     
 
     class Meta:
