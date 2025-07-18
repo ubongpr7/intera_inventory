@@ -32,7 +32,7 @@ class PurchaseOrderLineItemSerializer(UserDetailMixin,serializers.ModelSerialize
     unit = serializers.SerializerMethodField()
     
     def get_unit(self, obj):
-        return obj.stock_item.inventory.get_unit if obj.stock_item else None
+        return obj.stock_item.inventory.unit if obj.stock_item else 'pieces'
     
 
     class Meta:
