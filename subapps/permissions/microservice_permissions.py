@@ -59,7 +59,7 @@ class CachingMixin:
     """
     # Default cache configuration
     CACHE_ENABLED = True
-    CACHE_TTL = 60*60
+    CACHE_TTL = 300
     CACHE_VERSION_KEY = "{model_name}_cache_version"
     CACHE_KEY_PREFIX = "{model_name}_cache"
     INCLUDE_HEADERS_IN_KEY = ['X-Profile-ID']
