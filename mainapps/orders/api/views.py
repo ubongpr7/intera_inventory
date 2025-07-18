@@ -259,8 +259,6 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
             )
         
         
-        # current_user = UserService.get_current_user(request)
-        
         with transaction.atomic():
             purchase_order.status = PurchaseOrderStatus.APPROVED
             purchase_order.approved_by = request.user.id
@@ -280,7 +278,70 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
         })
     
     
-    @action(detail=True, methods=['post'])
+    @action(detail=True, methods=['put', 'patch'])
+    def issue(self, request, pk=None):
+        """Enhanced issue method with proper email handling"""
+        purchase_order = self.get_object()
+        
+        if purchase_order.status != PurchaseOrderStatus.APPROVED:
+            return Response(
+                {'error': 'Only approved orders can be issued'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        serializer = PurchaseOrderWorkflowSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        
+        current_user = UserService.get_current_user(request)
+        
+        try:
+            with transaction.atomic():
+                # Calculate total price
+                total_price = sum(
+                    line_item.total_price for line_item in purchase_order.line_items.all()
+                )
+                
+                purchase_order.total_price = int(total_price * 100)  # Store as cents
+                purchase_order.status = PurchaseOrderStatus.ISSUED
+                purchase_order.issue_date = timezone.now()
+                purchase_order.issued_by = current_user_id
+                purchase_order.save()
+                
+                # Send email notification if requested
+                email_sent = False
+                if serializer.validated_data.get('notify_supplier', True):
+                    try:
+                        self._send_purchase_order_email(purchase_order)
+                        email_sent = True
+                    except Exception as e:
+                        logger.warning(f"Failed to send email for PO {purchase_order.reference}: {str(e)}")
+                        # Don't fail the entire operation if email fails
+                
+                # Log activity
+                self._log_activity('ISSUE', purchase_order, {
+                    'issued_by': current_user.get('full_name'),
+                    'total_price': str(total_price),
+                    'email_sent': email_sent,
+                    'email_requested': serializer.validated_data.get('notify_supplier', True)
+                })
+            
+            return Response({
+                'message': 'Purchase order issued successfully',
+                'status': purchase_order.status,
+                'total_price': total_price,
+                'issue_date': purchase_order.issue_date,
+                'email_sent': email_sent
+            })
+            
+        except Exception as e:
+            logger.error(f"Error issuing purchase order {purchase_order.reference}: {str(e)}")
+            return Response(
+                {'error': f'Error issuing purchase order: {str(e)}'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+    
+    @action(detail=True, methods=['put', 'patch'])
     def receive(self, request, pk=None):
         """Mark purchase order as received"""
         purchase_order = self.get_object()
@@ -311,7 +372,7 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
             'received_date': purchase_order.received_date
         })
     
-    @action(detail=True, methods=['post'])
+    @action(detail=True, methods=['put', 'patch'])
     def receive_items(self, request, pk=None):
         """Receive specific items and update stock"""
         purchase_order = self.get_object()
@@ -407,7 +468,7 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
                 status=status.HTTP_400_BAD_REQUEST
             )
     
-    @action(detail=True, methods=['post'])
+    @action(detail=True, methods=['put', 'patch'])
     def complete(self, request, pk=None):
         """Mark purchase order as complete and finalize stock"""
         purchase_order = self.get_object()
@@ -449,7 +510,7 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
     
-    @action(detail=True, methods=['post'])
+    @action(detail=True, methods=['put', 'patch'])
     def cancel(self, request, pk=None):
         """Cancel purchase order"""
         purchase_order = self.get_object()
@@ -907,69 +968,6 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
         except Exception as e:
             logger.error(f"Failed to send return order email: {str(e)}")
             raise
-    
-    @action(detail=True, methods=['post'])
-    def issue(self, request, pk=None):
-        """Enhanced issue method with proper email handling"""
-        purchase_order = self.get_object()
-        
-        if purchase_order.status != PurchaseOrderStatus.APPROVED:
-            return Response(
-                {'error': 'Only approved orders can be issued'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        serializer = PurchaseOrderWorkflowSerializer(data=request.data)
-        if not serializer.is_valid():
-            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-        
-        current_user = UserService.get_current_user(request)
-        
-        try:
-            with transaction.atomic():
-                # Calculate total price
-                total_price = sum(
-                    line_item.total_price for line_item in purchase_order.line_items.all()
-                )
-                
-                purchase_order.total_price = int(total_price * 100)  # Store as cents
-                purchase_order.status = PurchaseOrderStatus.ISSUED
-                purchase_order.issue_date = timezone.now()
-                purchase_order.issued_by = current_user_id
-                purchase_order.save()
-                
-                # Send email notification if requested
-                email_sent = False
-                if serializer.validated_data.get('notify_supplier', True):
-                    try:
-                        self._send_purchase_order_email(purchase_order)
-                        email_sent = True
-                    except Exception as e:
-                        logger.warning(f"Failed to send email for PO {purchase_order.reference}: {str(e)}")
-                        # Don't fail the entire operation if email fails
-                
-                # Log activity
-                self._log_activity('ISSUE', purchase_order, {
-                    'issued_by': current_user.get('full_name'),
-                    'total_price': str(total_price),
-                    'email_sent': email_sent,
-                    'email_requested': serializer.validated_data.get('notify_supplier', True)
-                })
-            
-            return Response({
-                'message': 'Purchase order issued successfully',
-                'status': purchase_order.status,
-                'total_price': total_price,
-                'issue_date': purchase_order.issue_date,
-                'email_sent': email_sent
-            })
-            
-        except Exception as e:
-            logger.error(f"Error issuing purchase order {purchase_order.reference}: {str(e)}")
-            return Response(
-                {'error': f'Error issuing purchase order: {str(e)}'},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
     
     # Add new PDF generation endpoints
     @action(detail=True, methods=['get'])
