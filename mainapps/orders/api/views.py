@@ -129,6 +129,11 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
     def add_line_item(self, request, pk=None):
         """Add line item to purchase order"""
         purchase_order = self.get_object()
+        if purchase_order.status not in [PurchaseOrderStatus.PENDING,]:
+            return Response(
+                {'error': 'Cannot add line item to order in current status'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
         
         if purchase_order.status not in [PurchaseOrderStatus.PENDING, 'draft']:
             return Response(
@@ -160,6 +165,12 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
     def update_line_item(self, request, pk=None):
         """Update a specific line item"""
         purchase_order = self.get_object()
+        if purchase_order.status not in [PurchaseOrderStatus.PENDING,]:
+            return Response(
+                {'error': f'Cannot edit line item in the  order in current status ({purchase_order.status})'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
         line_item_id = request.data.get('line_item_id')
         
         if not line_item_id:
@@ -236,7 +247,7 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
     
     # ==================== WORKFLOW MANAGEMENT ====================
     
-    @action(detail=True, methods=['post'])
+    @action(detail=True, methods=['put', 'patch'])
     def approve(self, request, pk=None):
         """Approve purchase order"""
         purchase_order = self.get_object()
