@@ -258,28 +258,24 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        serializer = PurchaseOrderWorkflowSerializer(data=request.data)
-        if not serializer.is_valid():
-            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
         
-        current_user = UserService.get_current_user(request)
+        # current_user = UserService.get_current_user(request)
         
         with transaction.atomic():
             purchase_order.status = PurchaseOrderStatus.APPROVED
-            purchase_order.approved_by = current_user_id
+            purchase_order.approved_by = request.user.id
             purchase_order.approved_at = timezone.now()
             purchase_order.save()
             
-            # Log activity
-            self._log_activity('APPROVE', purchase_order, {
-                'approved_by': current_user.get('full_name'),
-                'notes': serializer.validated_data.get('notes', '')
-            })
+            # # Log activity
+            # self._log_activity('APPROVE', purchase_order, {
+            #     'approved_by': current_user.get('full_name'),
+            #     'notes': serializer.validated_data.get('notes', '')
+            # })
         
         return Response({
             'message': 'Purchase order approved successfully',
             'status': purchase_order.status,
-            'approved_by': current_user.get('full_name'),
             'approved_at': purchase_order.approved_at
         })
     
@@ -303,11 +299,11 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
             purchase_order.received_by = current_user_id
             purchase_order.save()
             
-            # Log activity
-            self._log_activity('RECEIVE', purchase_order, {
-                'received_by': current_user.get('full_name'),
-                'received_date': purchase_order.received_date
-            })
+            # # Log activity
+            # self._log_activity('RECEIVE', purchase_order, {
+            #     'received_by': current_user.get('full_name'),
+            #     'received_date': purchase_order.received_date
+            # })
         
         return Response({
             'message': 'Purchase order marked as received',

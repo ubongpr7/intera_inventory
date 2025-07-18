@@ -114,7 +114,13 @@ class Order(ProfileMixin):
         verbose_name=_('Description'),
         help_text=_('Order description (optional)'),
     )
+    notes = models.TextField(
+        blank=True,
+        verbose_name=_('Notes'),
+        help_text=_('Additional notes (optional)'),
+    )
 
+    
 
     link = models.URLField(
         blank=True, verbose_name=_('Link'), help_text=_('Link to an external page')
