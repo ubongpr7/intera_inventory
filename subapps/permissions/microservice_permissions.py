@@ -204,5 +204,5 @@ class CachingMixin:
         return response
     
 from rest_framework import viewsets
-class BaseCachePermissionViewset(CachingMixin,PermissionRequiredMixin,viewsets.ModelViewSet):
+class BaseCachePermissionViewset(PermissionRequiredMixin,viewsets.ModelViewSet):
     pass
