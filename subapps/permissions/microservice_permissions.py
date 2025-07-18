@@ -51,33 +51,7 @@ class PermissionRequiredMixin:
     """
     required_permission = None
     permission_classes = [ HasModelRequestPermission]
-
-def cache_response(ttl=None):
-        """
-        Decorator to wrap DRF list/retrieve methods
-        """
-        def decorator(func):
-            @wraps(func)
-            def wrapper(viewset, request, *args, **kwargs):
-                if not getattr(viewset, 'CACHE_ENABLED', True):
-                    return func(viewset, request, *args, **kwargs)
-
-                cache_key = viewset._generate_cache_key(request, *args, **kwargs)
-                cached_data = cache.get(cache_key)
-                print(cached_data)
-
-                if cached_data is not None:
-                    return Response(cached_data, status=status.HTTP_200_OK)
-
-                response = func(viewset, request, *args, **kwargs)
-
-                if isinstance(response, Response) and response.status_code == status.HTTP_200_OK:
-                    cache.set(cache_key, response.data, ttl or viewset.CACHE_TTL)
-
-                return response
-            return wrapper
-        return decorator
-
+    
 class CachingMixin:
     """
     Caching mixin for DRF ViewSets with multi-tenant support
@@ -109,6 +83,7 @@ class CachingMixin:
         path = request.path
         version = cache.get(self.CACHE_VERSION_KEY, 1)
 
+        # Get relevant headers (especially tenant identifier)
         headers = {
             h: request.headers.get(h)
             for h in self.INCLUDE_HEADERS_IN_KEY
@@ -173,8 +148,32 @@ class CachingMixin:
                 return response
             return wrapper
         return decorator
-    
-    
+
+    def cache_response(self, ttl=None):
+        """
+        Decorator to wrap DRF list/retrieve methods
+        """
+        def decorator(func):
+            @wraps(func)
+            def wrapper(viewset, request, *args, **kwargs):
+                if not getattr(viewset, 'CACHE_ENABLED', True):
+                    return func(viewset, request, *args, **kwargs)
+
+                cache_key = viewset._generate_cache_key(request, *args, **kwargs)
+                cached_data = cache.get(cache_key)
+
+                if cached_data is not None:
+                    return Response(cached_data, status=status.HTTP_200_OK)
+
+                response = func(viewset, request, *args, **kwargs)
+
+                if isinstance(response, Response) and response.status_code == status.HTTP_200_OK:
+                    cache.set(cache_key, response.data, ttl or viewset.CACHE_TTL)
+
+                return response
+            return wrapper
+        return decorator
+
     def perform_create(self, serializer):
         super().perform_create(serializer)
         self._invalidate_cache()
@@ -187,11 +186,11 @@ class CachingMixin:
         super().perform_destroy(instance)
         self._invalidate_cache()
 
-    @cache_response(CACHE_TTL)
+    @cache_response()
     def list(self, request, *args, **kwargs):
         return super().list(request, *args, **kwargs)
 
-    @cache_response(CACHE_TTL)
+    @cache_response()
     def retrieve(self, request, *args, **kwargs):
         return super().retrieve(request, *args, **kwargs)
 class BaseCachePermissionViewset(CachingMixin,PermissionRequiredMixin,viewsets.ModelViewSet):
