@@ -332,11 +332,9 @@ class PurchaseOrder(TotalPriceMixin, Order):
     
     def calculate_total(self):
         """Dynamic total from line items"""
-        total = self.line_items.aggregate(
-            total=models.Sum('total_price')
-        )['total'] or Decimal('0.00')
-        return total
-
+        total = sum(Decimal(str(item.total_price)) for item in self.line_items.all())
+        return total.quantize(Decimal('0.00'), rounding=ROUND_HALF_UP)
+    
     @property
     def total_price(self):
         return self.calculate_total()
