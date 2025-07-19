@@ -295,11 +295,8 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
         try:
             with transaction.atomic():
                 # Calculate total price
-                total_price = sum(
-                    line_item.total_price for line_item in purchase_order.line_items.all()
-                )
+                total_price =purchase_order.total_price
                 
-                purchase_order.total_price = int(total_price * 100)  # Store as cents
                 purchase_order.status = PurchaseOrderStatus.ISSUED
                 purchase_order.issue_date = timezone.now()
                 purchase_order.issued_by = current_user_id
@@ -315,13 +312,13 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
                         logger.warning(f"Failed to send email for PO {purchase_order.reference}: {str(e)}")
                         # Don't fail the entire operation if email fails
                 
-                # Log activity
-                self._log_activity('ISSUE', purchase_order, {
-                    'issued_by': current_user.get('full_name'),
-                    'total_price': str(total_price),
-                    'email_sent': email_sent,
-                    'email_requested': serializer.validated_data.get('notify_supplier', True)
-                })
+                # # Log activity
+                # self._log_activity('ISSUE', purchase_order, {
+                #     'issued_by': current_user.get('full_name'),
+                #     'total_price': str(total_price),
+                #     'email_sent': email_sent,
+                #     'email_requested': serializer.validated_data.get('notify_supplier', True)
+                # })
             
             return Response({
                 'message': 'Purchase order issued successfully',
