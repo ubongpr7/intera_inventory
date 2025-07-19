@@ -76,13 +76,13 @@ class PurchaseOrderLineItem(UUIDBaseModel):
         return (self.unit_price * self.quantity) * (self.tax_rate / Decimal("100"))
 
     @property
-    def discount_amount(self):
+    def discount(self):
         return (self.unit_price * self.quantity) * (self.discount_rate / Decimal("100"))
 
     @property
     def total_price(self):
         subtotal = self.quantity * self.unit_price
-        return (subtotal + self.tax_amount - self.discount_amount).quantize(
+        return (subtotal + self.tax_amount - self.discount).quantize(
             Decimal('0.00'), rounding=ROUND_HALF_UP
         )
 

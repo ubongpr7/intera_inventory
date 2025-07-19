@@ -48,9 +48,9 @@ class PurchaseOrderLineItemSerializer(UserDetailMixin, serializers.ModelSerializ
             'quantity', 'quantity_w_unit', 'unit_price',
             'discount_rate', 'tax_rate', 'description',
             'batch_number', 'expiry_date', 'manufactured_date',
-            'fully_received', 'tax_amount', 'discount_amount', 'total_price'
+            'fully_received', 'tax_amount', 'discount', 'total_price'
         ]
-        read_only_fields = ['tax_amount', 'discount_amount', 'total_price']
+        read_only_fields = ['tax_amount', 'discount', 'total_price']
 
 
 class PurchaseOrderListSerializer(UserDetailMixin, serializers.ModelSerializer):
@@ -122,7 +122,7 @@ class PurchaseOrderDetailSerializer(UserDetailMixin, serializers.ModelSerializer
             }
 
         total_quantity = sum(item.quantity for item in line_items)
-        total_discount = sum(item.discount_amount for item in line_items)
+        total_discount = sum(item.discount for item in line_items)
         total_tax = sum(item.tax_amount for item in line_items)
         avg_unit_price = (
             sum(item.unit_price for item in line_items) / line_items.count()
@@ -145,7 +145,7 @@ class PurchaseOrderLineItemCreateSerializer(serializers.ModelSerializer):
     class Meta:
         model = PurchaseOrderLineItem
         exclude = ['purchase_order']
-        read_only_fields = ['tax_amount', 'discount_amount', 'total_price', 'batch_number']
+        read_only_fields = ['tax_amount', 'discount', 'total_price', 'batch_number']
 
     def create(self, validated_data):
         po_reference = validated_data.pop('purchase_order_reference', None)
