@@ -37,7 +37,7 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
     
     filterset_fields = ['status', 'supplier', 'issue_date', 'delivery_date']
     search_fields = ['reference', 'description', 'supplier_reference', 'supplier__name']
-    ordering_fields = ['reference', 'issue_date', 'delivery_date', 'total_price', 'created_at']
+    ordering_fields = ['reference', 'issue_date', 'delivery_date', 'created_at']
     ordering = ['-created_at']
     
     def get_serializer_class(self):
