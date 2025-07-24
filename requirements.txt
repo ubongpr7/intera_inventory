@@ -82,3 +82,13 @@ weasyprint
 django-sync-model
 django-synchro
 modal
+
+
+langchain_tavily
+django-mcp-server
+langchain-mcp-adapters
+mcp
+langgraph
+langchain
+python-dotenv
+langchain-google-genai
