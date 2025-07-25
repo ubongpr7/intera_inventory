@@ -82,8 +82,6 @@ weasyprint
 django-sync-model
 django-synchro
 modal
-
-
 langchain_tavily
 django-mcp-server
 langchain-mcp-adapters
