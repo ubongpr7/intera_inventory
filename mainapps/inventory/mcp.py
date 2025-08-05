@@ -9,7 +9,7 @@ from mcp_server import (
     drf_publish_list_mcp_tool,
 )
 
-from inventory.mcp_views import (
+from .mcp_views import (
     InventoryListAPIView, InventoryCreateAPIView, InventoryRetrieveAPIView,
     InventoryUpdateAPIView, InventoryDestroyAPIView,
 )

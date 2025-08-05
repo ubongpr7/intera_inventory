@@ -11,7 +11,7 @@ from mcp_server import (
 )
 
 
-from stock.mcp_views import (
+from .mcp_views import (
     StockLocationListAPIView, StockLocationCreateAPIView, StockLocationRetrieveAPIView,
     StockLocationUpdateAPIView, StockLocationDestroyAPIView,
     StockItemListAPIView, StockItemCreateAPIView, StockItemRetrieveAPIView,
