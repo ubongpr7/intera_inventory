@@ -2,7 +2,7 @@ from rest_framework import generics, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from .models import PurchaseOrder, SalesOrder, PurchaseOrderLineItem
-from .api.serializers import PurchaseOrderSerializer, SalesOrderSerializer, PurchaseOrderLineItemSerializer
+from .api.serializers import PurchaseOrderDetailSerializer, SalesOrderSerializer, PurchaseOrderLineItemSerializer
 from rest_framework.exceptions import ValidationError
 
 class PurchaseOrderListAPIView(generics.ListAPIView):
@@ -20,7 +20,7 @@ class PurchaseOrderListAPIView(generics.ListAPIView):
       order date, expected delivery date, status, and total amount.
     """
     queryset = PurchaseOrder.objects.all()
-    serializer_class = PurchaseOrderSerializer
+    serializer_class = PurchaseOrderDetailSerializer
 
 class PurchaseOrderCreateAPIView(generics.CreateAPIView):
     """
@@ -38,7 +38,7 @@ class PurchaseOrderCreateAPIView(generics.CreateAPIView):
     - The newly created purchase order object with its assigned ID.
     """
     queryset = PurchaseOrder.objects.all()
-    serializer_class = PurchaseOrderSerializer
+    serializer_class = PurchaseOrderDetailSerializer
 
 class PurchaseOrderRetrieveAPIView(generics.RetrieveAPIView):
     """
@@ -54,7 +54,7 @@ class PurchaseOrderRetrieveAPIView(generics.RetrieveAPIView):
     - A single purchase order object containing its details.
     """
     queryset = PurchaseOrder.objects.all()
-    serializer_class = PurchaseOrderSerializer
+    serializer_class = PurchaseOrderDetailSerializer
 
 class PurchaseOrderUpdateAPIView(generics.UpdateAPIView):
     """
@@ -75,7 +75,7 @@ class PurchaseOrderUpdateAPIView(generics.UpdateAPIView):
     - The updated purchase order object.
     """
     queryset = PurchaseOrder.objects.all()
-    serializer_class = PurchaseOrderSerializer
+    serializer_class = PurchaseOrderDetailSerializer
 
 class PurchaseOrderDestroyAPIView(generics.DestroyAPIView):
     """
@@ -91,7 +91,7 @@ class PurchaseOrderDestroyAPIView(generics.DestroyAPIView):
     - An empty response with a 204 No Content status on successful deletion.
     """
     queryset = PurchaseOrder.objects.all()
-    serializer_class = PurchaseOrderSerializer
+    serializer_class = PurchaseOrderDetailSerializer
 
 class SalesOrderListAPIView(generics.ListAPIView):
     """
