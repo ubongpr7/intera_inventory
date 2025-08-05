@@ -541,4 +541,15 @@ class AuditMixin(models.Model):
         
         super().save(*args, **kwargs)
         
-registerable_models = [StockLocationType, StockLocation, StockItemTracking, StockItem]
+class StockAdjustment(models.Model):
+    stock_item = models.ForeignKey(StockItem, related_name='adjustments', on_delete=models.CASCADE)
+    adjustment_type = models.CharField(max_length=50, choices=[('add', 'Add'), ('remove', 'Remove'), ('transfer', 'Transfer')])
+    quantity_change = models.IntegerField()
+    reason = models.TextField(blank=True, null=True)
+    adjusted_by = models.CharField(max_length=255, blank=True, null=True)
+    adjusted_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"Adjustment of {self.quantity_change} for {self.stock_item}"
+registerable_models = [StockLocationType, StockLocation, StockItemTracking, StockItem,StockAdjustment]
+

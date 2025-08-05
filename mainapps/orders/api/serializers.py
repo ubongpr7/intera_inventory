@@ -6,7 +6,7 @@ from decimal import Decimal
 from mainapps.content_type_linking_models.serializers import UserDetailMixin
 from mainapps.stock.models import StockItem
 from mainapps.inventory.models import Inventory
-from mainapps.orders.models import PurchaseOrder, PurchaseOrderLineItem
+from mainapps.orders.models import PurchaseOrder, PurchaseOrderLineItem, SalesOrder
 
 
 class InventoryStockItemListSerializer(UserDetailMixin, serializers.ModelSerializer):
@@ -29,6 +29,12 @@ class InventoryStockItemListSerializer(UserDetailMixin, serializers.ModelSeriali
             return (obj.expiry_date - timezone.now().date()).days
         return None
 
+
+
+class SalesOrderSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SalesOrder
+        fields = '__all__'
 
 class PurchaseOrderLineItemSerializer(UserDetailMixin, serializers.ModelSerializer):
     """Serializer for purchase order line items"""

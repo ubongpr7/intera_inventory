@@ -6,7 +6,7 @@ from mainapps.content_type_linking_models.serializers import UserDetailMixin
 from mainapps.inventory.models import Inventory
 
 from ..models import (
-     StockItem, StockLocation, StockItemTracking, StockLocationType
+     StockAdjustment, StockItem, StockLocation, StockItemTracking, StockLocationType
 )
 from subapps.services.microservices.user_service import UserService
 
@@ -151,6 +151,12 @@ class StockItemDetailSerializer(UserDetailMixin, serializers.ModelSerializer):
         """Get recent stock movements"""
         recent = obj.tracking_info.all()[:5]
         return StockItemTrackingListSerializer(recent, many=True).data
+
+
+class StockAdjustmentSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = StockAdjustment
+        fields = '__all__'
 
 class StockItemTrackingListSerializer(UserDetailMixin, serializers.ModelSerializer):
     """Serializer for stock tracking entries"""
