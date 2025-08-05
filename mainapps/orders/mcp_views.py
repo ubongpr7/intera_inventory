@@ -218,21 +218,6 @@ class PurchaseOrderLineItemCreateAPIView(generics.CreateAPIView):
     queryset = PurchaseOrderLineItem.objects.all()
     serializer_class = PurchaseOrderLineItemSerializer
 
-class PurchaseOrderLineItemUpdateAPIView(generics.RetrieveAPIView):
-    """
-    Retrieves a single order item by its ID.
-
-    This tool allows an AI agent to get detailed information about a specific order item.
-    It is useful for inspecting a particular item's details within an order.
-
-    Parameters (in URL path):
-    - `pk` (integer, required): The unique identifier of the order item.
-
-    Returns:
-    - A single order item object containing its product ID, quantity, and associated order.
-    """
-    queryset = PurchaseOrderLineItem.objects.all()
-    serializer_class = PurchaseOrderLineItemSerializer
 
 class PurchaseOrderLineOrderItemUpdateAPIView(generics.UpdateAPIView):
     """
