@@ -16,7 +16,7 @@ from .mcp_views import (
     SalesOrderListAPIView, SalesOrderCreateAPIView, SalesOrderRetrieveAPIView,
     SalesOrderUpdateAPIView, SalesOrderDestroyAPIView,
     PurchaseOrderLineItemListAPIView, PurchaseOrderLineItemCreateAPIView,
-    PurchaseOrderLineItemUpdateAPIView, PurchaseOrderLineItemDestroyAPIView
+     PurchaseOrderLineItemDestroyAPIView
 )
 
 drf_publish_list_mcp_tool(
@@ -83,16 +83,7 @@ drf_publish_create_mcp_tool(
     instructions="Create a new order item. Provide 'product_id' (string, required), 'quantity' (integer, required), 'unit_price' (decimal, required), and either 'purchase_order' (integer, ID) or 'sales_order' (integer, ID). Example: {'purchase_order': 1, 'product_id': 'PROD003', 'quantity': 5, 'unit_price': 10.00}"
 )
 
-# global_mcp_server.register_drf_retrieve_tool(
-#     PurchaseOrderLineItemRetrieveAPIView,
-#     name="RetrievePurchaseOrderLineItem",
-#     instructions="Get detailed information about a specific order item by its ID. Provide the 'id' (integer, required) as a path parameter."
-# )
 
-drf_publish_update_mcp_tool(
-    PurchaseOrderLineItemUpdateAPIView,
-    instructions="Update an existing order item by its ID. Provide the 'id' (integer, required) as a path parameter and fields to update in the body. Example: {'id': 1, 'quantity': 7}"
-)
 
 drf_publish_destroy_mcp_tool(
     PurchaseOrderLineItemDestroyAPIView,
