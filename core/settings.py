@@ -202,7 +202,11 @@ DJOSER = {
     'SOCIAL_AUTH_ALLOWED_REDIRECT_URIS': os.getenv('SOCIAL_AUTH_ALLOWED_REDIRECT_URIS', '').split(','),
 }
 
+
+DJANGO_MCP_SERVER_NAME = "IMS Inventory Service"
+DJANGO_MCP_INSTRUCTIONS = "Provides tools for managing inentory in the IMS"
 DJANGO_MCP_AUTHENTICATION_CLASSES=["rest_framework_simplejwt.authentication.JWTStatelessUserAuthentication"]
+
 
 
 SIMPLE_JWT = {
