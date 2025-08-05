@@ -1,7 +1,7 @@
 from rest_framework import generics, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
-from .models import Company, Branch, Department
+from .models import Company
 from .api.serializers import CompanySerializer
 from rest_framework.exceptions import ValidationError
 
