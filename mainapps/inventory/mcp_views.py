@@ -3,7 +3,6 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from .models import Inventory
 from .api.serializers import InventorySerializer
-from rest_framework.exceptions import ValidationError
 
 class InventoryListAPIView(generics.ListAPIView):
     """
