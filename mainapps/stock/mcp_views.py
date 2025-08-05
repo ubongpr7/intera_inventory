@@ -2,7 +2,7 @@ from rest_framework import generics, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from .models import StockLocation, StockItem, StockAdjustment
-from .api.serializers import StockLocationListSerializer, StockItemSerializer, StockAdjustmentSerializer
+from .api.serializers import StockLocationListSerializer, StockItemDetailSerializer, StockAdjustmentSerializer
 from rest_framework.exceptions import ValidationError
 
 class StockLocationListAPIView(generics.ListAPIView):
@@ -105,7 +105,7 @@ class StockItemListAPIView(generics.ListAPIView):
     - A list of stock item objects, each containing details such as product ID, quantity, and location.
     """
     queryset = StockItem.objects.all()
-    serializer_class = StockItemSerializer
+    serializer_class = StockItemDetailSerializer
 
 class StockItemCreateAPIView(generics.CreateAPIView):
     """
@@ -123,7 +123,7 @@ class StockItemCreateAPIView(generics.CreateAPIView):
     - The newly created stock item object with its assigned ID.
     """
     queryset = StockItem.objects.all()
-    serializer_class = StockItemSerializer
+    serializer_class = StockItemDetailSerializer
 
 class StockItemRetrieveAPIView(generics.RetrieveAPIView):
     """
@@ -139,7 +139,7 @@ class StockItemRetrieveAPIView(generics.RetrieveAPIView):
     - A single stock item object containing its product ID, quantity, and location.
     """
     queryset = StockItem.objects.all()
-    serializer_class = StockItemSerializer
+    serializer_class = StockItemDetailSerializer
 
 class StockItemUpdateAPIView(generics.UpdateAPIView):
     """
@@ -160,7 +160,7 @@ class StockItemUpdateAPIView(generics.UpdateAPIView):
     - The updated stock item object.
     """
     queryset = StockItem.objects.all()
-    serializer_class = StockItemSerializer
+    serializer_class = StockItemDetailSerializer
 
 class StockItemDestroyAPIView(generics.DestroyAPIView):
     """
@@ -176,7 +176,7 @@ class StockItemDestroyAPIView(generics.DestroyAPIView):
     - An empty response with a 204 No Content status on successful deletion.
     """
     queryset = StockItem.objects.all()
-    serializer_class = StockItemSerializer
+    serializer_class = StockItemDetailSerializer
 
 class StockAdjustmentListAPIView(generics.ListAPIView):
     """
