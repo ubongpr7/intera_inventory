@@ -1,7 +1,7 @@
 from rest_framework import generics, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
-from inventory.models import Inventory, InventoryItem, InventoryReport
+from .models import Inventory, InventoryItem, InventoryReport
 from .api.serializers import InventorySerializer
 from rest_framework.exceptions import ValidationError
 

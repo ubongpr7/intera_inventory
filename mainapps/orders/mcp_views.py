@@ -1,7 +1,7 @@
 from rest_framework import generics, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
-from orders.models import PurchaseOrder, SalesOrder, PurchaseOrderLineItem
+from .models import PurchaseOrder, SalesOrder, PurchaseOrderLineItem
 from .api.serializers import PurchaseOrderSerializer, SalesOrderSerializer, PurchaseOrderLineItemSerializer
 from rest_framework.exceptions import ValidationError
 

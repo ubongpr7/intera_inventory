@@ -1,7 +1,7 @@
 from rest_framework import generics, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
-from stock.models import StockLocation, StockItem, StockAdjustment
+from .models import StockLocation, StockItem, StockAdjustment
 from .api.serializers import StockLocationListSerializer, StockItemSerializer, StockAdjustmentSerializer
 from rest_framework.exceptions import ValidationError
 

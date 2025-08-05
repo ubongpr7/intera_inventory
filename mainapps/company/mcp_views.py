@@ -1,7 +1,7 @@
 from rest_framework import generics, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
-from company.models import Company, Branch, Department
+from .models import Company, Branch, Department
 from .api.serializers import CompanySerializer
 from rest_framework.exceptions import ValidationError
 
@@ -34,7 +34,7 @@ class CompanyCreateAPIView(generics.CreateAPIView):
     - `phone_number` (string, optional): The contact phone number.
     - `email` (string, optional): The contact email address.
     - `website` (string, optional): The company's website URL.
-    
+
     Returns:
     - The newly created company object with its assigned ID.
     """
