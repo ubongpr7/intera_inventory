@@ -2,7 +2,7 @@ from rest_framework import generics, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from .models import Inventory
-from .api.serializers import InventorySerializer
+from .api.serializers import InventoryListSerializer
 
 class InventoryListAPIView(generics.ListAPIView):
     """
@@ -18,7 +18,7 @@ class InventoryListAPIView(generics.ListAPIView):
     - A list of inventory objects, each containing details such as name, location, and timestamps.
     """
     queryset = Inventory.objects.all()
-    serializer_class = InventorySerializer
+    serializer_class = InventoryListSerializer
 
 class InventoryCreateAPIView(generics.CreateAPIView):
     """
@@ -35,7 +35,7 @@ class InventoryCreateAPIView(generics.CreateAPIView):
     - The newly created inventory object with its assigned ID.
     """
     queryset = Inventory.objects.all()
-    serializer_class = InventorySerializer
+    serializer_class = InventoryListSerializer
 
 class InventoryRetrieveAPIView(generics.RetrieveAPIView):
     """
@@ -51,7 +51,7 @@ class InventoryRetrieveAPIView(generics.RetrieveAPIView):
     - A single inventory object containing its name, location, and timestamps.
     """
     queryset = Inventory.objects.all()
-    serializer_class = InventorySerializer
+    serializer_class = InventoryListSerializer
 
 class InventoryUpdateAPIView(generics.UpdateAPIView):
     """
@@ -71,7 +71,7 @@ class InventoryUpdateAPIView(generics.UpdateAPIView):
     - The updated inventory object.
     """
     queryset = Inventory.objects.all()
-    serializer_class = InventorySerializer
+    serializer_class = InventoryListSerializer
 
 class InventoryDestroyAPIView(generics.DestroyAPIView):
     """
@@ -87,4 +87,4 @@ class InventoryDestroyAPIView(generics.DestroyAPIView):
     - An empty response with a 204 No Content status on successful deletion.
     """
     queryset = Inventory.objects.all()
-    serializer_class = InventorySerializer
+    serializer_class = InventoryListSerializer
