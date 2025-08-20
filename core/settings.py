@@ -52,7 +52,7 @@ THIRD_PARTY_APPS=[
     'djoser',
     'social_django',
     'schema_graph',
-    'mcp_server',
+    # 'mcp_server',
 ]
 CORE_APPS = [
     'mainapps.company',
@@ -203,9 +203,9 @@ DJOSER = {
 }
 
 
-DJANGO_MCP_SERVER_NAME = "IMS Inventory Service"
-DJANGO_MCP_INSTRUCTIONS = "Provides tools for managing inentory in the IMS"
-DJANGO_MCP_AUTHENTICATION_CLASSES=["rest_framework_simplejwt.authentication.JWTStatelessUserAuthentication"]
+# DJANGO_MCP_SERVER_NAME = "IMS Inventory Service"
+# DJANGO_MCP_INSTRUCTIONS = "Provides tools for managing inentory in the IMS"
+# DJANGO_MCP_AUTHENTICATION_CLASSES=["rest_framework_simplejwt.authentication.JWTStatelessUserAuthentication"]
 
 
 

@@ -43,6 +43,6 @@ urlpatterns = [
     path('order_api/', include("mainapps.orders.api.urls",)),
     path('stock_api/', include("mainapps.stock.api.urls",)),
 
-    path("mcp_server/", include('mcp_server.urls')),
+    # path("mcp_server/", include('mcp_server.urls')),
 
 ]
