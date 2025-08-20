@@ -1,11 +1,13 @@
 from rest_framework import generics, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
+
+from mainapps.company.mcp_views import BaseInventoryViewSet
 from .models import PurchaseOrder, SalesOrder, PurchaseOrderLineItem
 from .api.serializers import PurchaseOrderDetailSerializer, SalesOrderSerializer, PurchaseOrderLineItemSerializer
 from rest_framework.exceptions import ValidationError
 
-class PurchaseOrderListAPIView(generics.ListAPIView):
+class PurchaseOrderListAPIView(BaseInventoryViewSet,generics.ListAPIView):
     """
     Retrieves a list of all purchase orders.
 
@@ -22,7 +24,7 @@ class PurchaseOrderListAPIView(generics.ListAPIView):
     queryset = PurchaseOrder.objects.all()
     serializer_class = PurchaseOrderDetailSerializer
 
-class PurchaseOrderCreateAPIView(generics.CreateAPIView):
+class PurchaseOrderCreateAPIView(BaseInventoryViewSet,generics.CreateAPIView):
     """
     Creates a new purchase order.
 

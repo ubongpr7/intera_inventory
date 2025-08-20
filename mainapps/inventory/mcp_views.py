@@ -1,10 +1,12 @@
 from rest_framework import generics, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
+
+from mainapps.inventory.api.views import BaseInventoryViewSet
 from .models import Inventory
 from .api.serializers import InventoryListSerializer
 
-class InventoryListAPIView(generics.ListAPIView):
+class InventoryListAPIView(BaseInventoryViewSet,generics.ListAPIView):
     """
     Retrieves a list of all inventories.
 
@@ -20,7 +22,7 @@ class InventoryListAPIView(generics.ListAPIView):
     queryset = Inventory.objects.all()
     serializer_class = InventoryListSerializer
 
-class InventoryCreateAPIView(generics.CreateAPIView):
+class InventoryCreateAPIView(BaseInventoryViewSet,generics.CreateAPIView):
     """
     Creates a new inventory record.
 

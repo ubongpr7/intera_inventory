@@ -1064,3 +1064,4 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
 
+# we need to create mcp tools that agent can use to search for products on various

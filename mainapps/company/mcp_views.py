@@ -1,11 +1,48 @@
+from venv import logger
 from rest_framework import generics, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from django_filters.rest_framework import DjangoFilterBackend
+from rest_framework import status, filters
+
+
+from subapps.permissions.microservice_permissions import PermissionRequiredMixin
 from .models import Company
 from .api.serializers import CompanySerializer
 from rest_framework.exceptions import ValidationError
 
-class CompanyListAPIView(generics.ListAPIView):
+
+class BaseInventoryViewSet(PermissionRequiredMixin, ):
+    """Enhanced base viewset with caching and performance optimizations"""
+    
+    # filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    # search_fields = ['name', 'description']
+    # ordering_fields = ['name', 'created_at', 'updated_at']
+    # ordering = ['name']
+    
+
+    def get_queryset(self):
+        """Optimized queryset with select_related and prefetch_related"""
+        queryset = super().get_queryset()
+        profile_id = self.request.headers.get('X-Profile-ID')
+        
+        if profile_id:
+            queryset = queryset.filter(profile=profile_id)
+        return queryset
+
+    def perform_create(self, serializer):
+        """Enhanced creation with better error handling"""
+        profile_id = str(self.request.headers.get('X-Profile-ID'))
+        current_user_id = str(self.request.user.id)
+        
+        try:
+            serializer.save(profile=profile_id, created_by=current_user_id)
+        except Exception as e:
+            logger.error(f"Error creating {self.__class__.__name__}: {str(e)}")
+            raise
+
+
+class CompanyListAPIView(BaseInventoryViewSet,generics.ListAPIView):
     """
     Retrieves a list of all companies.
 
