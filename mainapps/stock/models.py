@@ -171,8 +171,8 @@ class StockItem(MPTTModel, InventoryMixin):
         max_length=200,
         null=True,
         blank=True,
-        verbose_name=_('Name'),
-        help_text=_('Name of the stock item'),
+        verbose_name=_('Product Variant Barcode'),
+        help_text=_('Barcode to variant of the product'),
     )
 
     inventory = models.ForeignKey('inventory.Inventory', on_delete=models.CASCADE, null=True,related_name='stock_items')
