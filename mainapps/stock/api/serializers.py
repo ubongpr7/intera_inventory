@@ -76,7 +76,7 @@ class StockItemListSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'name', 'sku', 'serial', 'quantity', 'status',
             'inventory_name', 'location_name', 'expiry_date', 'days_to_expiry',
-            'purchase_price', 'created_at','quantity_w_unit'
+            'purchase_price', 'created_at','quantity_w_unit','product_variant'
         ]
     
     def get_days_to_expiry(self, obj):

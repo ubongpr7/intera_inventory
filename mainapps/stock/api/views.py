@@ -254,7 +254,6 @@ class StockItemViewSet(BaseInventoryViewSetMixin):
                 {'error': 'inventory_id and product_variants are required'},
                 status=status.HTTP_400_BAD_REQUEST
             )
-        print(inventory_id,product_variant)
         
         inventory = Inventory.objects.get(
             external_system_id=inventory_id,
