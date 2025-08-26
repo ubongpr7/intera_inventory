@@ -169,6 +169,12 @@ class StockItemViewSet(BaseInventoryViewSetMixin):
     def get_queryset(self):
         queryset = super().get_queryset()
         inventory = self.request.query_params.get('inventory')
+        product_variant = self.request.query_params.get('product_variant')
+        
+        if inventory:
+            queryset = queryset.filter(inventory=inventory)
+        if product_variant:
+            queryset = queryset.filter(product_variant=product_variant)
                
         # Filter by expiry status
         expiry_filter = self.request.query_params.get('expiry_status')
