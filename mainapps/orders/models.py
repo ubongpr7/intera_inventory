@@ -333,8 +333,7 @@ class PurchaseOrder(TotalPriceMixin, Order):
     def calculate_total(self):
         """Dynamic total from line items"""
         total = sum(Decimal(str(item.total_price)) for item in self.line_items.all())
-        return total.quantize(Decimal('0.00'), rounding=ROUND_HALF_UP)
-    
+        return total
     @property
     def total_price(self):
         return self.calculate_total()
