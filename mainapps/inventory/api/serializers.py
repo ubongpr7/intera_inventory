@@ -151,7 +151,7 @@ class StockAnalyticsSerializer(serializers.Serializer):
     location_distribution = serializers.ListField()
     
     # Stock movement trends
-    movement_trends = serializers.DictField()
+    # movement_trends = serializers.DictField()
     
     # Aging analysis
     aging_analysis = serializers.DictField()
