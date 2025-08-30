@@ -3,7 +3,7 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from django_filters.rest_framework import DjangoFilterBackend
-from django.db.models import Q, Sum, Count, Avg, F, Case, When, Value, IntegerField
+from django.db.models import Q, Sum, Count, Avg, F, Case, When, Value, IntegerField, DecimalField
 from django.db import transaction
 from django.utils import timezone
 from datetime import timedelta, datetime
@@ -643,17 +643,22 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
         )
         
         # Financial metrics
-        financial_metrics = queryset.aggregate(
-            total_value=Sum('total_price'),
-            average_value=Avg('total_price')
+        # Annotate each PO with its calculated total price from its line items
+        annotated_queryset = queryset.annotate(
+            calculated_total=Sum(
+                F('line_items__quantity') * F('line_items__unit_price'),
+                output_field=DecimalField()
+            )
         )
-        
-        total_value = financial_metrics['total_value'] or 0
-        average_value = financial_metrics['average_value'] or 0
-        
-        # Convert from cents to currency
-        total_value = Decimal(total_value) / 100
-        average_value = Decimal(average_value) / 100
+
+        # Aggregate the annotated values
+        financial_metrics = annotated_queryset.aggregate(
+            total_value=Sum('calculated_total', default=Decimal('0')),
+            average_value=Avg('calculated_total', default=Decimal('0'))
+        )
+
+        total_value = financial_metrics['total_value'] or Decimal('0')
+        average_value = financial_metrics['average_value'] or Decimal('0')
         
         # Time-based analytics
         monthly_trends = self._get_monthly_trends(queryset)
@@ -713,11 +718,8 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
             'orders_this_month': queryset.filter(created_at__gte=month_ago).count(),
             'total_value_this_month': queryset.filter(
                 created_at__gte=month_ago
-            ).aggregate(total=Sum('total_price'))['total'] or 0,
+            ).aggregate(total=Sum(F('line_items__quantity') * F('line_items__unit_price'), output_field=DecimalField()))['total'] or Decimal('0'),
         }
-        
-        # Convert total value from cents
-        summary['total_value_this_month'] = Decimal(summary['total_value_this_month']) / 100
         
         return Response(summary)
     
