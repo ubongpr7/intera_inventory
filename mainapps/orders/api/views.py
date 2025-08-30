@@ -761,18 +761,26 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
             month_start = timezone.now().replace(day=1) - timedelta(days=30*i)
             month_end = month_start + timedelta(days=30)
             
-            month_data = queryset.filter(
+            # month_data = queryset.filter(
+            #     created_at__gte=month_start,
+            #     created_at__lt=month_end
+            # ).aggregate(
+            #     count=Count('id'),
+            #     total_value=Sum('total_price')
+            # )
+            
+            qs = queryset.filter(
                 created_at__gte=month_start,
                 created_at__lt=month_end
-            ).aggregate(
-                count=Count('id'),
-                total_value=Sum('total_price')
             )
-            
+            month_data = {
+                "count": qs.count(),
+                "total_value": sum(obj.total_price for obj in qs)
+            }
             trends.append({
                 'month': month_start.strftime('%Y-%m'),
                 'count': month_data['count'],
-                'total_value': Decimal(month_data['total_value'] or 0) / 100
+                'total_value': month_data.get('total_value', 0)
             })
         
         return trends
