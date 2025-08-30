@@ -146,14 +146,13 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
             line_item = serializer.save(purchase_order=purchase_order)
             
             # Recalculate order total
-            self._recalculate_order_total(purchase_order)
             
             # Log activity
-            self._log_activity('ADD_LINE_ITEM', purchase_order, {
-                'line_item_id': line_item.id,
-                'quantity': line_item.quantity,
-                'unit_price': str(line_item.unit_price)
-            })
+            # self._log_activity('ADD_LINE_ITEM', purchase_order, {
+            #     'line_item_id': line_item.id,
+            #     'quantity': line_item.quantity,
+            #     'unit_price': str(line_item.unit_price)
+            # })
             
             return Response(
                 PurchaseOrderLineItemSerializer(line_item).data,
@@ -201,7 +200,6 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
             serializer.save()
             
             # Recalculate order total
-            self._recalculate_order_total(purchase_order)
             
             return Response(serializer.data)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
@@ -236,7 +234,6 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
         line_item.delete()
         
         # Recalculate order total
-        self._recalculate_order_total(purchase_order)
         
         # Log activity
         self._log_activity('REMOVE_LINE_ITEM', purchase_order, {
@@ -722,14 +719,6 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
         return Response(summary)
     
     # ==================== HELPER METHODS ====================
-    
-    def _recalculate_order_total(self, purchase_order):
-        """Recalculate and update purchase order total"""
-        total = sum(
-            line_item.total_price for line_item in purchase_order.line_items.all()
-        )
-        purchase_order.total_price = int(total * 100)  # Store as cents
-        purchase_order.save(update_fields=['total_price'])
     
     def _create_inventory_transactions(self, purchase_order, current_user_id):
         """Create inventory transaction records for audit"""
