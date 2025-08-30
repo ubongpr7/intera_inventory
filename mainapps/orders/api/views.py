@@ -33,7 +33,7 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
     required_permission = UNIFIED_PERMISSION_DICT.get('purchase_order')
 
     queryset = PurchaseOrder.objects.select_related('supplier', 'contact', 'address').prefetch_related('line_items')
-    permission_classes = [IsAuthenticated, HasModelRequestPermission]
+    # permission_classes = [IsAuthenticated, HasModelRequestPermission]
     
     filterset_fields = ['status', 'supplier', 'issue_date', 'delivery_date']
     search_fields = ['reference', 'description', 'supplier_reference', 'supplier__name']
@@ -1105,3 +1105,9 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
             )
 
 # we need to create mcp tools that agent can use to search for products on various
+
+class LineItemsViewset(HasModelRequestPermission,viewsets.ModelViewSet):
+    queryset=PurchaseOrderLineItem.objects.all()
+    serializer_class=PurchaseOrderLineItemSerializer
+
+    
