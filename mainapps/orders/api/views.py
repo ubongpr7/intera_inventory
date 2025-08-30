@@ -833,12 +833,13 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
     #     ).order_by('-total_value')[:10])
     def _get_supplier_performance(self, queryset, month_start=None, month_end=None):
         """Get supplier performance metrics (Python-side aggregation)."""
-
-        qs = queryset.filter(
-            created_at__gte=month_start,
-            created_at__lt=month_end
-        ).prefetch_related("line_items", "supplier")
-
+        if month_start and month_end:
+            qs = queryset.filter(
+                created_at__gte=month_start,
+                created_at__lt=month_end
+            ).prefetch_related("line_items", "supplier")
+        else:
+            qs = queryset.prefetch_related("line_items", "supplier")
         data = {}
 
         for order in qs:
