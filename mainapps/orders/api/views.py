@@ -792,18 +792,15 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
             week_start = timezone.now().date() - timedelta(days=7*i)
             week_end = week_start + timedelta(days=7)
             
-            week_data = queryset.filter(
+            qs = queryset.filter(
                 created_at__date__gte=week_start,
                 created_at__date__lt=week_end
-            ).aggregate(
-                count=Count('id'),
-                total_value=Sum('total_price')
             )
             
             trends.append({
                 'week': week_start.strftime('%Y-W%U'),
-                'count': week_data['count'],
-                'total_value': Decimal(week_data['total_value'] or 0) / 100
+                'count': qs.count(),
+                'total_value': sum(obj.total_price for obj in qs)
             })
         
         return trends
