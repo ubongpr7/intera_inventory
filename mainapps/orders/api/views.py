@@ -886,113 +886,46 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
 
         return supplier_performance
 
-    def _get_top_suppliers_by_value(self, queryset):
-        """Get top suppliers by order value"""
-        return list(queryset.values(
-            'supplier__name', 'supplier__id'
-        ).annotate(
-            total_value=Sum('total_price'),
-            order_count=Count('id')
-        ).order_by('-total_value')[:5])
-    
-    # def _get_performance_metrics(self, queryset):
-    #     """Calculate performance metrics"""
-    #     completed_orders = queryset.filter(status=PurchaseOrderStatus.COMPLETED)
-        
-    #     # Average processing time (from creation to completion)
-    #     avg_processing_time = completed_orders.aggregate(
-    #         avg_time=Avg(
-    #             Case(
-    #                 When(
-    #                     complete_date__isnull=False,
-    #                     then=F('complete_date') - F('created_at')
-    #                 ),
-    #                 default=Value(0)
-    #             )
-    #         )
-    #     )['avg_time']
-        
-    #     # Average delivery time (from issue to delivery)
-    #     avg_delivery_time = completed_orders.aggregate(
-    #         avg_time=Avg(
-    #             Case(
-    #                 When(
-    #                     received_date__isnull=False,
-    #                     issue_date__isnull=False,
-    #                     then=F('received_date') - F('issue_date')
-    #                 ),
-    #                 default=Value(0)
-    #             )
-    #         )
-    #     )['avg_time']
-        
-    #     # On-time delivery rate
-    #     total_delivered = completed_orders.filter(
-    #         received_date__isnull=False,
-    #         delivery_date__isnull=False
-    #     ).count()
-        
-    #     on_time_delivered = completed_orders.filter(
-    #         received_date__lte=F('delivery_date')
-    #     ).count()
-        
-    #     on_time_rate = (on_time_delivered / total_delivered * 100) if total_delivered > 0 else 0
-        
-    #     # Financial metrics
-    #     total_savings = Decimal('0.00')  # Calculate based on your business logic
-    #     avg_cost_per_order = queryset.aggregate(
-    #         avg_cost=Avg('total_price')
-    #     )['avg_cost'] or 0
-        
-    #     return {
-    #         'average_processing_time': avg_processing_time.days if avg_processing_time else 0,
-    #         'average_delivery_time': avg_delivery_time.days if avg_delivery_time else 0,
-    #         'on_time_delivery_rate': round(on_time_rate, 2),
-    #         'total_savings': total_savings,
-    #         'cost_per_order': Decimal(avg_cost_per_order) / 100
-    #     }
-    
 
-    # def _get_top_suppliers_by_value(self, queryset, month_start=None, month_end=None):
-    #     """Get top suppliers by total order value (Python-side aggregation)."""
+    def _get_top_suppliers_by_value(self, queryset, month_start=None, month_end=None):
+        """Get top suppliers by total order value (Python-side aggregation)."""
 
-    #     qs = queryset
-    #     if month_start and month_end:
-    #         qs = qs.filter(created_at__gte=month_start, created_at__lt=month_end)
+        qs = queryset
+        if month_start and month_end:
+            qs = qs.filter(created_at__gte=month_start, created_at__lt=month_end)
 
-    #     qs = qs.prefetch_related("line_items", "supplier")
+        qs = qs.prefetch_related("line_items", "supplier")
 
-    #     data = {}
+        data = {}
 
-    #     for order in qs:
-    #         supplier_id = order.supplier.id
-    #         supplier_name = order.supplier.name
+        for order in qs:
+            supplier_id = order.supplier.id
+            supplier_name = order.supplier.name
 
-    #         if supplier_id not in data:
-    #             data[supplier_id] = {
-    #                 "supplier__id": supplier_id,
-    #                 "supplier__name": supplier_name,
-    #                 "order_count": 0,
-    #                 "total_value": Decimal("0"),
-    #             }
+            if supplier_id not in data:
+                data[supplier_id] = {
+                    "supplier__id": supplier_id,
+                    "supplier__name": supplier_name,
+                    "order_count": 0,
+                    "total_value": Decimal("0"),
+                }
 
-    #         d = data[supplier_id]
+            d = data[supplier_id]
 
-    #         # count orders
-    #         d["order_count"] += 1
+            # count orders
+            d["order_count"] += 1
 
-    #         # add total value using your @property
-    #         d["total_value"] += order.total_price
+            # add total value using your @property
+            d["total_value"] += order.total_price
 
-    #     # convert dict to list and sort by total_value
-    #     top_suppliers = sorted(
-    #         data.values(),
-    #         key=lambda x: x["total_value"],
-    #         reverse=True
-    #     )[:5]
+        # convert dict to list and sort by total_value
+        top_suppliers = sorted(
+            data.values(),
+            key=lambda x: x["total_value"],
+            reverse=True
+        )[:5]
 
-    #     return top_suppliers
-
+        return top_suppliers
 
     def _get_performance_metrics(self, queryset):
         """Calculate performance metrics (Python-side for total_price)."""
