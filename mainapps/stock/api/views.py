@@ -317,7 +317,8 @@ class StockItemViewSet(BaseInventoryViewSetMixin):
             'location__name'
         ).annotate(
             item_count=Count('id'),
-            total_quantity=Sum('quantity')
+            total_quantity=Sum('quantity'),
+            total_value=Sum(F('quantity') * F('purchase_price'))
         ).order_by('-item_count')
         
         # Status distribution
