@@ -716,9 +716,7 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
             ).count(),
             'orders_this_week': queryset.filter(created_at__gte=week_ago).count(),
             'orders_this_month': queryset.filter(created_at__gte=month_ago).count(),
-            'total_value_this_month': queryset.filter(
-                created_at__gte=month_ago
-            ).aggregate(total=Sum(F('line_items__quantity') * F('line_items__unit_price'), output_field=DecimalField()))['total'] or Decimal('0'),
+            'total_value_this_month': sum(obj.total_price for obj in queryset.filter(created_at__gte=month_ago))
         }
         
         return Response(summary)
@@ -805,32 +803,6 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
         
         return trends
     
-    # def _get_supplier_performance(self, queryset):
-    #     """Get supplier performance metrics"""
-    #     return list(queryset.values(
-    #         'supplier__name'
-    #     ).annotate(
-    #         order_count=Count('id'),
-    #         total_value=Sum('total_price'),
-    #         avg_delivery_time=Avg(
-    #             Case(
-    #                 When(
-    #                     delivery_date__isnull=False,
-    #                     issue_date__isnull=False,
-    #                     then=F('delivery_date') - F('issue_date')
-    #                 ),
-    #                 default=Value(0)
-    #             )
-    #         ),
-    #         on_time_deliveries=Count(
-    #             Case(
-    #                 When(
-    #                     received_date__lte=F('delivery_date'),
-    #                     then=1
-    #                 )
-    #             )
-    #         )
-    #     ).order_by('-total_value')[:10])
     def _get_supplier_performance(self, queryset, month_start=None, month_end=None):
         """Get supplier performance metrics (Python-side aggregation)."""
         if month_start and month_end:
