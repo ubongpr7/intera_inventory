@@ -665,7 +665,7 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
         weekly_trends = self._get_weekly_trends(queryset)
         
         # Supplier analytics
-        supplier_performance = self._get_supplier_performance(queryset)
+        supplier_performance = self._get_supplier_performance(queryset,)
         top_suppliers = self._get_top_suppliers_by_value(queryset)
         
         # Performance metrics
@@ -831,7 +831,7 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
     #             )
     #         )
     #     ).order_by('-total_value')[:10])
-    def _get_supplier_performance(self, queryset, month_start, month_end):
+    def _get_supplier_performance(self, queryset, month_start=None, month_end=None):
         """Get supplier performance metrics (Python-side aggregation)."""
 
         qs = queryset.filter(
