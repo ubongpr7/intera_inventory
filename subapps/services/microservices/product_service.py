@@ -48,7 +48,7 @@ class ProductService:
             response = requests.get(
                 url,
                 params=params,
-                headers=UserService.get_authentication_credentials(request),
+                headers=UserService.get_auth_header(request),
                 timeout=5
             )
 

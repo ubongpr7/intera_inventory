@@ -66,6 +66,13 @@ class UserService:
         except requests.RequestException as e:
             logger.error(f"Error fetching current user: {str(e)}")
             return None
+    @classmethod
+    def get_auth_header(cls, request) -> Optional[str]:
+        """Get authorization header from request"""
+        return {
+            'Authorization': request.META.get('HTTP_AUTHORIZATION'),
+            'X-Profile-ID': request.headers.get('X-Profile-ID')
+        }
     
     @classmethod
     def get_minimal_user_data(cls, user_id: str) -> Dict[str, Any]:
