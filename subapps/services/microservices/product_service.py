@@ -29,16 +29,13 @@ class ProductService:
         Returns:
             A dictionary containing the variant details or None if not found or an error occurs.
         """
-        logger.debug(f"Attempting to fetch variant details for barcode: {barcode}")
         if not barcode:
-            logger.debug("Barcode is empty, returning None.")
             return None
 
         cache_key = f"product_variant_details_{barcode}"
         cached_data = cache.get(cache_key)
 
         if cached_data:
-            logger.debug(f"Returning cached data for barcode: {barcode}")
             return cached_data
 
         endpoint = "product_api/variants/minimal_details_barcode/"
@@ -47,7 +44,6 @@ class ProductService:
         
         params = {"barcode": barcode}
         
-        print(f"Making API call to {url} with params: {params}")
         try:
             response = requests.get(
                 url,
@@ -60,22 +56,12 @@ class ProductService:
                 data = response.json()
                 if data:
                     cache.set(cache_key, data, cls.CACHE_TIMEOUT)
-                    logger.info(f"Fetched and cached details for barcode: {barcode}")
-                    logger.debug(f"Successfully fetched data for barcode {barcode}: {data}")
                     return data
                 else:
-                    logger.warning(f"No product variant found for barcode: {barcode}")
-                    logger.debug(f"API returned no data for barcode {barcode}.")
                     return None
             else:
-                logger.error(
-                    f"Failed to fetch variant details for barcode {barcode}. "
-                    f"Status: {response.status_code}, Response: {response.text[:200]}"
-                )
-                logger.debug(f"API call failed with status {response.status_code} for barcode {barcode}.")
+                
                 return None
 
         except requests.RequestException as e:
-            logger.error(f"Error calling product service for barcode {barcode}: {str(e)}")
-            logger.debug(f"Exception occurred during API call for barcode {barcode}: {e}")
             return None

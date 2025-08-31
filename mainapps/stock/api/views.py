@@ -165,6 +165,13 @@ class StockItemViewSet(BaseInventoryViewSetMixin):
     #     if self.action == 'list':
     #         return StockItemListSerializer
     #     return StockItemDetailSerializer
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        context.update({
+            "request": self.request,  # ensures request is included
+            # you can add more custom stuff here if needed
+        })
+        return context
     
     def get_queryset(self):
         queryset = super().get_queryset()
@@ -296,9 +303,9 @@ class StockItemViewSet(BaseInventoryViewSetMixin):
         stock_item = self.get_object()
         tracking = stock_item.tracking_info.all().order_by('-date')
         
-        serializer = StockItemTrackingListSerializer(tracking, many=True)
+        serializer = StockItemTrackingListSerializer(tracking, many=True,context={'request': request})
         return Response(serializer.data)
-    
+
 
     @action(detail=False, methods=['get'])
     def analytics(self, request):
@@ -354,7 +361,7 @@ class StockItemViewSet(BaseInventoryViewSetMixin):
             'aging_analysis': aging_analysis
         }
         
-        serializer = StockAnalyticsSerializer(analytics_data)
+        serializer = StockAnalyticsSerializer(analytics_data,context={'request': request})
         return Response(serializer.data)
     
     @action(detail=False, methods=['get'])

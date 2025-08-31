@@ -719,27 +719,6 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
     
     # ==================== HELPER METHODS ====================
     
-    def _create_inventory_transactions(self, purchase_order, current_user_id):
-        """Create inventory transaction records for audit"""
-        transactions = []
-        for line_item in purchase_order.line_items.all():
-            if line_item.stock_item:
-                transactions.append(
-                    InventoryTransaction(
-                        item=line_item.stock_item,
-                        quantity=line_item.quantity if line_item.quantity_received<=0 else line_item.quantity_received,
-                        unit_price=line_item.unit_price,
-                        transaction_type=TransactionType.PO_COMPLETE,
-                        reference=purchase_order.reference,
-                        user=current_user_id,
-                        profile=purchase_order.profile,
-                        notes=f"Completed from PO {purchase_order.reference}"
-                    )
-                )
-        
-        if transactions:
-            InventoryTransaction.objects.bulk_create(transactions)
-    
     def _get_monthly_trends(self, queryset):
         """Get monthly trends for the last 12 months"""
         trends = []
@@ -930,6 +909,27 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
             "cost_per_order": avg_cost_per_order,
         }
 
+    def _create_inventory_transactions(self, purchase_order, current_user_id):
+        """Create inventory transaction records for audit"""
+        transactions = []
+        for line_item in purchase_order.line_items.all():
+            if line_item.stock_item:
+                transactions.append(
+                    InventoryTransaction(
+                        item=line_item.stock_item,
+                        quantity=line_item.quantity if line_item.quantity_received<=0 else line_item.quantity_received,
+                        unit_price=line_item.unit_price,
+                        transaction_type=TransactionType.PO_COMPLETE,
+                        reference=purchase_order.reference,
+                        user=current_user_id,
+                        profile=purchase_order.profile,
+                        notes=f"Completed from PO {purchase_order.reference}"
+                    )
+                )
+        
+        if transactions:
+            InventoryTransaction.objects.bulk_create(transactions)
+    
     def _log_activity(self, action, instance, details):
         """Log user activity for audit trail"""
         try:
