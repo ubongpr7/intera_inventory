@@ -14,6 +14,7 @@ from subapps.services.microservices.product_service import ProductService # Adde
 class ProductImageMixin: # Added Mixin
 
     def _get_display_image(self, obj,context):
+        print(context)
         request = context.get('request')
         print(request)
         if not request or not obj.product_variant:
