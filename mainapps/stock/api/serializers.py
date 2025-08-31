@@ -12,7 +12,6 @@ from subapps.services.microservices.user_service import UserService
 from subapps.services.microservices.product_service import ProductService # Added import
 
 class ProductImageMixin: # Added Mixin
-    display_image = serializers.SerializerMethodField()
 
     def get_display_image(self, obj):
         request = self.context.get('request')
@@ -89,6 +88,8 @@ class StockItemListSerializer(ProductImageMixin, serializers.ModelSerializer):
     inventory_name = serializers.CharField(source='inventory.name', read_only=True)
     location_name = serializers.CharField(source='location.name', read_only=True)
     days_to_expiry = serializers.SerializerMethodField()
+    display_image = serializers.SerializerMethodField()
+
     
     class Meta:
         model = StockItem
@@ -130,6 +131,8 @@ class StockItemDetailSerializer(ProductImageMixin, UserDetailMixin, serializers.
     location_details = StockLocationListSerializer(source='location', read_only=True)
     customer_details = serializers.SerializerMethodField()
     stocktaker_details = serializers.SerializerMethodField()
+    display_image = serializers.SerializerMethodField()
+
     
     # Pricing information
     current_pricing = serializers.SerializerMethodField()
@@ -196,6 +199,8 @@ class LowStockItemSerializer(ProductImageMixin, serializers.ModelSerializer):
     re_order_point = serializers.IntegerField(source='inventory.re_order_point', read_only=True)
     shortfall = serializers.SerializerMethodField()
     # display_image = serializers.SerializerMethodField() # Removed from here
+    display_image = serializers.SerializerMethodField()
+
     
 
     class Meta:
