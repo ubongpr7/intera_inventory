@@ -13,7 +13,7 @@ from decimal import Decimal
 from mainapps.inventory.api.serializers import StockAnalyticsSerializer
 from mainapps.inventory.api.views import BaseInventoryViewSet
 from mainapps.inventory.models import Inventory
-from mainapps.stock.api.serializers import StockItemDetailSerializer, StockItemListSerializer, StockLocationDetailSerializer, StockLocationListSerializer, StockLocationTypeSerializer
+from mainapps.stock.api.serializers import LowStockItemSerializer, StockItemDetailSerializer, StockItemListSerializer, StockLocationDetailSerializer, StockLocationListSerializer, StockLocationTypeSerializer
 from mainapps.stock.models import StockItem, StockLocation, StockLocationType
 from rest_framework import viewsets
 
@@ -355,6 +355,21 @@ class StockItemViewSet(BaseInventoryViewSetMixin):
         }
         
         serializer = StockAnalyticsSerializer(analytics_data)
+        return Response(serializer.data)
+    
+    @action(detail=False, methods=['get'])
+    def low_stock(self, request):
+        """Get StockItems with low quantity for dashboard view."""
+        queryset = self.get_queryset().filter(
+            quantity__lt=F('inventory__minimum_stock_level')
+        ).select_related('inventory')
+
+        page = self.paginate_queryset(queryset)
+        if page is not None:
+            serializer = LowStockItemSerializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+
+        serializer = LowStockItemSerializer(queryset, many=True)
         return Response(serializer.data)
     
 

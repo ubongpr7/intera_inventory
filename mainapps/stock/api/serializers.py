@@ -9,6 +9,25 @@ from ..models import (
      StockAdjustment, StockItem, StockLocation, StockItemTracking, StockLocationType
 )
 from subapps.services.microservices.user_service import UserService
+from subapps.services.microservices.product_service import ProductService # Added import
+
+class ProductImageMixin: # Added Mixin
+    display_image = serializers.SerializerMethodField()
+
+    def get_display_image(self, obj):
+        request = self.context.get('request')
+        if not request or not obj.product_variant:
+            return None
+        
+        variant_details = ProductService.get_variant_details_by_barcode(
+            barcode=obj.product_variant,
+            request=request
+        )
+        
+        if variant_details:
+            return variant_details.get('image') or variant_details.get('display_image')
+        
+        return None
 
 class StockLocationTypeSerializer(serializers.ModelSerializer):
     class Meta:
@@ -65,7 +84,7 @@ class StockLocationDetailSerializer(UserDetailMixin, serializers.ModelSerializer
         summary['top_inventory_types'] = list(top_types)
         return summary
 
-class StockItemListSerializer(serializers.ModelSerializer):
+class StockItemListSerializer(ProductImageMixin, serializers.ModelSerializer):
     """Lightweight serializer for stock item lists"""
     inventory_name = serializers.CharField(source='inventory.name', read_only=True)
     location_name = serializers.CharField(source='location.name', read_only=True)
@@ -76,7 +95,8 @@ class StockItemListSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'name', 'sku', 'serial', 'quantity', 'status',
             'inventory_name', 'location_name', 'expiry_date', 'days_to_expiry',
-            'purchase_price', 'created_at','quantity_w_unit','product_variant'
+            'purchase_price', 'created_at','quantity_w_unit','product_variant',
+            'display_image' # Added field
         ]
     
     def get_days_to_expiry(self, obj):
@@ -104,7 +124,7 @@ class StockInventoryListSerializer(serializers.ModelSerializer):
   
 
 
-class StockItemDetailSerializer(UserDetailMixin, serializers.ModelSerializer):
+class StockItemDetailSerializer(ProductImageMixin, UserDetailMixin, serializers.ModelSerializer):
     """Comprehensive serializer for stock item CRUD operations"""
     inventory_details = StockInventoryListSerializer(source='inventory', read_only=True)
     location_details = StockLocationListSerializer(source='location', read_only=True)
@@ -169,3 +189,32 @@ class StockItemTrackingListSerializer(UserDetailMixin, serializers.ModelSerializ
     
     def get_user_details(self, obj):
         return self.get_user_details(obj.user)
+
+class LowStockItemSerializer(ProductImageMixin, serializers.ModelSerializer):
+    inventory_name = serializers.CharField(source='inventory.name', read_only=True)
+    minimum_stock_level = serializers.IntegerField(source='inventory.minimum_stock_level', read_only=True)
+    re_order_point = serializers.IntegerField(source='inventory.re_order_point', read_only=True)
+    shortfall = serializers.SerializerMethodField()
+    # display_image = serializers.SerializerMethodField() # Removed from here
+    
+
+    class Meta:
+        model = StockItem
+        fields = [
+            'id',
+            'name',
+            'sku',
+            'quantity',
+            'inventory_name',
+            'minimum_stock_level',
+            're_order_point',
+            'shortfall',
+            'product_variant',
+            'display_image' # Added field
+        ]
+
+    def get_shortfall(self, obj):
+        if obj.inventory and obj.inventory.minimum_stock_level is not None and obj.quantity is not None:
+            return obj.inventory.minimum_stock_level - obj.quantity
+        return None
+    # Removed get_display_image method from here 
