@@ -366,7 +366,7 @@ class StockItemViewSet(BaseInventoryViewSetMixin):
 
         page = self.paginate_queryset(queryset)
         if page is not None:
-            serializer = LowStockItemSerializer(page, many=True)
+            serializer = LowStockItemSerializer(page, many=True,context={'request': request})
             return self.get_paginated_response(serializer.data)
 
         serializer = LowStockItemSerializer(queryset, many=True)
