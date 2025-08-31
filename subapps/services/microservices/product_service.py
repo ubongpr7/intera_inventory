@@ -42,7 +42,7 @@ class ProductService:
             return cached_data
 
         endpoint = "product_api/variants/minimal_details_barcode/"
-        url = f"{cls.BASE_URL.rstrip('/')}/{endpoint.lstrip('/')}"
+        url = f"{cls.BASE_URL.rstrip('/')}/{endpoint.lstrip('/')}/"
         
         params = {"barcode": barcode}
         

@@ -15,17 +15,20 @@ class ProductImageMixin: # Added Mixin
 
     def _get_display_image(self, obj):
         request = self.context.get('request')
+        print(request)
         if not request or not obj.product_variant:
             return None
-        
-        variant_details = ProductService.get_variant_details_by_barcode(
-            barcode=obj.product_variant,
-            request=request
-        )
-        
-        if variant_details:
-            return variant_details.get('image') or variant_details.get('display_image')
-        
+        try:
+
+            variant_details = ProductService.get_variant_details_by_barcode(
+                barcode=obj.product_variant,
+                request=request
+            )
+            
+            if variant_details:
+                return variant_details.get('image') or variant_details.get('display_image')
+        except Exception as e:
+            print(f"Error fetching variant details: {e}")
         return None
 
 class StockLocationTypeSerializer(serializers.ModelSerializer):
