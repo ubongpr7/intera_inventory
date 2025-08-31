@@ -161,15 +161,14 @@ class StockItemViewSet(BaseInventoryViewSetMixin):
     ordering_fields = ['name', 'quantity', 'expiry_date', 'created_at']
     ordering = ['-created_at']
     serializer_class=StockItemDetailSerializer
-    # def get_serializer_class(self):
-    #     if self.action == 'list':
-    #         return StockItemListSerializer
-    #     return StockItemDetailSerializer
+    def get_serializer_class(self):
+        if self.action == 'list':
+            return StockItemListSerializer
+        return StockItemDetailSerializer
     def get_serializer_context(self):
         context = super().get_serializer_context()
         context.update({
-            "request": self.request,  # ensures request is included
-            # you can add more custom stuff here if needed
+            "request": self.request,  
         })
         return context
     
