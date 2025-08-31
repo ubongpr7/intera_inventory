@@ -30,7 +30,6 @@ class BaseInventoryViewSet(BaseCachePermissionViewset):
         profile_id = self.request.headers.get('X-Profile-ID')
         if profile_id:
             queryset = queryset.filter(profile=profile_id)
-            print(queryset)
         return queryset
     
     def perform_create(self, serializer):

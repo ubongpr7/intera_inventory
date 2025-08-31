@@ -11,5 +11,4 @@ class Command(BaseCommand):
         # Delete all product categories
         StockItem.objects.all().delete()
         
-        # Print a success message with the number of deleted categories
         self.stdout.write(self.style.SUCCESS(f'Deleted {count} Variant Stocks.'))

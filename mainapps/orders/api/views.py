@@ -74,7 +74,6 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
             queryset = queryset.filter(created_at__gte=date_from)
         if date_to:
             queryset = queryset.filter(created_at__lte=date_to)
-        print(queryset)
         return queryset
     
     def perform_create(self, serializer):
