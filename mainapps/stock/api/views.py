@@ -369,7 +369,7 @@ class StockItemViewSet(BaseInventoryViewSetMixin):
             serializer = LowStockItemSerializer(page, many=True,context={'request': request})
             return self.get_paginated_response(serializer.data)
 
-        serializer = LowStockItemSerializer(queryset, many=True)
+        serializer = LowStockItemSerializer(queryset, many=True,context={'request': request})
         return Response(serializer.data)
     
 
