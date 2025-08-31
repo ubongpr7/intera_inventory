@@ -34,19 +34,20 @@ class ProductService:
             logger.debug("Barcode is empty, returning None.")
             return None
 
-        cache_key = f"product_variant_details_{barcode}"
-        cached_data = cache.get(cache_key)
+        # cache_key = f"product_variant_details_{barcode}"
+        # cached_data = cache.get(cache_key)
 
-        if cached_data:
-            logger.debug(f"Returning cached data for barcode: {barcode}")
-            return cached_data
+        # if cached_data:
+        #     logger.debug(f"Returning cached data for barcode: {barcode}")
+        #     return cached_data
 
         endpoint = "product_api/variants/minimal_details_barcode/"
         url = f"{cls.BASE_URL.rstrip('/')}/{endpoint.lstrip('/')}/"
+        print(url)
         
         params = {"barcode": barcode}
         
-        logger.debug(f"Making API call to {url} with params: {params}")
+        print(f"Making API call to {url} with params: {params}")
         try:
             response = requests.get(
                 url,
@@ -58,7 +59,7 @@ class ProductService:
             if response.status_code == 200:
                 data = response.json()
                 if data:
-                    cache.set(cache_key, data, cls.CACHE_TIMEOUT)
+                    # cache.set(cache_key, data, cls.CACHE_TIMEOUT)
                     logger.info(f"Fetched and cached details for barcode: {barcode}")
                     logger.debug(f"Successfully fetched data for barcode {barcode}: {data}")
                     return data
