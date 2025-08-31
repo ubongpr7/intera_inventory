@@ -4,7 +4,6 @@ from django.conf import settings
 from django.core.cache import cache
 from typing import Optional, Dict, Any
 
-# Re-using UserService for authentication headers as per the previous pattern
 from .user_service import UserService
 
 logger = logging.getLogger(__name__)
@@ -40,7 +39,6 @@ class ProductService:
 
         endpoint = "product_api/variants/minimal_details_barcode/"
         url = f"{cls.BASE_URL.rstrip('/')}/{endpoint.lstrip('/')}"
-        print(url)
         
         params = {"barcode": barcode}
         
