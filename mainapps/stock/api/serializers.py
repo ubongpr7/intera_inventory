@@ -13,7 +13,7 @@ from subapps.services.microservices.product_service import ProductService # Adde
 
 class ProductImageMixin: # Added Mixin
 
-    def get_display_image(self, obj):
+    def _get_display_image(self, obj):
         request = self.context.get('request')
         if not request or not obj.product_variant:
             return None
@@ -99,7 +99,8 @@ class StockItemListSerializer(ProductImageMixin, serializers.ModelSerializer):
             'purchase_price', 'created_at','quantity_w_unit','product_variant',
             'display_image' # Added field
         ]
-    
+    def get_display_image(self, obj):
+        return self._get_display_image(obj)
     def get_days_to_expiry(self, obj):
         if obj.expiry_date:
             from django.utils import timezone
@@ -145,6 +146,8 @@ class StockItemDetailSerializer(ProductImageMixin, UserDetailMixin, serializers.
         fields = '__all__'
         read_only_fields = ['sku', 'serial_int']
     
+    def get_display_image(self, obj):
+        return self._get_display_image(obj)
     def get_customer_details(self, obj):
         return self.get_user_details(obj.customer)
     
@@ -200,6 +203,9 @@ class LowStockItemSerializer(ProductImageMixin, serializers.ModelSerializer):
     shortfall = serializers.SerializerMethodField()
     # display_image = serializers.SerializerMethodField() # Removed from here
     display_image = serializers.SerializerMethodField()
+    
+    def get_display_image(self, obj):
+        return self._get_display_image(obj)
 
     
 
