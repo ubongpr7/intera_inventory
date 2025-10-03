@@ -15,14 +15,7 @@ DEBUG = True
 ALLOWED_HOSTS = [
     'localhost',
     '127.0.0.1',
-    'dev.inventory.destinybuilders.africa',
-     'inventory-service:8000'
-    'common-service:8000',
-    'product-service:8000',
-    '16.16.25.132'
-
-
-
+    'dev.inventory.interaims.com',
 ]
 
 
@@ -216,17 +209,11 @@ DJOSER = {
     'USER_CREATE_PASSWORD_RETYPE': True,
     'PASSWORD_RESET_CONFIRM_RETYPE': True,
     'LOGOUT_ON_PASSWORD_CHANGE': True,
-    # 'EMAIL_FRONTEND_DOMAIN':'localhost:3000',
-    # 'EMAIL_FRONTEND_PROTOCOL':'http',
     'TOKEN_MODEL': 'rest_framework.authtoken.models.Token',  
-
     'SOCIAL_AUTH_ALLOWED_REDIRECT_URIS': os.getenv('SOCIAL_AUTH_ALLOWED_REDIRECT_URIS', '').split(','),
 }
 
 
-# DJANGO_MCP_SERVER_NAME = "IMS Inventory Service"
-# DJANGO_MCP_INSTRUCTIONS = "Provides tools for managing inentory in the IMS"
-# DJANGO_MCP_AUTHENTICATION_CLASSES=["rest_framework_simplejwt.authentication.JWTStatelessUserAuthentication"]
 
 
 
@@ -309,11 +296,12 @@ CORS_ALLOWED_ORIGINS = [
     "http://3.84.22.207:3000",
     'https://agentic-caller-gvlu.onrender.com',
     'https://intera-inventory.vercel.app',
-    'https://dev.product.destinybuilders.africa',
-    'https://dev.inventory.destinybuilders.africa',
-    'https://dev.pos.destinybuilders.africa',
-    'https://pos-app-snowy.vercel.app',
-]
+    'https://dev.product.interaims.com',
+    'https://dev.inventory.interaims.com',
+    'https://dev.pos.interaims.com',
+    'https://interaims.com',
+    'https://www.interaims.com',
+    ]
 
 SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
 SESSION_COOKIE_SECURE = True

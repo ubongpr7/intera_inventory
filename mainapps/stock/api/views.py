@@ -165,6 +165,7 @@ class StockItemViewSet(BaseInventoryViewSetMixin):
         if self.action == 'list':
             return StockItemListSerializer
         return StockItemDetailSerializer
+    
     def get_serializer_context(self):
         context = super().get_serializer_context()
         print('Context',context)
