@@ -28,8 +28,8 @@ services:
       - "8002:8000"
     # depends_on:
     #   - redis
-    networks:
-      - microservice-net
+    # networks:
+    #   - microservice-net
     restart: unless-stopped
 
 #   celery:
@@ -49,8 +49,8 @@ services:
 # volumes:
 #   redis_data:
 
-networks:
-  microservice-net:
-    external: true
+# networks:
+#   microservice-net:
+#     external: true
   
 
