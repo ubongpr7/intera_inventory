@@ -10,9 +10,7 @@ services:
   #   restart: unless-stopped
 
   web:
-    # image: ubongpr7/inventoryv2:latest
-    image: ubongpr7/intera_users:latest
-
+    image: ubongpr7/inventoryv2:latest
     env_file:
       - .env
     container_name: inventory-service
