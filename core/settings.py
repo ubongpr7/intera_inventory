@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+LOCAL_SERVER = os.getenv('LOCAL_SERVER', 'False')=='True'
 
 
 SECRET_KEY = os.getenv('SECRET_KEY')
@@ -40,7 +41,6 @@ THIRD_PARTY_APPS=[
     'rest_framework_simplejwt',
     'rest_framework_simplejwt.token_blacklist',
     'oauth2_provider',
-    'tinymce',
     'drf_yasg',
     'djoser',
     'social_django',
@@ -93,25 +93,24 @@ TEMPLATES = [
 
 WSGI_APPLICATION = 'core.wsgi.application'
 
-"""
-DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
+if LOCAL_SERVER:
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.sqlite3',
+            'NAME': BASE_DIR / 'db.sqlite3',
+        }
     }
-}
-
-"""
-DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.postgresql',
-        'NAME': os.getenv('DB_NAME'),
-        'USER': os.getenv('DB_USER'),
-        'PASSWORD': os.getenv('DB_PASSWORD'),
-        'HOST': os.getenv('DB_HOST'),
-        'PORT': os.getenv('DB_PORT'),
+else:
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.postgresql',
+            'NAME': os.getenv('DB_NAME'),
+            'USER': os.getenv('DB_USER'),
+            'PASSWORD': os.getenv('DB_PASSWORD'),
+            'HOST': os.getenv('DB_HOST'),
+            'PORT': os.getenv('DB_PORT'),
+        }
     }
-}
 
 AUTH_PASSWORD_VALIDATORS = [
     {
@@ -312,14 +311,6 @@ FILE_UPLOAD_TIMEOUT = 3600
 DATA_UPLOAD_MAX_MEMORY_SIZE = 2147483648  # 2GB
 FILE_UPLOAD_MAX_MEMORY_SIZE = 2147483648  # 2GB
 
-TINYMCE_DEFAULT_CONFIG = {
-    'height': 360,
-    'width': 800,
-    'cleanup_on_startup': True,
-    'custom_undo_redo_levels': 20,
-    'selector': 'textarea',
-    'theme': 'modern',
-}
 
 """
 CACHES = {

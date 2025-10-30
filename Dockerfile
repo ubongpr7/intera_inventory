@@ -1,4 +1,5 @@
-FROM python:3.11-slim
+FROM python:3.13
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
 RUN mkdir /app
 
@@ -9,18 +10,17 @@ ENV PYTHONUNBUFFERED=1
 
 RUN apt-get update && apt-get install -y gcc libpq-dev graphviz libpq-dev && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --upgrade pip
+COPY pyproject.toml /app/
+COPY uv.lock /app/
+COPY .python-version /app/
 
-RUN pip install --upgrade setuptools wheel
-RUN pip install tox
-
-COPY requirements.txt /app/
-RUN pip install --no-cache-dir -r requirements.txt
-RUN pip install celery[redis]
+RUN uv sync --locked
+ENV PATH="/app/.venv/bin:$PATH"
 
 COPY . /app/
 
 # Expose port
-EXPOSE 8001
+EXPOSE 7002
 
-CMD ["sh", "-c", "python manage.py migrate && python manage.py runserver 0.0.0.0:8001"]
+
+CMD ["sh", "-c", "uv run manage.py migrate && uv run manage.py runserver 0.0.0.0:7002"]

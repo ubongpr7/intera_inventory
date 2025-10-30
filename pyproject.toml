@@ -1,0 +1,32 @@
+[project]
+name = "intera-inventory"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "boto3>=1.40.56",
+    "celery>=5.5.3",
+    "django>=5.2.7",
+    "django-cities-light>=3.10.2",
+    "django-cors-headers>=4.9.0",
+    "django-extensions>=4.1",
+    "django-filter>=25.2",
+    "django-mptt>=0.18.0",
+    "django-oauth2-provider>=0.2.6.1",
+    "django-rest-framework>=0.1.0",
+    "django-schema-graph>=3.1.0",
+    "django-smtp-ssl>=1.0",
+    "djangorestframework-simplejwt>=5.5.1",
+    "djoser>=2.3.3",
+    "dotenv>=0.9.9",
+    "drf-yasg>=1.21.11",
+    "oauth2-provider>=0.0",
+    "pillow>=12.0.0",
+    "psycopg[binary]>=3.2.12",
+    "redis>=6.4.0",
+    "sendgrid-django>=4.2.0",
+    "social-auth-app-django>=5.6.0",
+    "weasyprint>=66.0",
+    "whitenoise>=6.11.0",
+]

@@ -1,54 +1,22 @@
 services:
-  # redis:
-  #   image: redis:latest
-  #   ports:
-  #     - "6379:6370"
-  #   volumes:
-  #     - redis_data:/data
-  #   networks:
-  #     - intera_network
-  #   restart: unless-stopped
-
   web:
-    image: ubongpr7/inventoryv2:latest
+    build:
+      context: .
+    container_name: intera-inventory
     env_file:
       - .env
-    container_name: inventory-service
     command: >
       sh -c "
-        python manage.py makemigrations &&
-        python manage.py migrate &&
-        uvicorn core.asgi:application --reload --host 0.0.0.0 --port 8000
+        uv run manage.py makemigrations &&
+        uv run manage.py migrate &&
+        uv run manage.py runserver 0.0.0.0:7002
       "
     volumes:
       - .:/app
+      - venv:/app/.venv
     ports:
-      - "8002:8000"
-    # depends_on:
-    #   - redis
-    # networks:
-    #   - microservice-net
+      - "7002:7002"
     restart: unless-stopped
 
-#   celery:
-#     image: ubongpr7/inventoryv2:latest
-#     env_file:
-#       - .env
-#     command: celery -A core worker --loglevel=info --pool=solo
-#     depends_on:
-#       - redis
-#       - web
-#     volumes:
-#       - .:/app
-#     networks:
-#       - intera_network
-#     restart: unless-stopped
-
-# volumes:
-#   redis_data:
-
-# networks:
-#   microservice-net:
-#     external: true
-  
-
+volumes:
+  venv:
