@@ -4,8 +4,9 @@ from decimal import Decimal
 
 from mainapps.content_type_linking_models.serializers import UserDetailMixin
 from mainapps.stock.models import StockItem
+from subapps.services.inventory_read_model import get_inventory_summary_map
 
-from ..models import (
+from .models import (
     Inventory, InventoryCategory, InventoryBatch
 )
 
@@ -36,15 +37,17 @@ class InventoryCategoryDetailSerializer(UserDetailMixin, serializers.ModelSerial
         return obj.parent.name if obj.parent else None
     
     def get_created_by_details(self, obj):
-        return self.get_user_details(getattr(obj, 'created_by', None))
+        return self.get_user_details(self.resolve_user_reference(obj, 'created_by_user_id', 'created_by'))
     
     def get_modified_by_details(self, obj):
-        return self.get_user_details(getattr(obj, 'modified_by', None))
+        return self.get_user_details(self.resolve_user_reference(obj, 'updated_by_user_id', 'modified_by'))
 
 class InventoryListSerializer(serializers.ModelSerializer):
     """Lightweight serializer for inventory lists"""
     category_name = serializers.CharField(source='category.name', read_only=True)
-    stock_status = serializers.ReadOnlyField()
+    stock_status = serializers.SerializerMethodField()
+    total_stock_value = serializers.SerializerMethodField()
+    current_stock_level = serializers.SerializerMethodField()
     
     class Meta:
         model = Inventory
@@ -54,11 +57,24 @@ class InventoryListSerializer(serializers.ModelSerializer):
             'minimum_stock_level', 're_order_point', 'created_at','re_order_quantity','reorder_strategy'
         ]
 
+    def _get_summary(self, obj):
+        summary_map = self.context.get('inventory_summary_map') or {}
+        return summary_map.get(obj.id) or get_inventory_summary_map([obj]).get(obj.id, {})
+
+    def get_stock_status(self, obj):
+        return self._get_summary(obj).get('stock_status', obj.stock_status)
+
+    def get_total_stock_value(self, obj):
+        return self._get_summary(obj).get('total_stock_value', obj.total_stock_value)
+
+    def get_current_stock_level(self, obj):
+        return self._get_summary(obj).get('current_stock_level', obj.current_stock_level)
+
 class InventoryDetailSerializer(UserDetailMixin, serializers.ModelSerializer):
     """Comprehensive serializer for inventory CRUD operations"""
     category_details = InventoryCategoryListSerializer(source='category', read_only=True)
     current_stock = serializers.SerializerMethodField()
-    stock_status = serializers.ReadOnlyField()
+    stock_status = serializers.SerializerMethodField()
     calculated_safety_stock = serializers.ReadOnlyField()
     
     # User details
@@ -74,51 +90,39 @@ class InventoryDetailSerializer(UserDetailMixin, serializers.ModelSerializer):
         fields = '__all__'
         read_only_fields = ['external_system_id', 'created_at', 'modified_at']
     
+    def _get_summary(self, obj):
+        summary_map = self.context.get('inventory_summary_map') or {}
+        return summary_map.get(obj.id) or get_inventory_summary_map([obj]).get(obj.id, {})
+
     def get_current_stock(self, obj):
-        return obj.current_stock_level
+        return self._get_summary(obj).get('current_stock_level', obj.current_stock_level)
+
+    def get_stock_status(self, obj):
+        return self._get_summary(obj).get('stock_status', obj.stock_status)
     
 
     def get_officer_in_charge_details(self, obj):
-        return self.get_user_details(obj.officer_in_charge)
+        return self.get_user_details(self.resolve_user_reference(obj, 'officer_in_charge_user_id', 'officer_in_charge'))
     
     def get_created_by_details(self, obj):
-        return self.get_user_details(getattr(obj, 'created_by', None))
+        return self.get_user_details(self.resolve_user_reference(obj, 'created_by_user_id', 'created_by'))
     
     def get_modified_by_details(self, obj):
-        return self.get_user_details(getattr(obj, 'modified_by', None))
+        return self.get_user_details(self.resolve_user_reference(obj, 'updated_by_user_id', 'modified_by'))
     
     def get_stock_analytics(self, obj):
         """Get comprehensive stock analytics"""
-        stock_items = obj.stock_items.all()
-        
-        if not stock_items.exists():
-            return {
-                'total_locations': 0,
-                'average_purchase_price': 0,
-                'stock_turnover_rate': 0,
-                'days_since_last_movement': None,
-                'expiring_soon_count': 0
-            }
-        
-        analytics = stock_items.aggregate(
-            total_locations=Count('location', distinct=True),
-            avg_purchase_price=Avg('purchase_price'),
-            total_quantity=Sum('quantity')
-        )
-        
-        from django.utils import timezone
-        from datetime import timedelta
-        
-        expiring_soon = stock_items.filter(
-            expiry_date__lte=timezone.now().date() + timedelta(days=30),
-            expiry_date__isnull=False
-        ).count()
-        
-        analytics['expiring_soon_count'] = expiring_soon
-        analytics['stock_turnover_rate'] = 0  
-        analytics['days_since_last_movement'] = None 
-        
-        return analytics
+        summary = self._get_summary(obj)
+        return {
+            'total_locations': summary.get('total_locations', 0),
+            'average_purchase_price': summary.get('avg_purchase_price', Decimal('0')),
+            'stock_turnover_rate': 0,
+            'days_since_last_movement': None,
+            'expiring_soon_count': summary.get('expiring_soon_count', 0),
+            'quantity_reserved': summary.get('quantity_reserved', Decimal('0')),
+            'quantity_available': summary.get('quantity_available', Decimal('0')),
+            'location_breakdown': summary.get('location_breakdown', []),
+        }
 
 # Analytics Serializers
 class InventoryAnalyticsSerializer(serializers.Serializer):

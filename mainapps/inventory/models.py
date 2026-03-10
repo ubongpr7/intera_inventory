@@ -14,11 +14,25 @@ from django.utils.crypto import get_random_string
 from django.utils.text import slugify
 from django.utils.translation import gettext_lazy as _
 from django.utils import timezone
-from mainapps.content_type_linking_models.models import ProfileMixin, UUIDBaseModel
+from mainapps.content_type_linking_models.models import (
+    ProfileMixin,
+    TenantStampedUUIDModel,
+    UUIDBaseModel,
+    _sync_identity_fields,
+)
 from django.db import transaction
 from django.db.models import F
 from django.core.validators import RegexValidator
 from django.core.exceptions import ValidationError
+
+
+def _sync_profile_lookup_value(value):
+    if value in (None, ""):
+        return None
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
 
 
 class Address(models.Model):
@@ -115,6 +129,24 @@ class ForecastMethods(models.TextChoices):
     SIMPLE_AVERAGE = "SA", _("Simple Average")
     MOVING_AVERAGE = "MA", _("Moving Average")
     EXP_SMOOTHING = "ES", _("Exponential Smoothing")
+
+
+INVENTORY_TYPE_CHOICES = [
+    ('raw_material', _('Raw Material')),
+    ('finished_good', _('Finished Good')),
+    ('work_in_progress', _('Work In Progress')),
+    ('maintenance_spare_part', _('Maintenance Spare Part')),
+    ('consumable', _('Consumable')),
+    ('tooling', _('Tooling')),
+    ('packaging', _('Packaging')),
+]
+
+
+class InventoryItemStatus(models.TextChoices):
+    DRAFT = 'draft', _('Draft')
+    ACTIVE = 'active', _('Active')
+    ARCHIVED = 'archived', _('Archived')
+    DISCONTINUED = 'discontinued', _('Discontinued')
 
 class InventoryPolicy(ProfileMixin):
     """
@@ -419,7 +451,10 @@ class InventoryCategory(ProfileMixin, MPTTModel):
     
     @classmethod
     def return_numbers(cls, profile):
-        return cls.objects.filter(profile=profile).count()
+        profile_value = _sync_profile_lookup_value(profile)
+        if profile_value is None:
+            return 0
+        return cls.objects.filter(models.Q(profile_id=profile_value) | models.Q(profile=str(profile_value))).count()
 
     @property
     def inventory_count(self):
@@ -442,29 +477,134 @@ class InventoryCategory(ProfileMixin, MPTTModel):
     @classmethod
     def tabular_display(cls):
         return [{"name": 'Name'}, {'is_active': 'Active'}]
+
+
+class InventoryItem(TenantStampedUUIDModel):
+    product_template_id = models.UUIDField(
+        blank=True,
+        null=True,
+        db_index=True,
+        verbose_name=_("Product Template ID"),
+    )
+    product_variant_id = models.UUIDField(
+        blank=True,
+        null=True,
+        db_index=True,
+        verbose_name=_("Product Variant ID"),
+    )
+    name_snapshot = models.CharField(max_length=255, verbose_name=_("Name Snapshot"))
+    sku_snapshot = models.CharField(max_length=100, blank=True, default="", verbose_name=_("SKU Snapshot"))
+    barcode_snapshot = models.CharField(max_length=100, blank=True, default="", verbose_name=_("Barcode Snapshot"))
+    description = models.TextField(blank=True, default="", verbose_name=_("Description"))
+    inventory_category = models.ForeignKey(
+        InventoryCategory,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='inventory_items',
+        verbose_name=_("Inventory Category"),
+    )
+    inventory_type = models.CharField(
+        max_length=50,
+        choices=INVENTORY_TYPE_CHOICES,
+        default='raw_material',
+        verbose_name=_("Inventory Type"),
+    )
+    default_uom_code = models.CharField(max_length=32, blank=True, default="", verbose_name=_("Default UOM"))
+    stock_uom_code = models.CharField(max_length=32, blank=True, default="", verbose_name=_("Stock UOM"))
+    track_stock = models.BooleanField(default=True, verbose_name=_("Track Stock"))
+    track_lot = models.BooleanField(default=False, verbose_name=_("Track Lot"))
+    track_serial = models.BooleanField(default=False, verbose_name=_("Track Serial"))
+    track_expiry = models.BooleanField(default=False, verbose_name=_("Track Expiry"))
+    allow_negative_stock = models.BooleanField(default=False, verbose_name=_("Allow Negative Stock"))
+    reorder_point = models.DecimalField(max_digits=15, decimal_places=5, default=0)
+    reorder_quantity = models.DecimalField(max_digits=15, decimal_places=5, default=0)
+    minimum_stock_level = models.DecimalField(max_digits=15, decimal_places=5, default=0)
+    safety_stock_level = models.DecimalField(max_digits=15, decimal_places=5, default=0)
+    default_supplier = models.ForeignKey(
+        'company.Company',
+        on_delete=models.SET_NULL,
+        blank=True,
+        null=True,
+        related_name='inventory_item_defaults',
+        limit_choices_to={'is_supplier': True},
+        verbose_name=_("Default Supplier"),
+    )
+    status = models.CharField(
+        max_length=20,
+        choices=InventoryItemStatus.choices,
+        default=InventoryItemStatus.ACTIVE,
+        db_index=True,
+        verbose_name=_("Status"),
+    )
+    metadata = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        ordering = ['name_snapshot']
+        indexes = [
+            models.Index(fields=['profile_id', 'status']),
+            models.Index(fields=['inventory_category', 'inventory_type']),
+            models.Index(fields=['sku_snapshot']),
+            models.Index(fields=['barcode_snapshot']),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=['profile_id', 'product_variant_id'],
+                condition=models.Q(product_variant_id__isnull=False),
+                name='unique_inventory_item_profile_variant',
+            ),
+        ]
+
+    @staticmethod
+    def legacy_bridge_id(legacy_inventory_id):
+        return uuid.uuid5(uuid.NAMESPACE_URL, f"inventory-item:{legacy_inventory_id}")
+
+    @property
+    def display_name(self):
+        return self.name_snapshot
+
+    def __str__(self):
+        return self.name_snapshot
+
+
 class InventoryQuerySet(models.QuerySet):
     def active(self):
         return self.filter(active=True)
     
     def low_stock(self):
-        return self.filter(
-            stock_items__quantity__lte=models.F('minimum_stock_level')
-        ).distinct()
+        from subapps.services.inventory_read_model import get_inventory_ids_for_stock_filter
+
+        inventory_list = list(self)
+        inventory_ids = get_inventory_ids_for_stock_filter(inventory_list, filter_name='low_stock')
+        if not inventory_ids:
+            return self.none()
+        return self.filter(id__in=inventory_ids)
     
     def needs_reorder(self):
-        return self.filter(
-            stock_items__quantity__lte=models.F('re_order_point')
-        ).distinct()
+        from subapps.services.inventory_read_model import get_inventory_ids_for_stock_filter
+
+        inventory_list = list(self)
+        inventory_ids = get_inventory_ids_for_stock_filter(inventory_list, filter_name='needs_reorder')
+        if not inventory_ids:
+            return self.none()
+        return self.filter(id__in=inventory_ids)
     
     def by_category(self, category):
         return self.filter(category=category)
     
     def expiring_soon(self, days=30):
-        cutoff_date = timezone.now().date() + timezone.timedelta(days=days)
-        return self.filter(
-            stock_items__expiry_date__lte=cutoff_date,
-            stock_items__expiry_date__isnull=False
-        ).distinct()
+        from subapps.services.inventory_read_model import get_inventory_summary_map
+
+        inventory_list = list(self)
+        summary_map = get_inventory_summary_map(inventory_list, expiring_days=days)
+        inventory_ids = [
+            inventory.id
+            for inventory in inventory_list
+            if summary_map.get(inventory.id, {}).get('expiring_soon_count', 0) > 0
+        ]
+        if not inventory_ids:
+            return self.none()
+        return self.filter(id__in=inventory_ids)
 
 class InventoryManager(models.Manager):
     def get_queryset(self):
@@ -508,15 +648,7 @@ class Inventory(InventoryProperty):
     
     inventory_type = models.CharField(
         max_length=50,
-        choices=[
-            ('raw_material', _('Raw Material')),
-            ('finished_good', _('Finished Good')),
-            ('work_in_progress', _('Work In Progress')),
-            ('maintenance_spare_part', _('Maintenance Spare Part')),
-            ('consumable', _('Consumable')),
-            ('tooling', _('Tooling')),
-            ('packaging', _('Packaging')),
-        ],
+        choices=INVENTORY_TYPE_CHOICES,
         default='raw_material',
         verbose_name=_('Inventory Type'),
         help_text=_('Type of inventory item')
@@ -557,6 +689,7 @@ class Inventory(InventoryProperty):
         verbose_name=_('Officer in Charge ID'),
         help_text=_('ID of the officer responsible for this inventory'),
     )
+    officer_in_charge_user_id = models.BigIntegerField(blank=True, null=True, db_index=True)
     class Meta:
         verbose_name_plural = 'Inventories'
         ordering = ['-created_at']
@@ -576,7 +709,10 @@ class Inventory(InventoryProperty):
     def generate_external_id(self):
         """Atomically generate unique external ID in PROFILE_INITIALS-SEQ format"""
         with transaction.atomic():
-            last_inventory= Inventory.objects.filter(profile=self.profile).order_by('-created_at').last()
+            profile_value = self.profile_id if self.profile_id is not None else self.profile
+            last_inventory = Inventory.objects.filter(
+                models.Q(profile_id=profile_value) | models.Q(profile=str(profile_value))
+            ).order_by('-created_at').last()
             number_in_category= Inventory.objects.filter(category=self.category).count()+1
             if last_inventory:
                 last_reference=last_inventory.external_system_id.split('-')[-1]
@@ -592,11 +728,12 @@ class Inventory(InventoryProperty):
                 initials = self.category.name[:3].upper()
                 
             
-            return f"INV-{initials}-{self.profile}{number_in_category}-{last_reference:04d}"
+            return f"INV-{initials}-{profile_value}{number_in_category}-{last_reference:04d}"
 
     def save(self, *args, **kwargs):
-        # if not self.external_system_id:
-        self.external_system_id = self.generate_external_id()
+        _sync_identity_fields(self, canonical_field='officer_in_charge_user_id', legacy_field='officer_in_charge')
+        if not self.external_system_id:
+            self.external_system_id = self.generate_external_id()
         super().save(*args, **kwargs)
     
     def clean(self):
@@ -613,6 +750,21 @@ class Inventory(InventoryProperty):
     @property
     def total_stock_value(self):
         """Calculate total value of all stock for this inventory"""
+        from mainapps.stock.models import StockBalance
+
+        bridge_id = InventoryItem.legacy_bridge_id(self.id)
+        balance_total = StockBalance.objects.filter(
+            inventory_item_id=bridge_id,
+            stock_lot__isnull=False,
+        ).aggregate(
+            total=models.Sum(
+                models.F('quantity_on_hand') * models.F('stock_lot__unit_cost'),
+                output_field=models.DecimalField(max_digits=20, decimal_places=5),
+            )
+        )['total']
+        if balance_total is not None:
+            return balance_total
+
         return self.stock_items.aggregate(
             total=models.Sum(
                 models.F('quantity') * models.F('purchase_price'),
@@ -623,6 +775,17 @@ class Inventory(InventoryProperty):
     @property
     def current_stock_level(self):
         """Get current total stock across all locations"""
+        from mainapps.stock.models import StockBalance
+
+        bridge_id = InventoryItem.legacy_bridge_id(self.id)
+        balance_total = StockBalance.objects.filter(
+            inventory_item_id=bridge_id,
+        ).aggregate(
+            total=models.Sum('quantity_on_hand')
+        )['total']
+        if balance_total is not None:
+            return balance_total
+
         return self.stock_items.aggregate(
             total=models.Sum('quantity')
         )['total'] or 0
@@ -778,6 +941,7 @@ class InventoryTransaction(ProfileMixin):
         null=True,
         help_text="User who performed the transaction"
     )
+    performed_by_user_id = models.BigIntegerField(blank=True, null=True, db_index=True)
     
     notes = models.TextField(
         blank=True,
@@ -794,5 +958,8 @@ class InventoryTransaction(ProfileMixin):
         verbose_name = 'Inventory Transaction'
         verbose_name_plural = 'Inventory Transactions'
 
-registerable_models = [Inventory, InventoryCategory]
+    def save(self, *args, **kwargs):
+        _sync_identity_fields(self, canonical_field='performed_by_user_id', legacy_field='user')
+        super().save(*args, **kwargs)
 
+registerable_models = [Inventory, InventoryCategory, InventoryItem]

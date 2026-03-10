@@ -4,31 +4,30 @@ from decimal import Decimal
 
 from mainapps.content_type_linking_models.serializers import UserDetailMixin
 from mainapps.inventory.models import Inventory
+from subapps.services.inventory_read_model import get_location_stock_summary
 
-from ..models import (
-     StockAdjustment, StockItem, StockLocation, StockItemTracking, StockLocationType
+from .models import (
+     StockAdjustment, StockItem, StockLocation, StockItemTracking, StockLocationType, StockReservation
 )
-from subapps.services.microservices.user_service import UserService
-from subapps.services.microservices.product_service import ProductService # Added import
+from subapps.services.catalog_projection import CatalogProjectionLookup
 
-class ProductImageMixin: # Added Mixin
+class ProductImageMixin:
 
     def get_display_image(self, obj):
         request = self.context.get('request')
-        print(request)
         if not request or not obj.product_variant:
             return None
         try:
 
-            variant_details = ProductService.get_variant_details_by_barcode(
+            variant_details = CatalogProjectionLookup.get_variant_details_by_barcode(
                 barcode=obj.product_variant,
                 request=request
             )
             
             if variant_details:
                 return variant_details.get('image') or variant_details.get('display_image')
-        except Exception as e:
-            print(f"Error fetching variant details: {e}")
+        except Exception:
+            return None
         return None
 
 class StockLocationTypeSerializer(serializers.ModelSerializer):
@@ -46,6 +45,9 @@ class StockLocationListSerializer(serializers.ModelSerializer):
         fields = ['id', 'name', 'code','parent_name','location_type_name', 'stock_count', 'structural', 'external','physical_address']
     
     def get_stock_count(self, obj):
+        active_balance_count = obj.stock_balances.filter(quantity_on_hand__gt=0).values('inventory_item').distinct().count()
+        if active_balance_count:
+            return active_balance_count
         return obj.stock_items.count()
     def get_parent_name(self, obj):
         return f'{obj.parent.name} - {obj.parent.code}' if obj.parent else ''
@@ -64,27 +66,13 @@ class StockLocationDetailSerializer(UserDetailMixin, serializers.ModelSerializer
         read_only_fields = ['code']
     
     def get_official_details(self, obj):
-        return self.get_user_details(obj.official)
+        return self.get_user_details(self.resolve_user_reference(obj, 'official_user_id', 'official'))
     def get_parent_name(self, obj):
         return f'{obj.parent.name} - {obj.parent.code}' if obj.parent else ''
     
     def get_stock_summary(self, obj):
         """Get stock summary for this location"""
-        stock_items = obj.stock_items.all()
-        
-        summary = stock_items.aggregate(
-            total_items=Count('id'),
-            total_quantity=Sum('quantity'),
-            total_value=Sum('quantity') * Sum('purchase_price')  # Simplified calculation
-        )
-        
-        # Get top inventory types
-        top_types = stock_items.values('inventory__inventory_type').annotate(
-            count=Count('id')
-        ).order_by('-count')[:5]
-        
-        summary['top_inventory_types'] = list(top_types)
-        return summary
+        return get_location_stock_summary(obj)
 
 class StockItemListSerializer(ProductImageMixin, serializers.ModelSerializer):
     """Lightweight serializer for stock item lists"""
@@ -151,7 +139,7 @@ class StockItemDetailSerializer(ProductImageMixin, UserDetailMixin, serializers.
         return self.get_user_details(obj.customer)
     
     def get_stocktaker_details(self, obj):
-        return self.get_user_details(obj.stocktaker)
+        return self.get_user_details(self.resolve_user_reference(obj, 'stocktaker_user_id', 'stocktaker'))
     
     def get_current_pricing(self, obj):
         """Get current pricing for this stock item"""
@@ -193,7 +181,10 @@ class StockItemTrackingListSerializer(UserDetailMixin, serializers.ModelSerializ
         fields = ['id', 'tracking_type', 'tracking_type_display', 'date', 'notes', 'user_details', 'deltas']
     
     def get_user_details(self, obj):
-        return self.get_user_details(obj.user)
+        return UserDetailMixin.get_user_details(
+            self,
+            self.resolve_user_reference(obj, 'performed_by_user_id', 'user'),
+        )
 
 class LowStockItemSerializer(ProductImageMixin, serializers.ModelSerializer):
     inventory_name = serializers.CharField(source='inventory.name', read_only=True)
@@ -224,5 +215,62 @@ class LowStockItemSerializer(ProductImageMixin, serializers.ModelSerializer):
         if obj.inventory and obj.inventory.minimum_stock_level is not None and obj.quantity is not None:
             return obj.inventory.minimum_stock_level - obj.quantity
         return None
+
+
+class LowStockBalanceSerializer(serializers.Serializer):
+    id = serializers.UUIDField()
+    name = serializers.CharField()
+    sku = serializers.CharField(allow_blank=True)
+    quantity = serializers.DecimalField(max_digits=15, decimal_places=5)
+    inventory_name = serializers.CharField()
+    minimum_stock_level = serializers.DecimalField(max_digits=15, decimal_places=5)
+    re_order_point = serializers.DecimalField(max_digits=15, decimal_places=5)
+    shortfall = serializers.DecimalField(max_digits=15, decimal_places=5)
+    product_variant = serializers.CharField(allow_blank=True)
+    display_image = serializers.CharField(allow_null=True, allow_blank=True)
+
+
+class StockReservationSerializer(serializers.ModelSerializer):
+    location_name = serializers.CharField(source='stock_location.name', read_only=True)
+    inventory_item_name = serializers.CharField(source='inventory_item.name_snapshot', read_only=True)
+    lot_number = serializers.CharField(source='stock_lot.lot_number', read_only=True)
+
+    class Meta:
+        model = StockReservation
+        fields = [
+            'id',
+            'inventory_item',
+            'inventory_item_name',
+            'stock_lot',
+            'lot_number',
+            'stock_location',
+            'location_name',
+            'external_order_type',
+            'external_order_id',
+            'external_order_line_id',
+            'reserved_quantity',
+            'fulfilled_quantity',
+            'status',
+            'expires_at',
+            'created_at',
+            'updated_at',
+        ]
+
+
+class StockReservationCreateSerializer(serializers.Serializer):
+    inventory_id = serializers.UUIDField()
+    location_id = serializers.UUIDField()
+    quantity = serializers.DecimalField(max_digits=15, decimal_places=5)
+    external_order_type = serializers.CharField(max_length=50)
+    external_order_id = serializers.CharField(max_length=100)
+    external_order_line_id = serializers.CharField(max_length=100, required=False, allow_blank=True)
+    stock_lot_id = serializers.UUIDField(required=False)
+    expires_at = serializers.DateTimeField(required=False)
+    notes = serializers.CharField(required=False, allow_blank=True)
+
+
+class StockReservationMutationSerializer(serializers.Serializer):
+    quantity = serializers.DecimalField(max_digits=15, decimal_places=5, required=False)
+    notes = serializers.CharField(required=False, allow_blank=True)
     
     

@@ -122,6 +122,14 @@ STOCK_LOCATION_PERMISSIONS = {
     'transfer_stock': CombinedPermissions.TRANSFER_STOCK_ITEM,
 }
 
+STOCK_RESERVATION_PERMISSIONS = {
+    'list': CombinedPermissions.READ_STOCK_ITEM,
+    'retrieve': CombinedPermissions.READ_STOCK_ITEM,
+    'create': CombinedPermissions.UPDATE_STOCK_ITEM,
+    'release': CombinedPermissions.UPDATE_STOCK_ITEM,
+    'fulfill': CombinedPermissions.UPDATE_STOCK_ITEM,
+}
+
 PURCHASE_ORDER_PERMISSIONS = {
     'list': CombinedPermissions.READ_PURCHASE_ORDER,
     'retrieve': CombinedPermissions.READ_PURCHASE_ORDER,
@@ -141,6 +149,7 @@ UNIFIED_PERMISSION_DICT= {
     'inventory_category':INVENTORY_CATEGORY_PERMISSIONS,
     'stock_item':STOCK_ITEM_PERMISSIONS,
     'stock_location':STOCK_LOCATION_PERMISSIONS,
+    'stock_reservation':STOCK_RESERVATION_PERMISSIONS,
     'purchase_order':PURCHASE_ORDER_PERMISSIONS
 
 }

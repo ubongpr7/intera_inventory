@@ -8,6 +8,7 @@ from mainapps.orders.models import *
 from django.core.validators import MinValueValidator
 from django.db import models
 from mptt.models import MPTTModel, TreeForeignKey
+from mainapps.content_type_linking_models.models import TenantStampedUUIDModel, _sync_identity_fields
 
 class StockStatus(models.TextChoices):
     OK = 'ok', _('OK')
@@ -39,6 +40,40 @@ class TrackingType(models.IntegerChoices):
     STATUS_CHANGE = 60, _('Stock status updated')
     DAMAGE_REPORTED = 61, _('Damage reported on item')
     OTHER = 0, _('Other Uncategorized tracking event')
+
+
+class StockLotStatus(models.TextChoices):
+    OPEN = 'open', _('Open')
+    QUARANTINED = 'quarantined', _('Quarantined')
+    DEPLETED = 'depleted', _('Depleted')
+    CLOSED = 'closed', _('Closed')
+
+
+class StockSerialStatus(models.TextChoices):
+    AVAILABLE = 'available', _('Available')
+    RESERVED = 'reserved', _('Reserved')
+    ISSUED = 'issued', _('Issued')
+    DAMAGED = 'damaged', _('Damaged')
+    RETURNED = 'returned', _('Returned')
+
+
+class StockMovementType(models.TextChoices):
+    RECEIPT = 'receipt', _('Receipt')
+    ISSUE = 'issue', _('Issue')
+    TRANSFER = 'transfer', _('Transfer')
+    ADJUSTMENT = 'adjustment', _('Adjustment')
+    RESERVATION = 'reservation', _('Reservation')
+    RELEASE = 'release', _('Release')
+    RETURN_IN = 'return_in', _('Return In')
+    RETURN_OUT = 'return_out', _('Return Out')
+
+
+class StockReservationStatus(models.TextChoices):
+    ACTIVE = 'active', _('Active')
+    PARTIALLY_FULFILLED = 'partially_fulfilled', _('Partially Fulfilled')
+    FULFILLED = 'fulfilled', _('Fulfilled')
+    RELEASED = 'released', _('Released')
+    EXPIRED = 'expired', _('Expired')
 
 class StockLocationType(models.Model):
     name = models.CharField(
@@ -83,6 +118,7 @@ class StockLocation(ProfileMixin, MPTTModel):
         verbose_name=_('Manager ID'),
         help_text=_('ID of the manager for this stock location'),
     )
+    official_user_id = models.BigIntegerField(blank=True, null=True, db_index=True)
 
     structural = models.BooleanField(
         default=False,
@@ -131,17 +167,18 @@ class StockLocation(ProfileMixin, MPTTModel):
     
     def save(self, *args, **kwargs):
         """Auto-generate location code on first save"""
+        _sync_identity_fields(self, canonical_field='official_user_id', legacy_field='official')
         if self.parent and not self.physical_address:
             self.physical_address =self.parent.physical_address
             
-        if  self.location_type and self.profile and not self.code:
+        if  self.location_type and (self.profile_id is not None or self.profile) and not self.code:
             
             base = self.location_type.name.upper().replace(' ', '_')
-            profile_id = self.profile
+            profile_id = self.profile_id if self.profile_id is not None else self.profile
             
             last_code = StockLocation.objects.filter(
+                models.Q(profile_id=profile_id) | models.Q(profile=str(profile_id)),
                 location_type=self.location_type,
-                profile=self.profile,
                 code__startswith=f"{base}_{profile_id}_"
             ).order_by('-code').values_list('code', flat=True).first()
 
@@ -176,6 +213,15 @@ class StockItem(MPTTModel, InventoryMixin):
     )
 
     inventory = models.ForeignKey('inventory.Inventory', on_delete=models.CASCADE, null=True,related_name='stock_items')
+    inventory_item = models.ForeignKey(
+        'inventory.InventoryItem',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='legacy_stock_items',
+        verbose_name=_('Inventory Item'),
+        help_text=_('Bridging reference to the redesigned inventory item record.'),
+    )
     parent = TreeForeignKey(
         'self',
         verbose_name=_('Parent Stock Item'),
@@ -298,6 +344,7 @@ class StockItem(MPTTModel, InventoryMixin):
         null=True,
         help_text=_('User  ID that performed the most recent stocktake'),
     )
+    stocktaker_user_id = models.BigIntegerField(blank=True, null=True, db_index=True)
 
     review_needed = models.BooleanField(default=False)
 
@@ -353,6 +400,13 @@ class StockItem(MPTTModel, InventoryMixin):
         return f'{self.quantity}'
 
     def save(self, *args, **kwargs):
+        _sync_identity_fields(self, canonical_field='stocktaker_user_id', legacy_field='stocktaker')
+        if not self.inventory_item_id and self.inventory_id:
+            from mainapps.inventory.models import InventoryItem
+
+            bridge_id = InventoryItem.legacy_bridge_id(self.inventory_id)
+            if InventoryItem.objects.filter(id=bridge_id).exists():
+                self.inventory_item_id = bridge_id
         
         try:
 
@@ -415,6 +469,181 @@ class StockPricing(models.Model):
     def get_total_price(self):
         return self.selling_price - self.get_discount_amount() + self.get_tax_amount()
 
+
+class StockLot(TenantStampedUUIDModel):
+    inventory_item = models.ForeignKey(
+        'inventory.InventoryItem',
+        on_delete=models.PROTECT,
+        related_name='stock_lots',
+    )
+    supplier = models.ForeignKey(
+        'company.Company',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='stock_lots',
+        limit_choices_to={'is_supplier': True},
+    )
+    purchase_order_line = models.ForeignKey(
+        'orders.PurchaseOrderLineItem',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='stock_lots',
+    )
+    goods_receipt_line = models.ForeignKey(
+        'orders.GoodsReceiptLine',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='stock_lots',
+    )
+    lot_number = models.CharField(max_length=100, blank=True)
+    manufactured_date = models.DateField(null=True, blank=True)
+    expiry_date = models.DateField(null=True, blank=True)
+    unit_cost = models.DecimalField(max_digits=15, decimal_places=5, default=0)
+    currency_code = models.CharField(max_length=10, blank=True, default='')
+    received_quantity = models.DecimalField(max_digits=15, decimal_places=5, default=0)
+    remaining_quantity = models.DecimalField(max_digits=15, decimal_places=5, default=0)
+    status = models.CharField(
+        max_length=20,
+        choices=StockLotStatus.choices,
+        default=StockLotStatus.OPEN,
+        db_index=True,
+    )
+
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['profile_id', 'inventory_item']),
+            models.Index(fields=['profile_id', 'lot_number']),
+            models.Index(fields=['expiry_date']),
+        ]
+
+    def save(self, *args, **kwargs):
+        if not self.lot_number and self.goods_receipt_line_id:
+            self.lot_number = f"LOT-{self.goods_receipt_line_id}"
+        if self.remaining_quantity > 0 and self.status == StockLotStatus.DEPLETED:
+            self.status = StockLotStatus.OPEN
+        elif self.remaining_quantity <= 0 and self.status == StockLotStatus.OPEN:
+            self.status = StockLotStatus.DEPLETED
+        super().save(*args, **kwargs)
+
+
+class StockSerial(TenantStampedUUIDModel):
+    inventory_item = models.ForeignKey(
+        'inventory.InventoryItem',
+        on_delete=models.PROTECT,
+        related_name='stock_serials',
+    )
+    stock_lot = models.ForeignKey(
+        StockLot,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='serials',
+    )
+    serial_number = models.CharField(max_length=100)
+    status = models.CharField(
+        max_length=20,
+        choices=StockSerialStatus.choices,
+        default=StockSerialStatus.AVAILABLE,
+        db_index=True,
+    )
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['profile_id', 'inventory_item']),
+            models.Index(fields=['profile_id', 'serial_number']),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=['profile_id', 'serial_number'],
+                name='unique_stock_serial_profile_serial_number',
+            )
+        ]
+
+
+class StockBalance(TenantStampedUUIDModel):
+    inventory_item = models.ForeignKey(
+        'inventory.InventoryItem',
+        on_delete=models.CASCADE,
+        related_name='stock_balances',
+    )
+    stock_location = models.ForeignKey(
+        StockLocation,
+        on_delete=models.CASCADE,
+        related_name='stock_balances',
+    )
+    stock_lot = models.ForeignKey(
+        StockLot,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='stock_balances',
+    )
+    quantity_on_hand = models.DecimalField(max_digits=15, decimal_places=5, default=0)
+    quantity_reserved = models.DecimalField(max_digits=15, decimal_places=5, default=0)
+    quantity_available = models.DecimalField(max_digits=15, decimal_places=5, default=0)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['profile_id', 'inventory_item', 'stock_location']),
+            models.Index(fields=['profile_id', 'quantity_available']),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=['inventory_item', 'stock_location', 'stock_lot'],
+                name='unique_stock_balance_item_location_lot',
+            )
+        ]
+
+    def save(self, *args, **kwargs):
+        self.quantity_available = self.quantity_on_hand - self.quantity_reserved
+        super().save(*args, **kwargs)
+
+
+class StockReservation(TenantStampedUUIDModel):
+    inventory_item = models.ForeignKey(
+        'inventory.InventoryItem',
+        on_delete=models.PROTECT,
+        related_name='stock_reservations',
+    )
+    stock_lot = models.ForeignKey(
+        StockLot,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='stock_reservations',
+    )
+    stock_location = models.ForeignKey(
+        StockLocation,
+        on_delete=models.PROTECT,
+        related_name='stock_reservations',
+    )
+    external_order_type = models.CharField(max_length=50)
+    external_order_id = models.CharField(max_length=100)
+    external_order_line_id = models.CharField(max_length=100, blank=True)
+    reserved_quantity = models.DecimalField(max_digits=15, decimal_places=5)
+    fulfilled_quantity = models.DecimalField(max_digits=15, decimal_places=5, default=0)
+    status = models.CharField(
+        max_length=30,
+        choices=StockReservationStatus.choices,
+        default=StockReservationStatus.ACTIVE,
+        db_index=True,
+    )
+    expires_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['profile_id', 'external_order_type', 'external_order_id']),
+            models.Index(fields=['profile_id', 'status']),
+        ]
+
+    @property
+    def remaining_quantity(self):
+        return max(self.reserved_quantity - self.fulfilled_quantity, 0)
+
 class StockItemTracking(InventoryMixin):
     tracking_type = models.IntegerField(default=TrackingType.OTHER, choices=TrackingType.choices)
 
@@ -438,6 +667,7 @@ class StockItemTracking(InventoryMixin):
         null=True,
         help_text=_('User  ID associated with this tracking info'),
     )
+    performed_by_user_id = models.BigIntegerField(blank=True, null=True, db_index=True)
 
     deltas = models.JSONField(null=True, blank=True)
 
@@ -453,7 +683,13 @@ class StockItemTracking(InventoryMixin):
 
     @classmethod
     def return_numbers(cls, profile):
-        return cls.objects.filter(inventory__profile=profile).count()
+        try:
+            profile_value = int(str(profile).strip())
+        except (TypeError, ValueError):
+            return 0
+        return cls.objects.filter(
+            models.Q(inventory__profile_id=profile_value) | models.Q(inventory__profile=str(profile_value))
+        ).count()
 
     class Meta:
         indexes = [
@@ -465,48 +701,71 @@ class StockItemTracking(InventoryMixin):
                 name='valid_tracking_type'
             )
         ]
-class StockMovement(InventoryMixin):
-    """Comprehensive stock movement tracking"""
-    
-    MOVEMENT_TYPES = [
-        ('IN', 'Stock In'),
-        ('OUT', 'Stock Out'),
-        ('TRANSFER', 'Location Transfer'),
-        ('ADJUSTMENT', 'Inventory Adjustment'),
-        ('RETURN', 'Return'),
-        ('DAMAGE', 'Damage/Loss'),
-    ]
-    
-    stock_item = models.ForeignKey(StockItem, on_delete=models.CASCADE)
-    movement_type = models.CharField(max_length=20, choices=MOVEMENT_TYPES)
-    quantity_before = models.DecimalField(max_digits=15, decimal_places=5)
-    quantity_after = models.DecimalField(max_digits=15, decimal_places=5)
-    quantity_changed = models.DecimalField(max_digits=15, decimal_places=5)
-    
+
+    def save(self, *args, **kwargs):
+        _sync_identity_fields(self, canonical_field='performed_by_user_id', legacy_field='user')
+        super().save(*args, **kwargs)
+
+class StockMovement(TenantStampedUUIDModel):
+    inventory_item = models.ForeignKey(
+        'inventory.InventoryItem',
+        on_delete=models.PROTECT,
+        related_name='stock_movements',
+    )
+    stock_lot = models.ForeignKey(
+        StockLot,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='stock_movements',
+    )
+    stock_serial = models.ForeignKey(
+        StockSerial,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='stock_movements',
+    )
     from_location = models.ForeignKey(
-        StockLocation, 
-        on_delete=models.SET_NULL, 
-        null=True, 
-        related_name='movements_from'
+        StockLocation,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='movements_from',
     )
     to_location = models.ForeignKey(
-        StockLocation, 
-        on_delete=models.SET_NULL, 
-        null=True, 
-        related_name='movements_to'
+        StockLocation,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='movements_to',
     )
-    
-    reference_order = models.CharField(max_length=100, blank=True)
-    user_id = models.CharField(max_length=255)  # From user microservice
-    timestamp = models.DateTimeField(auto_now_add=True)
-    notes = models.TextField(blank=True)
-    
+    movement_type = models.CharField(
+        max_length=20,
+        choices=StockMovementType.choices,
+        db_index=True,
+    )
+    quantity = models.DecimalField(max_digits=15, decimal_places=5)
+    unit_cost = models.DecimalField(
+        max_digits=15,
+        decimal_places=5,
+        blank=True,
+        null=True,
+    )
+    reference_type = models.CharField(max_length=64, blank=True, default='')
+    reference_id = models.CharField(max_length=100, blank=True, default='')
+    actor_user_id = models.BigIntegerField(blank=True, null=True, db_index=True)
+    occurred_at = models.DateTimeField(default=timezone.now, db_index=True)
+    notes = models.TextField(blank=True, default='')
+
     class Meta:
-        ordering = ['-timestamp']
+        ordering = ['-occurred_at', '-created_at']
         indexes = [
-            models.Index(fields=['stock_item', 'timestamp']),
-            models.Index(fields=['movement_type', 'timestamp']),
+            models.Index(fields=['profile_id', 'inventory_item', 'occurred_at']),
+            models.Index(fields=['profile_id', 'movement_type', 'occurred_at']),
+            models.Index(fields=['profile_id', 'reference_type', 'reference_id']),
         ]
+
 class AuditMixin(models.Model):
     """Mixin for comprehensive audit trails"""
     
@@ -547,9 +806,13 @@ class StockAdjustment(models.Model):
     quantity_change = models.IntegerField()
     reason = models.TextField(blank=True, null=True)
     adjusted_by = models.CharField(max_length=255, blank=True, null=True)
+    adjusted_by_user_id = models.BigIntegerField(blank=True, null=True, db_index=True)
     adjusted_at = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):
         return f"Adjustment of {self.quantity_change} for {self.stock_item}"
-registerable_models = [StockLocationType, StockLocation, StockItemTracking, StockItem,StockAdjustment]
 
+    def save(self, *args, **kwargs):
+        _sync_identity_fields(self, canonical_field='adjusted_by_user_id', legacy_field='adjusted_by')
+        super().save(*args, **kwargs)
+registerable_models = [StockLocationType, StockLocation, StockItemTracking, StockItem,StockAdjustment]

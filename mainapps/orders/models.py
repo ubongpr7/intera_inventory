@@ -13,7 +13,7 @@ from django.urls import reverse
 from django.utils.translation import gettext_lazy as _
 from django.contrib.contenttypes.fields import GenericForeignKey,GenericRelation
 
-from mainapps.content_type_linking_models.models import ProfileMixin, UUIDBaseModel
+from mainapps.content_type_linking_models.models import ProfileMixin, UUIDBaseModel, _sync_identity_fields
 from mptt.models import TreeForeignKey
 
 from django.utils import timezone
@@ -28,14 +28,28 @@ class PurchaseOrderLineItem(UUIDBaseModel):
         on_delete=models.CASCADE,
         related_name='line_items'
     )
+    inventory_item = models.ForeignKey(
+        'inventory.InventoryItem',
+        related_name='purchase_order_lines',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+    )
     stock_item = models.ForeignKey(
         'stock.StockItem',
         related_name='po_line_items',
         on_delete=models.CASCADE,
-        null=True
+        null=True,
+        blank=True,
     )
     quantity = models.PositiveIntegerField(
         validators=[MinValueValidator(1)]
+    )
+    quantity_received = models.DecimalField(
+        max_digits=15,
+        decimal_places=5,
+        default=0,
+        help_text="Cumulative quantity received against this line.",
     )
     unit_price = models.DecimalField(max_digits=15, decimal_places=2)
     discount_rate = models.DecimalField(
@@ -60,16 +74,29 @@ class PurchaseOrderLineItem(UUIDBaseModel):
                 return code
 
     def save(self, *args, **kwargs):
+        if not self.inventory_item_id and self.stock_item_id and self.stock_item.inventory_id:
+            from mainapps.inventory.models import InventoryItem
+
+            bridge_id = InventoryItem.legacy_bridge_id(self.stock_item.inventory_id)
+            if InventoryItem.objects.filter(id=bridge_id).exists():
+                self.inventory_item_id = bridge_id
         if not self.batch_number:
             self.batch_number = self.generate_batch_number()
         self.full_clean()
+        self.fully_received = Decimal(str(self.quantity_received)) >= Decimal(str(self.quantity))
         super().save(*args, **kwargs)
 
     def clean(self):
+        if not self.inventory_item_id and not self.stock_item_id:
+            raise ValidationError("Either inventory_item or stock_item must be provided.")
         if self.quantity <= 0:
             raise ValidationError("Quantity must be greater than zero.")
         if self.unit_price < 0:
             raise ValidationError("Unit price must be non-negative.")
+        if Decimal(str(self.quantity_received)) < 0:
+            raise ValidationError("Quantity received cannot be negative.")
+        if Decimal(str(self.quantity_received)) > Decimal(str(self.quantity)):
+            raise ValidationError("Quantity received cannot exceed ordered quantity.")
 
     @property
     def tax_amount(self):
@@ -87,7 +114,12 @@ class PurchaseOrderLineItem(UUIDBaseModel):
         )
 
     def __str__(self):
-        return f"{self.quantity} x {self.stock_item} @ {self.unit_price}"
+        line_item = self.inventory_item or self.stock_item
+        return f"{self.quantity} x {line_item} @ {self.unit_price}"
+
+    @property
+    def remaining_quantity(self):
+        return max(Decimal(str(self.quantity)) - Decimal(str(self.quantity_received)), Decimal("0"))
 
 
 class TotalPriceMixin(UUIDBaseModel):
@@ -184,6 +216,7 @@ class Order(ProfileMixin):
         verbose_name=_('Responsible'),
         help_text=_('User or group responsible for this order'),
     )
+    responsible_user_id = models.BigIntegerField(blank=True, null=True, db_index=True)
 
     contact = models.ForeignKey(
         Contact,
@@ -209,8 +242,10 @@ class Order(ProfileMixin):
     def generate_reference(self, prefix:str,instance:models.Model):
         """Atomically generate unique PO reference in PREFIX-YYYYMMDD-SEQ format"""
         with transaction.atomic():
-            profile = self.profile
-            order=instance.objects.filter(profile= self.profile).order_by('-created_at').first()
+            profile = self.profile_id if getattr(self, 'profile_id', None) is not None else self.profile
+            order = instance.objects.filter(
+                Q(profile_id=profile) | Q(profile=str(profile))
+            ).order_by('-created_at').first()
 
             sequence=0
             if order:
@@ -221,12 +256,16 @@ class Order(ProfileMixin):
             
             components = [
                 prefix.upper(),
-                profile,
+                str(profile),
                 date_str, 
                 f"{sequence:04d}"
             ]
             
             return '-'.join(components)
+
+    def save(self, *args, **kwargs):
+        _sync_identity_fields(self, canonical_field='responsible_user_id', legacy_field='responsible')
+        super().save(*args, **kwargs)
 
 
 class PurchaseOrderStatus(models.TextChoices):
@@ -294,6 +333,7 @@ class PurchaseOrder(TotalPriceMixin, Order):
         null=True,
         verbose_name=_('Received By'),
     )
+    received_by_user_id = models.BigIntegerField(blank=True, null=True, db_index=True)
 
     issue_date = models.DateTimeField(
         blank=True,
@@ -324,6 +364,7 @@ class PurchaseOrder(TotalPriceMixin, Order):
     
     approval_required = models.BooleanField(default=False)
     approved_by = models.CharField(max_length=255, blank=True)
+    approved_by_user_id = models.BigIntegerField(blank=True, null=True, db_index=True)
     approved_at = models.DateTimeField(null=True, blank=True)
     
     # Add budget tracking
@@ -338,9 +379,82 @@ class PurchaseOrder(TotalPriceMixin, Order):
     def total_price(self):
         return self.calculate_total()
     def save(self, *args, **kwargs):
+        _sync_identity_fields(self, canonical_field='received_by_user_id', legacy_field='received_by')
+        _sync_identity_fields(self, canonical_field='approved_by_user_id', legacy_field='approved_by')
         if not self.reference:
             self.reference = self.generate_reference("PO",PurchaseOrder)
         super().save(*args, **kwargs)
+
+
+class GoodsReceipt(ProfileMixin):
+    reference = models.CharField(max_length=64, unique=True, editable=False)
+    purchase_order = models.ForeignKey(
+        PurchaseOrder,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='goods_receipts',
+    )
+    supplier = models.ForeignKey(
+        Company,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='goods_receipts',
+        limit_choices_to={'is_supplier': True},
+    )
+    received_at = models.DateTimeField(default=timezone.now)
+    received_by_user_id = models.BigIntegerField(blank=True, null=True, db_index=True)
+    notes = models.TextField(blank=True)
+
+    class Meta:
+        ordering = ['-received_at', '-created_at']
+
+    def save(self, *args, **kwargs):
+        if not self.reference:
+            timestamp = timezone.now().strftime("%Y%m%d%H%M%S")
+            profile_value = self.profile_id if getattr(self, 'profile_id', None) is not None else self.profile
+            self.reference = f"GR-{profile_value}-{timestamp}"
+        super().save(*args, **kwargs)
+
+
+class GoodsReceiptLine(UUIDBaseModel):
+    goods_receipt = models.ForeignKey(
+        GoodsReceipt,
+        on_delete=models.CASCADE,
+        related_name='lines',
+    )
+    purchase_order_line = models.ForeignKey(
+        PurchaseOrderLineItem,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='goods_receipt_lines',
+    )
+    inventory_item = models.ForeignKey(
+        'inventory.InventoryItem',
+        on_delete=models.PROTECT,
+        related_name='goods_receipt_lines',
+    )
+    stock_location = models.ForeignKey(
+        'stock.StockLocation',
+        on_delete=models.PROTECT,
+        related_name='goods_receipt_lines',
+    )
+    received_quantity = models.DecimalField(max_digits=15, decimal_places=5)
+    unit_cost = models.DecimalField(max_digits=15, decimal_places=5)
+    lot_number = models.CharField(max_length=100, blank=True)
+    manufactured_date = models.DateField(null=True, blank=True)
+    expiry_date = models.DateField(null=True, blank=True)
+
+    class Meta:
+        ordering = ['created_at']
+
+    def clean(self):
+        if self.received_quantity <= 0:
+            raise ValidationError("Received quantity must be greater than zero.")
+        if self.unit_cost < 0:
+            raise ValidationError("Unit cost must be non-negative.")
 
 
 class SalesOrder(TotalPriceMixin, Order):
@@ -366,6 +480,11 @@ class SalesOrder(TotalPriceMixin, Order):
         verbose_name=_('Shipped By'),
         help_text=_('User or group responsible for shipping this order'),
     )
+    shipped_by_user_id = models.BigIntegerField(blank=True, null=True, db_index=True)
+
+    def save(self, *args, **kwargs):
+        _sync_identity_fields(self, canonical_field='shipped_by_user_id', legacy_field='shipped_by')
+        super().save(*args, **kwargs)
 
 
 
@@ -420,6 +539,7 @@ class SalesOrderShipment(InventoryMixin):
         null=True,
         verbose_name=_('Checked By'),
     )
+    checked_by_user_id = models.BigIntegerField(blank=True, null=True, db_index=True)
 
     reference = models.CharField(
         max_length=100,
@@ -448,6 +568,10 @@ class SalesOrderShipment(InventoryMixin):
     link = models.URLField(
         blank=True, verbose_name=_('Link'), help_text=_('Link to external page')
     )
+
+    def save(self, *args, **kwargs):
+        _sync_identity_fields(self, canonical_field='checked_by_user_id', legacy_field='checked_by')
+        super().save(*args, **kwargs)
 
 
 class ReturnOrderStatus(models.TextChoices):
@@ -556,4 +680,3 @@ registerable_models=[
     PurchaseOrderLineItem,
 
     ]
-

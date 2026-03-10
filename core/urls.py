@@ -38,10 +38,10 @@ urlpatterns = [
 
     # db sync
 
-    path('inventory_api/', include("mainapps.inventory.api.urls",)),
-    path('company_api/', include("mainapps.company.api.urls",)),
-    path('order_api/', include("mainapps.orders.api.urls",)),
-    path('stock_api/', include("mainapps.stock.api.urls",)),
+    path('inventory_api/', include("mainapps.inventory.urls",)),
+    path('company_api/', include("mainapps.company.urls",)),
+    path('order_api/', include("mainapps.orders.urls",)),
+    path('stock_api/', include("mainapps.stock.urls",)),
 
     # path("mcp_server/", include('mcp_server.urls')),
 

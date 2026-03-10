@@ -1,6 +1,9 @@
 
 import os
+from datetime import timedelta
 from pathlib import Path
+
+from django.core.exceptions import ImproperlyConfigured
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -45,13 +48,14 @@ THIRD_PARTY_APPS=[
     'djoser',
     'social_django',
     'schema_graph',
-    # 'mcp_server',
 ]
 CORE_APPS = [
     'mainapps.company',
     'mainapps.content_type_linking_models',
+    'mainapps.identity',
     'mainapps.inventory',
     'mainapps.orders',
+    'mainapps.projections',
     'mainapps.stock',
 ]
 INSTALLED_APPS=[
@@ -196,8 +200,36 @@ AUTHENTICATION_BACKENDS = [
 
     'django.contrib.auth.backends.ModelBackend',
 ]
-import os
-from datetime import timedelta
+
+
+def _read_key_from_env(value_var: str, path_var: str) -> str | None:
+    key_value = os.getenv(value_var)
+    if key_value:
+        return key_value.replace("\\n", "\n")
+
+    key_path = os.getenv(path_var)
+    if not key_path:
+        return None
+
+    try:
+        with open(key_path, "r", encoding="utf-8") as key_file:
+            return key_file.read()
+    except OSError as exc:
+        raise ImproperlyConfigured(f"Unable to read JWT key file '{key_path}': {exc}") from exc
+
+
+JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "RS256")
+JWT_VERIFYING_KEY = _read_key_from_env("JWT_PUBLIC_KEY", "JWT_PUBLIC_KEY_PATH")
+
+if not JWT_ALGORITHM.upper().startswith(("RS", "ES")):
+    raise ImproperlyConfigured(
+        "Downstream services must use an asymmetric JWT algorithm (RS*/ES*) to verify identity-service tokens."
+    )
+
+if not JWT_VERIFYING_KEY:
+    raise ImproperlyConfigured(
+        "JWT_PUBLIC_KEY or JWT_PUBLIC_KEY_PATH must be set for downstream JWT verification."
+    )
 
 # DJOSER CONFIGURATION
 DJOSER = {
@@ -217,18 +249,18 @@ DJOSER = {
 
 
 SIMPLE_JWT = {
-    'ACCESS_TOKEN_LIFETIME': timedelta(days=3),
-    'REFRESH_TOKEN_LIFETIME': timedelta(days=90),
+    'ACCESS_TOKEN_LIFETIME': timedelta(days=2),
+    'REFRESH_TOKEN_LIFETIME': timedelta(days=6),
     'ROTATE_REFRESH_TOKENS': True,
     'BLACKLIST_AFTER_ROTATION': True,
     'UPDATE_LAST_LOGIN': False,
-    'ALGORITHM': 'HS256',
-    'VERIFYING_KEY': None,
-    'AUDIENCE': None,
-    'ISSUER': None,
-    'JWK_URL': None,
+    'ALGORITHM': JWT_ALGORITHM,
+    'SIGNING_KEY': None,
+    'VERIFYING_KEY': JWT_VERIFYING_KEY,
+    'AUDIENCE': os.getenv("JWT_AUDIENCE"),
+    'ISSUER': os.getenv("JWT_ISSUER"),
+    'JWK_URL': os.getenv("JWT_JWK_URL"),
     'LEEWAY': 0,
-    "TOKEN_OBTAIN_SERIALIZER": "mainapps.accounts.api.serializers.MyTokenObtainPairSerializer",
 
     'AUTH_HEADER_TYPES': ('Bearer',),
     'AUTH_HEADER_NAME': 'HTTP_AUTHORIZATION',
@@ -255,7 +287,6 @@ AUTH_COOKIE_PATH='/'
 AUTH_COOKIE_SAMESITE='None'
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': (
-        # 'mainapps.accounts.authentication.AccountJWTAuthentication',
         'rest_framework_simplejwt.authentication.JWTStatelessUserAuthentication',
     )
 }
@@ -282,8 +313,6 @@ CORS_ALLOW_HEADERS = [
     'user-agent',
     'x-csrftoken',
     'x-requested-with',
-    'X-profile-id',  
-    'X-user-id'
 ]
 
 CORS_ALLOWED_ORIGINS = [
@@ -328,9 +357,3 @@ CELERY_BROKER_URL = os.getenv('CELERY_BROKER_URL', 'redis://redis:6379/0')
 CELERY_RESULT_BACKEND = os.getenv('CELERY_RESULT_BACKEND', 'redis://redis:6379/0')
 USE_L10N = True
 USE_THOUSAND_SEPARATOR = True
-
-# SERVICES
-USER_SERVICE_URL=os.getenv('USER_SERVICE_URL')
-COMMON_SERVICE_URL=os.getenv('COMMON_SERVICE_URL')
-PRODUCT_SERVICE_URL=os.getenv('PRODUCT_SERVICE_URL')
-

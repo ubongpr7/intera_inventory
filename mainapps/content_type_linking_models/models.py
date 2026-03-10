@@ -6,6 +6,33 @@ from mptt.models import MPTTModel, TreeForeignKey
 from django.utils.translation import gettext_lazy as _
 
 import uuid
+
+
+def _coerce_identity_id(value):
+    if value in (None, ""):
+        return None
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _sync_identity_fields(instance, *, canonical_field, legacy_field):
+    if not hasattr(instance, canonical_field) or not hasattr(instance, legacy_field):
+        return
+
+    canonical_value = _coerce_identity_id(getattr(instance, canonical_field, None))
+    legacy_value = getattr(instance, legacy_field, None)
+
+    if canonical_value is None:
+        canonical_value = _coerce_identity_id(legacy_value)
+        if canonical_value is not None:
+            setattr(instance, canonical_field, canonical_value)
+
+    if canonical_value is not None and legacy_value in (None, ""):
+        setattr(instance, legacy_field, str(canonical_value))
+
+
 class UUIDBaseModel(models.Model):
     id = models.UUIDField(
         primary_key=True,
@@ -21,6 +48,15 @@ class UUIDBaseModel(models.Model):
         verbose_name=_('Created By'),
         help_text=_('User who created this model instance.')
     )
+    created_by_user_id = models.BigIntegerField(blank=True, null=True, db_index=True)
+    modified_by = models.CharField(
+        max_length=400,
+        null=True,
+        blank=True,
+        verbose_name=_('Modified By'),
+        help_text=_('User who last modified this model instance.')
+    )
+    updated_by_user_id = models.BigIntegerField(blank=True, null=True, db_index=True)
     created_at = models.DateTimeField(
         auto_now_add=True,
         verbose_name=_('Created At'),
@@ -35,6 +71,11 @@ class UUIDBaseModel(models.Model):
     class Meta:
         abstract=True
 
+    def save(self, *args, **kwargs):
+        _sync_identity_fields(self, canonical_field='created_by_user_id', legacy_field='created_by')
+        _sync_identity_fields(self, canonical_field='updated_by_user_id', legacy_field='modified_by')
+        super().save(*args, **kwargs)
+
 
 class ProfileMixin(UUIDBaseModel):
 
@@ -46,6 +87,7 @@ class ProfileMixin(UUIDBaseModel):
         help_text=_('Profile of the user or entity associated with this model.'),
         editable=False
     )
+    profile_id = models.BigIntegerField(blank=True, null=True, db_index=True, editable=False)
     created_by = models.CharField(
         max_length=255,
         blank=True,
@@ -55,6 +97,62 @@ class ProfileMixin(UUIDBaseModel):
         editable=False
     )
 
+
+    class Meta:
+        abstract = True
+
+    def save(self, *args, **kwargs):
+        _sync_identity_fields(self, canonical_field='profile_id', legacy_field='profile')
+        super().save(*args, **kwargs)
+
+
+class TenantStampedUUIDModel(models.Model):
+    id = models.UUIDField(
+        primary_key=True,
+        default=uuid.uuid4,
+        editable=False,
+        verbose_name=_("ID"),
+        help_text=_("Unique identifier for the model instance."),
+    )
+    profile_id = models.BigIntegerField(
+        db_index=True,
+        verbose_name=_("Profile ID"),
+        help_text=_("Identity service CompanyProfile ID."),
+    )
+    created_by_user_id = models.BigIntegerField(
+        blank=True,
+        null=True,
+        db_index=True,
+        verbose_name=_("Created By User ID"),
+    )
+    updated_by_user_id = models.BigIntegerField(
+        blank=True,
+        null=True,
+        db_index=True,
+        verbose_name=_("Updated By User ID"),
+    )
+    created_by_name = models.CharField(
+        max_length=255,
+        blank=True,
+        default="",
+        verbose_name=_("Created By Name"),
+    )
+    updated_by_name = models.CharField(
+        max_length=255,
+        blank=True,
+        default="",
+        verbose_name=_("Updated By Name"),
+    )
+    created_at = models.DateTimeField(
+        auto_now_add=True,
+        verbose_name=_("Created At"),
+        help_text=_("Timestamp when this model instance was created."),
+    )
+    updated_at = models.DateTimeField(
+        auto_now=True,
+        verbose_name=_("Updated At"),
+        help_text=_("Timestamp when this model instance was last updated."),
+    )
 
     class Meta:
         abstract = True
@@ -134,5 +232,3 @@ class ContentTypeLink(models.Model):
     class Meta:
         verbose_name = "Content Type Link"
         verbose_name_plural = "Content Type Links"
-
-

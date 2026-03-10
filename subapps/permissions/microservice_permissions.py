@@ -8,42 +8,38 @@ from functools import wraps
 
 logger = logging.getLogger(__name__)
 
-from rest_framework_simplejwt.tokens import UntypedToken
+from subapps.utils.request_context import (
+    get_identity_cache_key,
+    get_request_owner_id,
+    get_request_permissions,
+    get_request_user_id,
+)
 
 class HasModelRequestPermission(permissions.BasePermission):
     """
-    Microservice-adapted permission class that checks permissions via user service
+    Permission class that checks permissions from JWT claims.
     """
-    def get_user_permissions(self, token_str):
-        try:
-            token= UntypedToken(token_str)
-            return set(token.payload.get('permissions')),token.payload.get('owner_id')
-        except Exception as e:
-            return {},False 
+
     def has_permission(self, request, view):
         permission = getattr(view, 'required_permission', None)
 
         if not permission:
             return True
-       
-        
-        
-        """Check if user has required permissions"""
-        auth_header=request.headers.get('Authorization')
-        if auth_header:
-            token_str=auth_header.split(' ')[1]
-            user_permissions,owner_id=self.get_user_permissions(token_str)
-                 
-            if owner_id == request.user.id:
-                return True
-            
-            if permission:
-            
-                if isinstance(permission, dict):
-                    action = view.action
-                    permission= permission.get(action)
-                return permission in user_permissions
-        return False
+
+        user_permissions = get_request_permissions(request)
+        owner_id = get_request_owner_id(request, as_str=False)
+        current_user_id = get_request_user_id(request, as_str=False)
+
+        if owner_id is not None and current_user_id is not None and str(owner_id) == str(current_user_id):
+            return True
+
+        if isinstance(permission, dict):
+            permission = permission.get(view.action)
+
+        if not permission:
+            return False
+
+        return permission in user_permissions
         
 class PermissionRequiredMixin:
     """
@@ -62,7 +58,6 @@ class CachingMixin:
     CACHE_TTL = 300
     CACHE_VERSION_KEY = "{model_name}_cache_version"
     CACHE_KEY_PREFIX = "{model_name}_cache"
-    INCLUDE_HEADERS_IN_KEY = ['X-Profile-ID']
     INCLUDE_QUERY_PARAMS = True
 
     def __init__(self, *args, **kwargs):
@@ -85,13 +80,6 @@ class CachingMixin:
         path = request.path
         version = cache.get(self.CACHE_VERSION_KEY, 1)
         
-        # Get relevant headers
-        headers = {
-            h: request.headers.get(h) 
-            for h in self.INCLUDE_HEADERS_IN_KEY 
-            if request.headers.get(h)
-        }
-        
         # Get query params if enabled
         params = {}
         if self.INCLUDE_QUERY_PARAMS and hasattr(request, 'query_params'):
@@ -104,7 +92,7 @@ class CachingMixin:
         components = {
             'path': path,
             'version': version,
-            'headers': '_'.join(f"{k}={v}" for k, v in sorted(headers.items())),
+            'identity': get_identity_cache_key(request),
             'params': '_'.join(f"{k}={v}" for k, v in sorted(params.items())),
             'view_specific': view_specific
         }

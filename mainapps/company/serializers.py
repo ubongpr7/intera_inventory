@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from ..models import Company, CompanyAddress, Contact
+from .models import Company, CompanyAddress, Contact
 
 
 class CompanyAddressSerializer(serializers.ModelSerializer):
