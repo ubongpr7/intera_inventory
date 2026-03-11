@@ -17,6 +17,34 @@ services:
     ports:
       - "7002:7002"
     restart: unless-stopped
+  consumer:
+    build:
+      context: .
+    container_name: intera-inventory-consumer
+    env_file:
+      - .env
+    command: >
+      sh -c "
+        uv run manage.py consume_kafka
+      "
+    volumes:
+      - .:/app
+      - venv:/app/.venv
+    restart: unless-stopped
+  outbox_publisher:
+    build:
+      context: .
+    container_name: intera-inventory-outbox
+    env_file:
+      - .env
+    command: >
+      sh -c "
+        uv run manage.py publish_outbox_events
+      "
+    volumes:
+      - .:/app
+      - venv:/app/.venv
+    restart: unless-stopped
 
 volumes:
   venv:

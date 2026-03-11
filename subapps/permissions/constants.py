@@ -144,12 +144,42 @@ PURCHASE_ORDER_PERMISSIONS = {
     
 }
 
+RETURN_ORDER_PERMISSIONS = {
+    'list': CombinedPermissions.READ_RETURN_ORDER,
+    'retrieve': CombinedPermissions.READ_RETURN_ORDER,
+    'create': CombinedPermissions.UPDATE_RETURN_ORDER,
+    'dispatch': CombinedPermissions.PROCESS_RETURN_ORDER,
+    'complete': CombinedPermissions.PROCESS_RETURN_ORDER,
+    'cancel': CombinedPermissions.UPDATE_RETURN_ORDER,
+}
+
+SALES_ORDER_PERMISSIONS = {
+    'list': CombinedPermissions.READ_SALES_ORDER,
+    'retrieve': CombinedPermissions.READ_SALES_ORDER,
+    'create': CombinedPermissions.CREATE_SALES_ORDER,
+    'update': CombinedPermissions.UPDATE_SALES_ORDER,
+    'partial_update': CombinedPermissions.UPDATE_SALES_ORDER,
+    'destroy': CombinedPermissions.DELETE_SALES_ORDER,
+    'line_items': CombinedPermissions.READ_SALES_ORDER,
+    'shipments': CombinedPermissions.READ_SALES_ORDER,
+    'add_line_item': CombinedPermissions.UPDATE_SALES_ORDER,
+    'update_line_item': CombinedPermissions.UPDATE_SALES_ORDER,
+    'remove_line_item': CombinedPermissions.UPDATE_SALES_ORDER,
+    'reserve': CombinedPermissions.FULFILL_SALES_ORDER,
+    'release': CombinedPermissions.FULFILL_SALES_ORDER,
+    'ship': CombinedPermissions.FULFILL_SALES_ORDER,
+    'complete': CombinedPermissions.FULFILL_SALES_ORDER,
+    'cancel': CombinedPermissions.UPDATE_SALES_ORDER,
+}
+
 UNIFIED_PERMISSION_DICT= {
     'inventory':INVENTORY_PERMISSIONS,
     'inventory_category':INVENTORY_CATEGORY_PERMISSIONS,
     'stock_item':STOCK_ITEM_PERMISSIONS,
     'stock_location':STOCK_LOCATION_PERMISSIONS,
     'stock_reservation':STOCK_RESERVATION_PERMISSIONS,
-    'purchase_order':PURCHASE_ORDER_PERMISSIONS
+    'purchase_order':PURCHASE_ORDER_PERMISSIONS,
+    'return_order':RETURN_ORDER_PERMISSIONS,
+    'sales_order':SALES_ORDER_PERMISSIONS,
 
 }

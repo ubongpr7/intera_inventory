@@ -457,10 +457,41 @@ class GoodsReceiptLine(UUIDBaseModel):
             raise ValidationError("Unit cost must be non-negative.")
 
 
+class SalesOrderStatus(models.TextChoices):
+    PENDING = 'pending', _('Pending')
+    IN_PROGRESS = 'in_progress', _('In Progress')
+    SHIPPED = 'shipped', _('Shipped')
+    COMPLETED = 'completed', _('Completed')
+    CANCELLED = 'cancelled', _('Cancelled')
+
+
 class SalesOrder(TotalPriceMixin, Order):
     """A SalesOrder represents a list of goods shipped outwards to a customer."""
 
-    
+    reference = models.CharField(
+        unique=True,
+        max_length=64,
+        verbose_name=_('Reference'),
+        help_text=_('Sales order reference'),
+        editable=False,
+    )
+    status = models.CharField(
+        default=SalesOrderStatus.PENDING,
+        choices=SalesOrderStatus.choices,
+        help_text=_('Sales order status'),
+        max_length=20,
+        verbose_name=_('Status'),
+    )
+    customer = models.ForeignKey(
+        Company,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        limit_choices_to={'is_customer': True},
+        related_name='sales_orders',
+        verbose_name=_('Customer'),
+        help_text=_('Company receiving the goods'),
+    )
     customer_reference = models.CharField(
         max_length=64,
         blank=True,
@@ -468,11 +499,15 @@ class SalesOrder(TotalPriceMixin, Order):
         verbose_name=_('Customer Reference '),
         help_text=_('Customer order reference code'),
     )
-
+    issue_date = models.DateTimeField(
+        blank=True,
+        null=True,
+        verbose_name=_('Issue Date'),
+        help_text=_('Date sales order was issued'),
+    )
     shipment_date = models.DateTimeField(
         blank=True, null=True, verbose_name=_('Shipment Date')
     )
-
     shipped_by = models.CharField(
         max_length=400,
         blank=True,
@@ -482,9 +517,100 @@ class SalesOrder(TotalPriceMixin, Order):
     )
     shipped_by_user_id = models.BigIntegerField(blank=True, null=True, db_index=True)
 
+    def calculate_total(self):
+        return sum(Decimal(str(item.total_price)) for item in self.line_items.all())
+
+    @property
+    def total_price(self):
+        return self.calculate_total()
+
     def save(self, *args, **kwargs):
         _sync_identity_fields(self, canonical_field='shipped_by_user_id', legacy_field='shipped_by')
+        if not self.reference:
+            self.reference = self.generate_reference("SO", SalesOrder)
         super().save(*args, **kwargs)
+
+
+class SalesOrderLineItem(UUIDBaseModel):
+    sales_order = models.ForeignKey(
+        SalesOrder,
+        on_delete=models.CASCADE,
+        related_name='line_items',
+    )
+    inventory = models.ForeignKey(
+        'inventory.Inventory',
+        on_delete=models.PROTECT,
+        related_name='sales_order_lines',
+    )
+    inventory_item = models.ForeignKey(
+        'inventory.InventoryItem',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='sales_order_lines',
+    )
+    quantity = models.DecimalField(max_digits=15, decimal_places=5, validators=[MinValueValidator(1)])
+    reserved_quantity = models.DecimalField(max_digits=15, decimal_places=5, default=0)
+    shipped_quantity = models.DecimalField(max_digits=15, decimal_places=5, default=0)
+    unit_price = models.DecimalField(max_digits=15, decimal_places=2)
+    discount_rate = models.DecimalField(max_digits=5, decimal_places=2, default=0)
+    tax_rate = models.DecimalField(max_digits=5, decimal_places=2, default=0)
+    description = models.TextField(null=True, blank=True)
+
+    def save(self, *args, **kwargs):
+        if not self.inventory_item_id and self.inventory_id:
+            from mainapps.inventory.models import InventoryItem
+
+            bridge_id = InventoryItem.legacy_bridge_id(self.inventory_id)
+            if InventoryItem.objects.filter(id=bridge_id).exists():
+                self.inventory_item_id = bridge_id
+        self.full_clean()
+        super().save(*args, **kwargs)
+
+    def clean(self):
+        if self.quantity <= 0:
+            raise ValidationError("Quantity must be greater than zero.")
+        if Decimal(str(self.reserved_quantity)) < 0:
+            raise ValidationError("Reserved quantity cannot be negative.")
+        if Decimal(str(self.shipped_quantity)) < 0:
+            raise ValidationError("Shipped quantity cannot be negative.")
+        if Decimal(str(self.reserved_quantity)) > Decimal(str(self.quantity)):
+            raise ValidationError("Reserved quantity cannot exceed ordered quantity.")
+        if Decimal(str(self.shipped_quantity)) > Decimal(str(self.quantity)):
+            raise ValidationError("Shipped quantity cannot exceed ordered quantity.")
+        if Decimal(str(self.reserved_quantity)) + Decimal(str(self.shipped_quantity)) > Decimal(str(self.quantity)):
+            raise ValidationError("Reserved and shipped quantities combined cannot exceed ordered quantity.")
+
+    @property
+    def tax_amount(self):
+        return (self.unit_price * self.quantity) * (self.tax_rate / Decimal("100"))
+
+    @property
+    def discount(self):
+        return (self.unit_price * self.quantity) * (self.discount_rate / Decimal("100"))
+
+    @property
+    def total_price(self):
+        subtotal = self.quantity * self.unit_price
+        return (subtotal + self.tax_amount - self.discount).quantize(
+            Decimal('0.00'), rounding=ROUND_HALF_UP
+        )
+
+    @property
+    def remaining_quantity(self):
+        return max(Decimal(str(self.quantity)) - Decimal(str(self.shipped_quantity)), Decimal("0"))
+
+    @property
+    def reservable_quantity(self):
+        return max(
+            Decimal(str(self.quantity))
+            - Decimal(str(self.shipped_quantity))
+            - Decimal(str(self.reserved_quantity)),
+            Decimal("0"),
+        )
+
+    def __str__(self):
+        return f"{self.quantity} x {self.inventory.name} @ {self.unit_price}"
 
 
 
@@ -514,7 +640,7 @@ class SalesOrderShipment(InventoryMixin):
         on_delete=models.CASCADE,
         blank=False,
         null=False,
-        related_name='+',
+        related_name='shipments',
         verbose_name=_('Order'),
         help_text=_('Sales Order'),
     )
@@ -543,10 +669,10 @@ class SalesOrderShipment(InventoryMixin):
 
     reference = models.CharField(
         max_length=100,
-        blank=False,
+        blank=True,
         verbose_name=_('Shipment'),
         help_text=_('Shipment number'),
-        default='1',
+        default='',
     )
 
     tracking_number = models.CharField(
@@ -569,9 +695,78 @@ class SalesOrderShipment(InventoryMixin):
         blank=True, verbose_name=_('Link'), help_text=_('Link to external page')
     )
 
+    notes = models.TextField(
+        blank=True,
+        null=True,
+        verbose_name=_('Notes'),
+        help_text=_('Shipment notes'),
+    )
+
     def save(self, *args, **kwargs):
         _sync_identity_fields(self, canonical_field='checked_by_user_id', legacy_field='checked_by')
+        if self.order_id and not self.reference:
+            shipment_count = (
+                SalesOrderShipment.objects.filter(order=self.order)
+                .exclude(pk=self.pk)
+                .count()
+                + 1
+            )
+            self.reference = f"SHIP-{self.order.reference}-{shipment_count:03d}"
         super().save(*args, **kwargs)
+
+    def __str__(self):
+        return self.reference or f"Shipment for {self.order.reference}"
+
+
+class SalesOrderShipmentLine(UUIDBaseModel):
+    shipment = models.ForeignKey(
+        SalesOrderShipment,
+        on_delete=models.CASCADE,
+        related_name='lines',
+    )
+    sales_order_line = models.ForeignKey(
+        SalesOrderLineItem,
+        on_delete=models.PROTECT,
+        related_name='shipment_lines',
+    )
+    stock_location = models.ForeignKey(
+        'stock.StockLocation',
+        on_delete=models.PROTECT,
+        related_name='sales_order_shipment_lines',
+    )
+    stock_lot = models.ForeignKey(
+        'stock.StockLot',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='sales_order_shipment_lines',
+    )
+    stock_serial = models.ForeignKey(
+        'stock.StockSerial',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='sales_order_shipment_lines',
+    )
+    reservation = models.ForeignKey(
+        'stock.StockReservation',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='shipment_lines',
+    )
+    quantity_shipped = models.DecimalField(max_digits=15, decimal_places=5, validators=[MinValueValidator(1)])
+    notes = models.TextField(blank=True)
+
+    class Meta:
+        ordering = ['created_at']
+
+    def clean(self):
+        if Decimal(str(self.quantity_shipped)) <= 0:
+            raise ValidationError("Shipped quantity must be greater than zero.")
+
+    def __str__(self):
+        return f"{self.quantity_shipped} shipped on {self.shipment.reference}"
 
 
 class ReturnOrderStatus(models.TextChoices):
@@ -599,6 +794,13 @@ class ReturnOrder(TotalPriceMixin, Order):
         help_text=_('Return Order reference'),
         # default=order.validators.generate_next_return_order_reference,
         # validators=[order.validators.validate_return_order_reference],
+    )
+    purchase_order = models.ForeignKey(
+        PurchaseOrder,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='return_orders',
     )
 
     customer = models.ForeignKey(
@@ -639,10 +841,10 @@ class ReturnOrder(TotalPriceMixin, Order):
         help_text=_('Detailed reason for the return')
     )
     
-    def save(self, ):
+    def save(self, *args, **kwargs):
         if not self.reference:
             self.reference = self.generate_reference("RO",ReturnOrder)
-        return super().save()
+        return super().save(*args, **kwargs)
     
    
 class ReturnOrderLineItem(UUIDBaseModel):
@@ -657,6 +859,7 @@ class ReturnOrderLineItem(UUIDBaseModel):
         related_name='returns'
     )
     quantity_returned = models.PositiveIntegerField()
+    quantity_processed = models.DecimalField(max_digits=15, decimal_places=5, default=0)
     return_reason = models.TextField(blank=True)
     
     unit_price = models.DecimalField(max_digits=10, decimal_places=2)
@@ -668,14 +871,30 @@ class ReturnOrderLineItem(UUIDBaseModel):
         return (self.unit_price * self.quantity_returned) - self.discount
         
     def clean(self):
-        if self.quantity_returned > self.original_line_item.quantity:
-            raise ValidationError("Return quantity exceeds original order quantity")
+        already_returned = (
+            self.original_line_item.returns.exclude(pk=self.pk).aggregate(
+                total=models.Sum('quantity_returned')
+            )['total'] or 0
+        )
+        max_returnable = Decimal(str(self.original_line_item.quantity_received)) - Decimal(str(already_returned))
+        if Decimal(str(self.quantity_returned)) > max_returnable:
+            raise ValidationError("Return quantity exceeds received quantity available for return")
+        if Decimal(str(self.quantity_processed)) < 0:
+            raise ValidationError("Processed quantity cannot be negative")
+        if Decimal(str(self.quantity_processed)) > Decimal(str(self.quantity_returned)):
+            raise ValidationError("Processed quantity cannot exceed quantity returned")
+
+    @property
+    def remaining_quantity(self):
+        return max(Decimal(str(self.quantity_returned)) - Decimal(str(self.quantity_processed)), Decimal("0"))
 
 registerable_models=[
     ReturnOrder,
     PurchaseOrder,
     SalesOrderShipment,
     SalesOrder,
+    SalesOrderLineItem,
+    SalesOrderShipmentLine,
     ReturnOrderLineItem,
     PurchaseOrderLineItem,
 

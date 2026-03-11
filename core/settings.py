@@ -54,6 +54,7 @@ CORE_APPS = [
     'mainapps.content_type_linking_models',
     'mainapps.identity',
     'mainapps.inventory',
+    'mainapps.kafka_reliability',
     'mainapps.orders',
     'mainapps.projections',
     'mainapps.stock',
@@ -291,10 +292,11 @@ REST_FRAMEWORK = {
     )
 }
 
-CORS_ALLOW_ALL_ORIGINS=True
-CORS_ORIGIN_ALLOW_ALL=True
+CORS_ALLOW_ALL_ORIGINS=os.getenv('CORS_ALLOW_ALL_ORIGINS', 'False')=='True'
+CORS_ORIGIN_ALLOW_ALL=CORS_ALLOW_ALL_ORIGINS
 
-CORS_ALLOW_CREDENTIALS=True
+CORS_ALLOW_CREDENTIALS=os.getenv('CORS_ALLOW_CREDENTIALS', 'True')=='True'
+
 CORS_ALLOW_METHODS = (
     "DELETE",
     "GET",
@@ -331,11 +333,16 @@ CORS_ALLOWED_ORIGINS = [
     'https://www.interaims.com',
     ]
 
-SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
-SESSION_COOKIE_SECURE = True
-SECURE_SSL_REDIRECT = True
+SECURE_SSL_REDIRECT = os.getenv('SECURE_SSL_REDIRECT', 'False')=='True'
 
-CSRF_COOKIE_SECURE = True
+SECURE_PROXY_SSL_HEADER = (
+    ('HTTP_X_FORWARDED_PROTO', 'https')
+    if os.getenv('SECURE_PROXY_SSL_HEADER_ENABLED', 'False') == 'True'
+    else None
+)
+SESSION_COOKIE_SECURE = os.getenv('SESSION_COOKIE_SECURE', 'True')=='True'
+
+CSRF_COOKIE_SECURE = os.getenv('CSRF_COOKIE_SECURE', 'True')=='True'
 FILE_UPLOAD_TIMEOUT = 3600
 DATA_UPLOAD_MAX_MEMORY_SIZE = 2147483648  # 2GB
 FILE_UPLOAD_MAX_MEMORY_SIZE = 2147483648  # 2GB

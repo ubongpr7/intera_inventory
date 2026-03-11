@@ -2,6 +2,8 @@
 
 Backlog tracker: [redesign-backlog.md](/Users/ubongpr7/dev/pr7/inventory/intera_inventory/docs/redesign-backlog.md)
 
+Kafka environment matrix: [kafka-environment-matrix.md](/Users/ubongpr7/dev/pr7/inventory/intera_inventory/docs/kafka-environment-matrix.md)
+
 ## Scope
 
 This redesign covers:
@@ -702,40 +704,36 @@ This line stores snapshots for audit and receipt rendering.
 
 ### Identity topics
 
-- `identity.user.created`
-- `identity.user.updated`
-- `identity.user.deactivated`
-- `identity.company_profile.created`
-- `identity.company_profile.updated`
+- `identity.user.upserted`
+- `identity.user.deleted`
+- `identity.company_profile.upserted`
+- `identity.company_profile.deleted`
 - `identity.membership.upserted`
-- `identity.membership.deactivated`
+- `identity.membership.deleted`
 
 ### Product topics
 
-- `catalog.product.created`
-- `catalog.product.updated`
-- `catalog.variant.created`
-- `catalog.variant.updated`
-- `catalog.variant.deactivated`
-- `catalog.price.changed`
+- `catalog.product.upserted`
+- `catalog.product.deleted`
+- `catalog.variant.upserted`
+- `catalog.variant.deleted`
 
 ### Inventory topics
 
-- `inventory.item.created`
-- `inventory.item.updated`
-- `inventory.stock.received`
-- `inventory.stock.adjusted`
-- `inventory.stock.moved`
-- `inventory.stock.reserved`
-- `inventory.stock.released`
-- `inventory.stock.fulfilled`
+- `inventory.availability.upserted`
+- `inventory.reservation.upserted`
+- `inventory.reservation.released`
+- `inventory.fulfillment.completed`
 
 ### POS topics
 
-- `pos.order.completed`
+- `pos.order.created`
 - `pos.order.cancelled`
-- `pos.payment.captured`
-- `pos.refund.completed`
+- `pos.order.paid`
+- `pos.inventory.reservation.requested`
+- `pos.inventory.reservation.released`
+- `pos.inventory.reservation.confirmed`
+- `pos.inventory.fulfillment.confirmed`
 
 ## Invariants
 

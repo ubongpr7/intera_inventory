@@ -5,14 +5,41 @@ from rest_framework.permissions import IsAuthenticated
 from django_filters.rest_framework import DjangoFilterBackend
 from django.db.models import Q, Sum, Count, Avg, F, Case, When, Value, IntegerField, DecimalField
 from django.db import transaction
+from django.http import HttpResponse
 from django.utils import timezone
 from datetime import timedelta, datetime
 from decimal import Decimal
 import logging
 
-from mainapps.inventory.models import InventoryTransaction, TransactionType
-from mainapps.orders.serializers import PurchaseOrderDetailSerializer,PurchaseOrderAnalyticsSerializer, PurchaseOrderLineItemSerializer,PurchaseOrderLineItemCreateSerializer, PurchaseOrderListSerializer,ReceiveItemsSerializer
-from mainapps.stock.models import StockItem, StockLocation
+from mainapps.orders.serializers import (
+    PurchaseOrderDetailSerializer,
+    PurchaseOrderAnalyticsSerializer,
+    PurchaseOrderLineItemSerializer,
+    PurchaseOrderLineItemCreateSerializer,
+    PurchaseOrderListSerializer,
+    ReceiveItemsSerializer,
+    ReturnOrderDetailSerializer,
+    ReturnOrderListSerializer,
+    ReturnOrderProcessSerializer,
+    SalesOrderDetailSerializer,
+    SalesOrderLineItemCreateSerializer,
+    SalesOrderLineItemSerializer,
+    SalesOrderListSerializer,
+    SalesOrderReleaseSerializer,
+    SalesOrderReserveSerializer,
+    SalesOrderShipSerializer,
+    SalesOrderShipmentSerializer,
+)
+from mainapps.stock.models import (
+    StockItem,
+    StockLocation,
+    StockLot,
+    StockMovementType,
+    TrackingType,
+    StockReservation,
+    StockReservationStatus,
+    StockSerial,
+)
 from subapps.permissions.constants import PURCHASE_ORDER_PERMISSIONS, UNIFIED_PERMISSION_DICT
 from subapps.permissions.microservice_permissions import BaseCachePermissionViewset, HasModelRequestPermission, PermissionRequiredMixin
 from subapps.services.emails.email_services import EmailService
@@ -28,6 +55,7 @@ from subapps.utils.request_context import (
 from .models import (
     PurchaseOrder, PurchaseOrderLineItem, PurchaseOrderStatus,
     ReturnOrder, ReturnOrderLineItem, ReturnOrderStatus,
+    SalesOrder, SalesOrderLineItem, SalesOrderShipment, SalesOrderStatus,
 )
 logger = logging.getLogger(__name__)
 
@@ -429,6 +457,7 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
                         lot_number=item_data.get('lot_number', ''),
                         manufactured_date=item_data.get('manufactured_date'),
                         expiry_date=item_data.get('expiry_date'),
+                        serial_numbers=item_data.get('serial_numbers'),
                         notes=item_data.get('notes') or request.data.get('notes', ''),
                     )
                     
@@ -488,9 +517,6 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
                 purchase_order.complete_date = timezone.now()
                 purchase_order.updated_by_user_id = current_user_id
                 purchase_order.save()
-                
-                # Create inventory transactions for audit
-                self._create_inventory_transactions(purchase_order, current_user)
                 
                 # Log activity
                 self._log_activity('COMPLETE', purchase_order, {
@@ -588,16 +614,21 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
                         raise ValueError(f"Line item {item['line_item_id']} not found")
                     
                     # Validate return quantity
-                    if item['quantity'] > line_item.quantity:
+                    previously_returned = line_item.returns.aggregate(
+                        total=Sum('quantity_returned')
+                    )['total'] or 0
+                    returnable_quantity = Decimal(str(line_item.quantity_received)) - Decimal(str(previously_returned))
+                    if Decimal(str(item['quantity'])) > returnable_quantity:
                         raise ValueError(
                             f"Cannot return {item['quantity']} items, "
-                            f"only {line_item.quantity} were ordered"
+                            f"only {returnable_quantity} remain returnable from received stock"
                         )
                     
                     ReturnOrderLineItem.objects.create(
                         return_order=return_order,
                         original_line_item=line_item,
                         quantity_returned=item['quantity'],
+                        quantity_processed=0,
                         unit_price=line_item.unit_price,
                         tax_rate=line_item.tax_rate,
                         discount=line_item.discount,
@@ -921,27 +952,6 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
             "cost_per_order": avg_cost_per_order,
         }
 
-    def _create_inventory_transactions(self, purchase_order, current_user_id):
-        """Create inventory transaction records for audit"""
-        transactions = []
-        for line_item in purchase_order.line_items.all():
-            if line_item.stock_item:
-                transactions.append(
-                    InventoryTransaction(
-                        item=line_item.stock_item,
-                        quantity=line_item.quantity if line_item.quantity_received<=0 else line_item.quantity_received,
-                        unit_price=line_item.unit_price,
-                        transaction_type=TransactionType.PO_COMPLETE,
-                        reference=purchase_order.reference,
-                        performed_by_user_id=current_user_id,
-                        profile_id=purchase_order.profile_id,
-                        notes=f"Completed from PO {purchase_order.reference}"
-                    )
-                )
-        
-        if transactions:
-            InventoryTransaction.objects.bulk_create(transactions)
-    
     def _log_activity(self, action, instance, details):
         """Log user activity for audit trail"""
         try:
@@ -1095,6 +1105,7 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
             
             # Log activity
             current_user = IdentityDirectory.get_current_user(request)
+            current_user_id = get_request_user_id(request, as_str=False)
             self._log_activity('RESEND_EMAIL', purchase_order, {
                 'resent_by': current_user.get('full_name') if current_user_id else 'Unknown'
             })
@@ -1115,7 +1126,846 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
 
-# we need to create mcp tools that agent can use to search for products on various
+
+class SalesOrderViewSet(BaseCachePermissionViewset):
+    required_permission = UNIFIED_PERMISSION_DICT.get('sales_order')
+    queryset = SalesOrder.objects.select_related(
+        'customer',
+        'contact',
+        'address',
+    ).prefetch_related(
+        'line_items',
+        'line_items__inventory',
+        'line_items__inventory_item',
+        'shipments',
+        'shipments__lines',
+        'shipments__lines__stock_location',
+        'shipments__lines__stock_lot',
+        'shipments__lines__stock_serial',
+        'shipments__lines__reservation',
+    )
+    filterset_fields = ['status', 'customer', 'issue_date', 'shipment_date', 'delivery_date']
+    search_fields = ['reference', 'description', 'customer_reference', 'customer__name']
+    ordering_fields = ['reference', 'issue_date', 'delivery_date', 'created_at']
+    ordering = ['-created_at']
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        profile_id = get_request_profile_id(self.request, as_str=False)
+        if profile_id:
+            queryset = scope_queryset_by_identity(
+                queryset,
+                canonical_field='profile_id',
+                legacy_field='profile',
+                value=profile_id,
+            )
+        return queryset
+
+    def get_serializer_class(self):
+        if self.action == 'list':
+            return SalesOrderListSerializer
+        if self.action == 'reserve':
+            return SalesOrderReserveSerializer
+        if self.action == 'release':
+            return SalesOrderReleaseSerializer
+        if self.action == 'ship':
+            return SalesOrderShipSerializer
+        return SalesOrderDetailSerializer
+
+    def perform_create(self, serializer):
+        current_user_id = get_request_user_id(self.request, as_str=False)
+        profile_id = get_request_profile_id(self.request, required=True, as_str=False)
+        extra_fields = {
+            'status': SalesOrderStatus.PENDING,
+            'profile_id': profile_id,
+        }
+        if current_user_id:
+            extra_fields['created_by_user_id'] = current_user_id
+            extra_fields['responsible_user_id'] = current_user_id
+        instance = serializer.save(**extra_fields)
+        self._log_activity('CREATE', instance, {'initial_data': self.request.data})
+
+    def perform_update(self, serializer):
+        current_user_id = get_request_user_id(self.request, as_str=False)
+        extra_fields = {}
+        if current_user_id:
+            extra_fields['updated_by_user_id'] = current_user_id
+        instance = serializer.save(**extra_fields)
+        self._log_activity('UPDATE', instance, {'updated_fields': list(serializer.validated_data.keys())})
+
+    @action(detail=True, methods=['get'])
+    def line_items(self, request, pk=None):
+        sales_order = self.get_object()
+        serializer = SalesOrderLineItemSerializer(sales_order.line_items.all(), many=True)
+        return Response(serializer.data)
+
+    @action(detail=True, methods=['get'])
+    def shipments(self, request, pk=None):
+        sales_order = self.get_object()
+        serializer = SalesOrderShipmentSerializer(sales_order.shipments.all(), many=True)
+        return Response(serializer.data)
+
+    @action(detail=True, methods=['post'])
+    def add_line_item(self, request, pk=None):
+        sales_order = self.get_object()
+        if sales_order.status not in [SalesOrderStatus.PENDING, SalesOrderStatus.IN_PROGRESS]:
+            return Response(
+                {'error': 'Cannot add line items to this sales order in its current status'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        serializer = SalesOrderLineItemCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        line_item = serializer.save(sales_order=sales_order)
+        self._log_activity('ADD_LINE_ITEM', sales_order, {'line_item_id': str(line_item.id)})
+        return Response(SalesOrderLineItemSerializer(line_item).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=['put', 'patch'])
+    def update_line_item(self, request, pk=None):
+        sales_order = self.get_object()
+        if sales_order.status not in [SalesOrderStatus.PENDING, SalesOrderStatus.IN_PROGRESS]:
+            return Response(
+                {'error': 'Cannot update line items for this sales order in its current status'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        line_item_id = request.data.get('line_item_id')
+        if not line_item_id:
+            return Response({'error': 'line_item_id is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            line_item = sales_order.line_items.get(id=line_item_id)
+        except SalesOrderLineItem.DoesNotExist:
+            return Response({'error': 'Line item not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        serializer = SalesOrderLineItemCreateSerializer(line_item, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        line_item = serializer.save()
+        self._log_activity('UPDATE_LINE_ITEM', sales_order, {'line_item_id': str(line_item.id)})
+        return Response(SalesOrderLineItemSerializer(line_item).data)
+
+    @action(detail=True, methods=['delete'])
+    def remove_line_item(self, request, pk=None):
+        sales_order = self.get_object()
+        if sales_order.status not in [SalesOrderStatus.PENDING, SalesOrderStatus.IN_PROGRESS]:
+            return Response(
+                {'error': 'Cannot remove line items from this sales order in its current status'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        line_item_id = request.query_params.get('line_item_id')
+        if not line_item_id:
+            return Response({'error': 'line_item_id parameter is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            line_item = sales_order.line_items.get(id=line_item_id)
+        except SalesOrderLineItem.DoesNotExist:
+            return Response({'error': 'Line item not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        if Decimal(str(line_item.shipped_quantity)) > 0 or Decimal(str(line_item.reserved_quantity)) > 0:
+            return Response(
+                {'error': 'Cannot remove a line item with reserved or shipped stock'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        line_item.delete()
+        self._log_activity('REMOVE_LINE_ITEM', sales_order, {'line_item_id': str(line_item_id)})
+        return Response({'message': 'Line item removed successfully'})
+
+    @action(detail=True, methods=['post'])
+    def reserve(self, request, pk=None):
+        sales_order = self.get_object()
+        if sales_order.status in [SalesOrderStatus.CANCELLED, SalesOrderStatus.COMPLETED]:
+            return Response(
+                {'error': 'Cannot reserve stock for a cancelled or completed sales order'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        payload = serializer.validated_data
+        current_user_id = get_request_user_id(request, as_str=False)
+        profile_id = get_request_profile_id(request, required=True, as_str=False)
+
+        try:
+            with transaction.atomic():
+                reservations = []
+                for item in payload['reservation_items']:
+                    line_item = sales_order.line_items.select_related('inventory').get(id=item['line_item_id'])
+                    default_reserve_quantity = (
+                        Decimal('1')
+                        if item.get('stock_serial_id') or item.get('serial_number')
+                        else line_item.reservable_quantity
+                    )
+                    reserve_quantity = Decimal(str(item.get('quantity', default_reserve_quantity)))
+                    if reserve_quantity <= 0:
+                        raise ValueError("Reservation quantity must be greater than zero")
+                    if reserve_quantity > line_item.reservable_quantity:
+                        raise ValueError(
+                            f"Cannot reserve {reserve_quantity}; only {line_item.reservable_quantity} remains reservable"
+                        )
+
+                    stock_location = scope_queryset_by_identity(
+                        StockLocation.objects.filter(id=item['location_id']),
+                        canonical_field='profile_id',
+                        legacy_field='profile',
+                        value=profile_id,
+                    ).first()
+                    if stock_location is None:
+                        raise ValueError(f"Stock location {item['location_id']} not found")
+
+                    stock_lot = None
+                    stock_lot_id = item.get('stock_lot_id')
+                    if stock_lot_id:
+                        stock_lot = StockLot.objects.filter(profile_id=profile_id, id=stock_lot_id).first()
+                        if stock_lot is None:
+                            raise ValueError(f"Stock lot {stock_lot_id} not found")
+
+                    stock_serial = None
+                    stock_serial_id = item.get('stock_serial_id')
+                    if stock_serial_id:
+                        stock_serial = StockSerial.objects.filter(profile_id=profile_id, id=stock_serial_id).first()
+                        if stock_serial is None:
+                            raise ValueError(f"Stock serial {stock_serial_id} not found")
+
+                    reservation_result = StockDomainService.reserve_stock(
+                        inventory=line_item.inventory,
+                        inventory_item=line_item.inventory_item,
+                        stock_location=stock_location,
+                        quantity=reserve_quantity,
+                        external_order_type='sales_order_line',
+                        external_order_id=str(sales_order.id),
+                        external_order_line_id=str(line_item.id),
+                        actor_user_id=current_user_id,
+                        stock_lot=stock_lot,
+                        stock_serial=stock_serial,
+                        serial_number=item.get('serial_number', ''),
+                        expires_at=payload.get('expires_at'),
+                        notes=item.get('notes') or payload.get('notes', '') or f"Reserved for sales order {sales_order.reference}",
+                    )
+                    line_item.reserved_quantity = Decimal(str(line_item.reserved_quantity)) + reserve_quantity
+                    line_item.updated_by_user_id = current_user_id
+                    line_item.save()
+                    reservations.append(str(reservation_result['reservation'].id))
+
+                if sales_order.status == SalesOrderStatus.PENDING:
+                    sales_order.status = SalesOrderStatus.IN_PROGRESS
+                    sales_order.updated_by_user_id = current_user_id
+                    sales_order.save()
+
+                self._log_activity('RESERVE_STOCK', sales_order, {
+                    'reservation_count': len(reservations),
+                    'reservation_ids': reservations,
+                })
+
+            return Response({
+                'message': 'Stock reserved successfully',
+                'reservation_count': len(reservations),
+                'reservation_ids': reservations,
+                'status': sales_order.status,
+            })
+        except SalesOrderLineItem.DoesNotExist:
+            return Response({'error': 'Sales order line item not found'}, status=status.HTTP_404_NOT_FOUND)
+        except StockDomainError as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as exc:
+            logger.error(f"Error reserving stock for sales order {sales_order.reference}: {str(exc)}")
+            return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=['post'])
+    def release(self, request, pk=None):
+        sales_order = self.get_object()
+        if sales_order.status in [SalesOrderStatus.CANCELLED, SalesOrderStatus.COMPLETED]:
+            return Response(
+                {'error': 'Cannot release reservations for a cancelled or completed sales order'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        payload = serializer.validated_data
+        current_user_id = get_request_user_id(request, as_str=False)
+        profile_id = get_request_profile_id(request, required=True, as_str=False)
+
+        try:
+            with transaction.atomic():
+                released_count = 0
+                for item in payload['reservation_items']:
+                    reservation = StockReservation.objects.select_related(
+                        'stock_location',
+                        'stock_lot',
+                        'inventory_item',
+                    ).filter(
+                        profile_id=profile_id,
+                        id=item['reservation_id'],
+                        external_order_type='sales_order_line',
+                        external_order_id=str(sales_order.id),
+                    ).first()
+                    if reservation is None:
+                        raise ValueError(f"Reservation {item['reservation_id']} not found")
+
+                    release_quantity = Decimal(str(item.get('quantity', reservation.remaining_quantity)))
+                    if release_quantity <= 0:
+                        raise ValueError("Release quantity must be greater than zero")
+
+                    StockDomainService.release_reservation(
+                        reservation=reservation,
+                        quantity=release_quantity,
+                        actor_user_id=current_user_id,
+                        notes=item.get('notes') or payload.get('notes', '') or f"Released reservation for {sales_order.reference}",
+                    )
+
+                    line_item = sales_order.line_items.get(id=reservation.external_order_line_id)
+                    line_item.reserved_quantity = max(
+                        Decimal(str(line_item.reserved_quantity)) - release_quantity,
+                        Decimal('0'),
+                    )
+                    line_item.updated_by_user_id = current_user_id
+                    line_item.save()
+                    released_count += 1
+
+                if (
+                    sales_order.status == SalesOrderStatus.IN_PROGRESS
+                    and not sales_order.line_items.filter(
+                        Q(reserved_quantity__gt=0) | Q(shipped_quantity__gt=0)
+                    ).exists()
+                ):
+                    sales_order.status = SalesOrderStatus.PENDING
+                    sales_order.updated_by_user_id = current_user_id
+                    sales_order.save()
+
+                self._log_activity('RELEASE_RESERVATION', sales_order, {'released_count': released_count})
+
+            return Response({
+                'message': 'Reservations released successfully',
+                'released_count': released_count,
+                'status': sales_order.status,
+            })
+        except SalesOrderLineItem.DoesNotExist:
+            return Response({'error': 'Sales order line item not found'}, status=status.HTTP_404_NOT_FOUND)
+        except StockDomainError as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as exc:
+            logger.error(f"Error releasing reservations for sales order {sales_order.reference}: {str(exc)}")
+            return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=['post'])
+    def ship(self, request, pk=None):
+        sales_order = self.get_object()
+        if sales_order.status in [SalesOrderStatus.CANCELLED, SalesOrderStatus.COMPLETED]:
+            return Response(
+                {'error': 'Cannot ship a cancelled or completed sales order'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        payload = serializer.validated_data
+        current_user_id = get_request_user_id(request, as_str=False)
+        profile_id = get_request_profile_id(request, required=True, as_str=False)
+
+        try:
+            with transaction.atomic():
+                shipment_items_payload = payload['shipment_items']
+                first_inventory = None
+                for item in shipment_items_payload:
+                    if 'reservation_id' in item:
+                        reservation = StockReservation.objects.filter(
+                            profile_id=profile_id,
+                            id=item['reservation_id'],
+                            external_order_type='sales_order_line',
+                            external_order_id=str(sales_order.id),
+                        ).first()
+                        if reservation is None:
+                            raise ValueError(f"Reservation {item['reservation_id']} not found")
+                        line_item = sales_order.line_items.select_related('inventory').get(
+                            id=reservation.external_order_line_id
+                        )
+                    else:
+                        line_item = sales_order.line_items.select_related('inventory').get(id=item['line_item_id'])
+                    if first_inventory is None:
+                        first_inventory = line_item.inventory
+
+                shipment = SalesOrderShipment.objects.create(
+                    order=sales_order,
+                    inventory=first_inventory,
+                    shipment_date=payload.get('shipment_date') or timezone.now().date(),
+                    delivery_date=payload.get('delivery_date'),
+                    tracking_number=payload.get('tracking_number', ''),
+                    invoice_number=payload.get('invoice_number', ''),
+                    link=payload.get('link', ''),
+                    notes=payload.get('notes', ''),
+                    checked_by_user_id=current_user_id,
+                    created_by_user_id=current_user_id,
+                    updated_by_user_id=current_user_id,
+                )
+
+                shipment_line_count = 0
+                for item in shipment_items_payload:
+                    notes = item.get('notes') or payload.get('notes', '') or f"Shipment {shipment.reference}"
+                    reservation = None
+                    stock_lot = None
+                    stock_serial = None
+
+                    if 'reservation_id' in item:
+                        reservation = StockReservation.objects.select_related(
+                            'stock_location',
+                            'stock_lot',
+                            'stock_serial',
+                            'inventory_item',
+                        ).filter(
+                            profile_id=profile_id,
+                            id=item['reservation_id'],
+                            external_order_type='sales_order_line',
+                            external_order_id=str(sales_order.id),
+                        ).first()
+                        if reservation is None:
+                            raise ValueError(f"Reservation {item['reservation_id']} not found")
+
+                        line_item = sales_order.line_items.select_related('inventory').get(
+                            id=reservation.external_order_line_id
+                        )
+                        ship_quantity = Decimal(str(item.get('quantity', reservation.remaining_quantity)))
+                        if ship_quantity <= 0:
+                            raise ValueError("Shipment quantity must be greater than zero")
+                        if ship_quantity > reservation.remaining_quantity:
+                            raise ValueError(
+                                f"Cannot ship {ship_quantity}; reservation only has {reservation.remaining_quantity} remaining"
+                            )
+
+                        StockDomainService.fulfill_reservation(
+                            reservation=reservation,
+                            quantity=ship_quantity,
+                            actor_user_id=current_user_id,
+                            notes=notes,
+                        )
+                        line_item.reserved_quantity = max(
+                            Decimal(str(line_item.reserved_quantity)) - ship_quantity,
+                            Decimal('0'),
+                        )
+                        stock_location = reservation.stock_location
+                        stock_lot = reservation.stock_lot
+                        stock_serial = reservation.stock_serial
+                    else:
+                        line_item = sales_order.line_items.select_related('inventory').get(id=item['line_item_id'])
+                        if Decimal(str(line_item.reserved_quantity)) > 0:
+                            raise ValueError(
+                                f"Line item {line_item.id} still has reserved stock. Fulfill or release reservations before direct shipping."
+                            )
+                        default_ship_quantity = (
+                            Decimal('1')
+                            if item.get('stock_serial_id') or item.get('serial_number')
+                            else line_item.remaining_quantity
+                        )
+                        ship_quantity = Decimal(str(item.get('quantity', default_ship_quantity)))
+                        if ship_quantity <= 0:
+                            raise ValueError("Shipment quantity must be greater than zero")
+                        if ship_quantity > line_item.remaining_quantity:
+                            raise ValueError(
+                                f"Cannot ship {ship_quantity}; only {line_item.remaining_quantity} remains on the line item"
+                            )
+
+                        stock_location = scope_queryset_by_identity(
+                            StockLocation.objects.filter(id=item['location_id']),
+                            canonical_field='profile_id',
+                            legacy_field='profile',
+                            value=profile_id,
+                        ).first()
+                        if stock_location is None:
+                            raise ValueError(f"Stock location {item['location_id']} not found")
+
+                        stock_lot_id = item.get('stock_lot_id')
+                        if stock_lot_id:
+                            stock_lot = StockLot.objects.filter(profile_id=profile_id, id=stock_lot_id).first()
+                            if stock_lot is None:
+                                raise ValueError(f"Stock lot {stock_lot_id} not found")
+
+                        stock_serial_id = item.get('stock_serial_id')
+                        if stock_serial_id:
+                            stock_serial = StockSerial.objects.filter(profile_id=profile_id, id=stock_serial_id).first()
+                            if stock_serial is None:
+                                raise ValueError(f"Stock serial {stock_serial_id} not found")
+
+                        StockDomainService.issue_stock(
+                            inventory=line_item.inventory,
+                            inventory_item=line_item.inventory_item,
+                            stock_location=stock_location,
+                            quantity=ship_quantity,
+                            actor_user_id=current_user_id,
+                            stock_lot=stock_lot,
+                            stock_serial=stock_serial,
+                            serial_number=item.get('serial_number', ''),
+                            reference_type='sales_order_line',
+                            reference_id=str(line_item.id),
+                            notes=notes,
+                            movement_type=StockMovementType.ISSUE,
+                            tracking_type=TrackingType.SHIPPED,
+                        )
+
+                    line_item.shipped_quantity = Decimal(str(line_item.shipped_quantity)) + ship_quantity
+                    line_item.updated_by_user_id = current_user_id
+                    line_item.save()
+
+                    shipment.lines.create(
+                        sales_order_line=line_item,
+                        stock_location=stock_location,
+                        stock_lot=stock_lot,
+                        stock_serial=stock_serial,
+                        reservation=reservation,
+                        quantity_shipped=ship_quantity,
+                        notes=notes,
+                        created_by_user_id=current_user_id,
+                        updated_by_user_id=current_user_id,
+                    )
+                    shipment_line_count += 1
+
+                sales_order.shipment_date = payload.get('shipment_date') or timezone.now()
+                if not sales_order.issue_date:
+                    sales_order.issue_date = timezone.now()
+                sales_order.shipped_by_user_id = current_user_id
+                sales_order.status = (
+                    SalesOrderStatus.SHIPPED
+                    if not sales_order.line_items.filter(shipped_quantity__lt=F('quantity')).exists()
+                    else SalesOrderStatus.IN_PROGRESS
+                )
+                sales_order.updated_by_user_id = current_user_id
+                sales_order.save()
+
+                self._log_activity('SHIP', sales_order, {
+                    'shipment_reference': shipment.reference,
+                    'shipment_line_count': shipment_line_count,
+                })
+
+            shipment.refresh_from_db()
+            return Response(SalesOrderShipmentSerializer(shipment).data, status=status.HTTP_201_CREATED)
+        except SalesOrderLineItem.DoesNotExist:
+            return Response({'error': 'Sales order line item not found'}, status=status.HTTP_404_NOT_FOUND)
+        except StockDomainError as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as exc:
+            logger.error(f"Error shipping sales order {sales_order.reference}: {str(exc)}")
+            return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=['post'])
+    def complete(self, request, pk=None):
+        sales_order = self.get_object()
+        if sales_order.status == SalesOrderStatus.CANCELLED:
+            return Response(
+                {'error': 'Cannot complete a cancelled sales order'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if sales_order.line_items.filter(shipped_quantity__lt=F('quantity')).exists():
+            return Response(
+                {'error': 'All sales order line items must be fully shipped before completion'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        sales_order.status = SalesOrderStatus.COMPLETED
+        sales_order.complete_date = timezone.now()
+        sales_order.updated_by_user_id = get_request_user_id(request, as_str=False)
+        sales_order.save()
+
+        self._log_activity('COMPLETE', sales_order, {'complete_date': sales_order.complete_date})
+        return Response(SalesOrderDetailSerializer(sales_order, context={'request': request}).data)
+
+    @action(detail=True, methods=['post'])
+    def cancel(self, request, pk=None):
+        sales_order = self.get_object()
+        if sales_order.status in [SalesOrderStatus.CANCELLED, SalesOrderStatus.COMPLETED]:
+            return Response(
+                {'error': 'Cannot cancel a completed or already cancelled sales order'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if sales_order.line_items.filter(shipped_quantity__gt=0).exists():
+            return Response(
+                {'error': 'Cannot cancel a sales order after stock has already been shipped'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        current_user_id = get_request_user_id(request, as_str=False)
+        profile_id = get_request_profile_id(request, required=True, as_str=False)
+
+        try:
+            with transaction.atomic():
+                reservations = StockReservation.objects.select_related(
+                    'stock_location',
+                    'stock_lot',
+                    'inventory_item',
+                ).filter(
+                    profile_id=profile_id,
+                    external_order_type='sales_order_line',
+                    external_order_id=str(sales_order.id),
+                    status__in=[StockReservationStatus.ACTIVE, StockReservationStatus.PARTIALLY_FULFILLED],
+                )
+                for reservation in reservations:
+                    remaining_quantity = Decimal(str(reservation.remaining_quantity))
+                    if remaining_quantity <= 0:
+                        continue
+                    StockDomainService.release_reservation(
+                        reservation=reservation,
+                        quantity=remaining_quantity,
+                        actor_user_id=current_user_id,
+                        notes=f"Cancelled sales order {sales_order.reference}",
+                    )
+                    line_item = sales_order.line_items.get(id=reservation.external_order_line_id)
+                    line_item.reserved_quantity = max(
+                        Decimal(str(line_item.reserved_quantity)) - remaining_quantity,
+                        Decimal('0'),
+                    )
+                    line_item.updated_by_user_id = current_user_id
+                    line_item.save()
+
+                sales_order.status = SalesOrderStatus.CANCELLED
+                sales_order.updated_by_user_id = current_user_id
+                sales_order.notes = request.data.get('notes', sales_order.notes)
+                sales_order.save()
+
+                self._log_activity('CANCEL', sales_order, {'notes': request.data.get('notes', '')})
+
+            return Response(SalesOrderDetailSerializer(sales_order, context={'request': request}).data)
+        except SalesOrderLineItem.DoesNotExist:
+            return Response({'error': 'Sales order line item not found'}, status=status.HTTP_404_NOT_FOUND)
+        except StockDomainError as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as exc:
+            logger.error(f"Error cancelling sales order {sales_order.reference}: {str(exc)}")
+            return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+    def _log_activity(self, action, instance, details):
+        try:
+            current_user_id = get_request_user_id(self.request, as_str=False)
+            if current_user_id:
+                logger.info(
+                    f"User {current_user_id} performed {action} "
+                    f"on sales order {instance.reference}: {details}"
+                )
+        except Exception as exc:
+            logger.error(f"Failed to log sales-order activity: {str(exc)}")
+
+class ReturnOrderViewSet(BaseCachePermissionViewset):
+    required_permission = UNIFIED_PERMISSION_DICT.get('return_order')
+    queryset = ReturnOrder.objects.select_related(
+        'purchase_order',
+        'purchase_order__supplier',
+        'contact',
+        'address',
+    ).prefetch_related(
+        'line_items',
+        'line_items__original_line_item',
+        'line_items__original_line_item__inventory_item',
+        'line_items__original_line_item__stock_item',
+    )
+    filterset_fields = ['status', 'purchase_order']
+    search_fields = ['reference', 'purchase_order__reference']
+    ordering_fields = ['reference', 'created_at', 'issue_date', 'complete_date']
+    ordering = ['-created_at']
+    http_method_names = ['get', 'post', 'head', 'options']
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        profile_id = get_request_profile_id(self.request, as_str=False)
+        if profile_id:
+            queryset = scope_queryset_by_identity(
+                queryset,
+                canonical_field='profile_id',
+                legacy_field='profile',
+                value=profile_id,
+            )
+        return queryset
+
+    def get_serializer_class(self):
+        if self.action == 'list':
+            return ReturnOrderListSerializer
+        if self.action == 'dispatch':
+            return ReturnOrderProcessSerializer
+        return ReturnOrderDetailSerializer
+
+    def create(self, request, *args, **kwargs):
+        return Response(
+            {'error': 'Create return orders from the purchase-order flow'},
+            status=status.HTTP_405_METHOD_NOT_ALLOWED
+        )
+
+    @action(detail=True, methods=['post'])
+    def dispatch(self, request, pk=None):
+        return_order = self.get_object()
+        if return_order.status not in [
+            ReturnOrderStatus.PENDING,
+            ReturnOrderStatus.AWAITING_PICKUP,
+            ReturnOrderStatus.IN_TRANSIT,
+        ]:
+            return Response(
+                {'error': 'Only pending, awaiting pickup, or in-transit return orders can be dispatched'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        payload = serializer.validated_data
+        current_user_id = get_request_user_id(request, as_str=False)
+        profile_id = get_request_profile_id(request, required=True, as_str=False)
+
+        try:
+            with transaction.atomic():
+                processed_count = 0
+                for item in payload['return_items']:
+                    try:
+                        return_line = return_order.line_items.select_related(
+                            'original_line_item',
+                            'original_line_item__inventory_item',
+                            'original_line_item__stock_item',
+                        ).get(id=item['return_line_item_id'])
+                    except ReturnOrderLineItem.DoesNotExist:
+                        raise ValueError(f"Return line item {item['return_line_item_id']} not found")
+
+                    default_issue_quantity = (
+                        Decimal('1')
+                        if item.get('stock_serial_id') or item.get('serial_number')
+                        else return_line.remaining_quantity
+                    )
+                    issue_quantity = Decimal(str(item.get('quantity', default_issue_quantity)))
+                    if issue_quantity <= 0:
+                        raise ValueError("Issue quantity must be greater than zero")
+                    if issue_quantity > return_line.remaining_quantity:
+                        raise ValueError(
+                            f"Cannot dispatch {issue_quantity}; only {return_line.remaining_quantity} remains on return line {return_line.id}"
+                        )
+
+                    stock_location = scope_queryset_by_identity(
+                        StockLocation.objects.filter(id=item['location_id']),
+                        canonical_field='profile_id',
+                        legacy_field='profile',
+                        value=profile_id,
+                    ).first()
+                    if stock_location is None:
+                        raise ValueError(f"Stock location {item['location_id']} not found")
+
+                    stock_lot = None
+                    stock_lot_id = item.get('stock_lot_id')
+                    if stock_lot_id:
+                        stock_lot = StockLot.objects.filter(profile_id=profile_id, id=stock_lot_id).first()
+                        if stock_lot is None:
+                            raise ValueError(f"Stock lot {stock_lot_id} not found")
+
+                    stock_serial = None
+                    stock_serial_id = item.get('stock_serial_id')
+                    if stock_serial_id:
+                        stock_serial = StockSerial.objects.filter(profile_id=profile_id, id=stock_serial_id).first()
+                        if stock_serial is None:
+                            raise ValueError(f"Stock serial {stock_serial_id} not found")
+
+                    original_line = return_line.original_line_item
+                    StockDomainService.issue_stock(
+                        inventory=(
+                            original_line.stock_item.inventory
+                            if original_line.stock_item_id and original_line.stock_item.inventory_id
+                            else None
+                        ),
+                        inventory_item=original_line.inventory_item,
+                        purchase_order_line=original_line,
+                        stock_location=stock_location,
+                        quantity=issue_quantity,
+                        actor_user_id=current_user_id,
+                        stock_lot=stock_lot,
+                        stock_serial=stock_serial,
+                        serial_number=item.get('serial_number', ''),
+                        reference_type='return_order_line',
+                        reference_id=str(return_line.id),
+                        notes=item.get('notes') or payload.get('notes', '') or f"Supplier return {return_order.reference}",
+                        movement_type=StockMovementType.RETURN_OUT,
+                        tracking_type=TrackingType.SHIPPED,
+                    )
+
+                    return_line.quantity_processed = Decimal(str(return_line.quantity_processed)) + issue_quantity
+                    return_line.updated_by_user_id = current_user_id
+                    return_line.save()
+                    processed_count += 1
+
+                return_order.status = ReturnOrderStatus.IN_TRANSIT
+                if not return_order.issue_date:
+                    return_order.issue_date = timezone.now()
+                return_order.updated_by_user_id = current_user_id
+                return_order.save()
+
+                self._log_activity('DISPATCH_RETURN', return_order, {
+                    'processed_lines': processed_count,
+                    'notes': payload.get('notes', ''),
+                })
+
+            return Response({
+                'message': 'Return order dispatched successfully',
+                'status': return_order.status,
+                'processed_count': processed_count,
+                'issue_date': return_order.issue_date,
+            })
+        except StockDomainError as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as exc:
+            logger.error(f"Error dispatching return order {return_order.reference}: {str(exc)}")
+            return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=['post'])
+    def complete(self, request, pk=None):
+        return_order = self.get_object()
+        if return_order.status != ReturnOrderStatus.IN_TRANSIT:
+            return Response(
+                {'error': 'Only in-transit return orders can be completed'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        if return_order.line_items.filter(quantity_processed__lt=F('quantity_returned')).exists():
+            return Response(
+                {'error': 'All return line items must be fully dispatched before completion'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        return_order.status = ReturnOrderStatus.COMPLETED
+        return_order.complete_date = timezone.now()
+        return_order.updated_by_user_id = get_request_user_id(request, as_str=False)
+        return_order.save()
+
+        self._log_activity('COMPLETE_RETURN', return_order, {
+            'completed_at': return_order.complete_date,
+        })
+
+        serializer = ReturnOrderDetailSerializer(return_order, context={'request': request})
+        return Response(serializer.data)
+
+    @action(detail=True, methods=['post'])
+    def cancel(self, request, pk=None):
+        return_order = self.get_object()
+        if return_order.status in [ReturnOrderStatus.COMPLETED, ReturnOrderStatus.CANCELLED]:
+            return Response(
+                {'error': 'Cannot cancel a completed or already cancelled return order'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        if return_order.line_items.filter(quantity_processed__gt=0).exists():
+            return Response(
+                {'error': 'Cannot cancel a return order after stock has already been dispatched'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        return_order.status = ReturnOrderStatus.CANCELLED
+        return_order.updated_by_user_id = get_request_user_id(request, as_str=False)
+        return_order.notes = request.data.get('notes', return_order.notes)
+        return_order.save()
+
+        self._log_activity('CANCEL_RETURN', return_order, {
+            'notes': request.data.get('notes', ''),
+        })
+
+        serializer = ReturnOrderDetailSerializer(return_order, context={'request': request})
+        return Response(serializer.data)
+
+    def _log_activity(self, action, instance, details):
+        try:
+            current_user_id = get_request_user_id(self.request, as_str=False)
+            if current_user_id:
+                logger.info(
+                    f"User {current_user_id} performed {action} "
+                    f"on return order {instance.reference}: {details}"
+                )
+        except Exception as exc:
+            logger.error(f"Failed to log return-order activity: {str(exc)}")
 
 class LineItemsViewset(HasModelRequestPermission,viewsets.ModelViewSet):
     queryset=PurchaseOrderLineItem.objects.all()

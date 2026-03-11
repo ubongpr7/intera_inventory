@@ -5,8 +5,17 @@ from django.db.models import Count, Sum, Avg, F
 from decimal import Decimal
 from mainapps.content_type_linking_models.serializers import UserDetailMixin
 from mainapps.stock.models import StockItem
-from mainapps.inventory.models import Inventory
-from mainapps.orders.models import PurchaseOrder, PurchaseOrderLineItem, SalesOrder
+from mainapps.inventory.models import Inventory, InventoryItem
+from mainapps.orders.models import (
+    PurchaseOrder,
+    PurchaseOrderLineItem,
+    ReturnOrder,
+    ReturnOrderLineItem,
+    SalesOrder,
+    SalesOrderLineItem,
+    SalesOrderShipment,
+    SalesOrderShipmentLine,
+)
 
 
 class InventoryStockItemListSerializer(UserDetailMixin, serializers.ModelSerializer):
@@ -30,30 +39,267 @@ class InventoryStockItemListSerializer(UserDetailMixin, serializers.ModelSeriali
         return None
 
 
+class InventoryItemReferenceSerializer(serializers.ModelSerializer):
+    name = serializers.CharField(source='name_snapshot', read_only=True)
+    sku = serializers.CharField(source='sku_snapshot', read_only=True)
+    barcode = serializers.CharField(source='barcode_snapshot', read_only=True)
+    unit_code = serializers.SerializerMethodField()
 
-class SalesOrderSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = InventoryItem
+        fields = [
+            'id',
+            'name',
+            'sku',
+            'barcode',
+            'product_template_id',
+            'product_variant_id',
+            'inventory_type',
+            'track_stock',
+            'track_lot',
+            'track_serial',
+            'minimum_stock_level',
+            'reorder_point',
+            'status',
+            'unit_code',
+        ]
+
+    def get_unit_code(self, obj):
+        return obj.stock_uom_code or obj.default_uom_code or ''
+
+
+
+class SalesOrderShipmentLineSerializer(serializers.ModelSerializer):
+    inventory_name = serializers.CharField(source='sales_order_line.inventory.name', read_only=True)
+    location_name = serializers.CharField(source='stock_location.name', read_only=True)
+    lot_number = serializers.CharField(source='stock_lot.lot_number', read_only=True)
+    serial_number = serializers.CharField(source='stock_serial.serial_number', read_only=True)
+    reservation_id = serializers.UUIDField(source='reservation.id', read_only=True)
+
+    class Meta:
+        model = SalesOrderShipmentLine
+        fields = [
+            'id',
+            'sales_order_line',
+            'inventory_name',
+            'stock_location',
+            'location_name',
+            'stock_lot',
+            'lot_number',
+            'stock_serial',
+            'serial_number',
+            'reservation_id',
+            'quantity_shipped',
+            'notes',
+            'created_at',
+        ]
+
+
+class SalesOrderShipmentSerializer(UserDetailMixin, serializers.ModelSerializer):
+    lines = SalesOrderShipmentLineSerializer(many=True, read_only=True)
+    checked_by_details = serializers.SerializerMethodField()
+
+    class Meta:
+        model = SalesOrderShipment
+        fields = [
+            'id',
+            'order',
+            'inventory',
+            'reference',
+            'shipment_date',
+            'delivery_date',
+            'checked_by',
+            'checked_by_user_id',
+            'checked_by_details',
+            'tracking_number',
+            'invoice_number',
+            'link',
+            'notes',
+            'lines',
+            'created_at',
+            'updated_at',
+        ]
+
+    def get_checked_by_details(self, obj):
+        return self.get_user_details(self.resolve_user_reference(obj, 'checked_by_user_id', 'checked_by'))
+
+
+class SalesOrderLineItemSerializer(serializers.ModelSerializer):
+    inventory_name = serializers.CharField(source='inventory.name', read_only=True)
+    remaining_quantity = serializers.DecimalField(max_digits=15, decimal_places=5, read_only=True)
+    reservable_quantity = serializers.DecimalField(max_digits=15, decimal_places=5, read_only=True)
+    total_price = serializers.DecimalField(max_digits=18, decimal_places=2, read_only=True)
+
+    class Meta:
+        model = SalesOrderLineItem
+        fields = [
+            'id',
+            'sales_order',
+            'inventory',
+            'inventory_item',
+            'inventory_name',
+            'quantity',
+            'reserved_quantity',
+            'shipped_quantity',
+            'remaining_quantity',
+            'reservable_quantity',
+            'unit_price',
+            'discount_rate',
+            'tax_rate',
+            'description',
+            'total_price',
+            'created_at',
+            'updated_at',
+        ]
+
+
+class SalesOrderListSerializer(UserDetailMixin, serializers.ModelSerializer):
+    customer_name = serializers.CharField(source='customer.name', read_only=True)
+    line_items_count = serializers.SerializerMethodField()
+    total_price = serializers.SerializerMethodField()
+
+    class Meta:
+        model = SalesOrder
+        fields = [
+            'id',
+            'reference',
+            'status',
+            'customer',
+            'customer_name',
+            'shipment_date',
+            'issue_date',
+            'delivery_date',
+            'line_items_count',
+            'total_price',
+            'created_at',
+            'updated_at',
+        ]
+
+    def get_line_items_count(self, obj):
+        return obj.line_items.count()
+
+    def get_total_price(self, obj):
+        return str(obj.total_price.quantize(Decimal('0.00'))) if obj.total_price else "0.00"
+
+
+class SalesOrderDetailSerializer(UserDetailMixin, serializers.ModelSerializer):
+    line_items = SalesOrderLineItemSerializer(many=True, read_only=True)
+    shipments = SalesOrderShipmentSerializer(many=True, read_only=True)
+    customer_name = serializers.CharField(source='customer.name', read_only=True)
+    responsible_details = serializers.SerializerMethodField()
+    shipped_by_details = serializers.SerializerMethodField()
+    total_price = serializers.SerializerMethodField()
+
     class Meta:
         model = SalesOrder
         fields = '__all__'
+        read_only_fields = ['reference']
+
+    def get_responsible_details(self, obj):
+        return self.get_user_details(self.resolve_user_reference(obj, 'responsible_user_id', 'responsible'))
+
+    def get_shipped_by_details(self, obj):
+        return self.get_user_details(self.resolve_user_reference(obj, 'shipped_by_user_id', 'shipped_by'))
+
+    def get_total_price(self, obj):
+        return str(obj.total_price.quantize(Decimal('0.00'))) if obj.total_price else "0.00"
+
+
+class SalesOrderLineItemCreateSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SalesOrderLineItem
+        exclude = ['sales_order']
+        read_only_fields = ['reserved_quantity', 'shipped_quantity', 'total_price']
+
+
+class SalesOrderReserveSerializer(serializers.Serializer):
+    reservation_items = serializers.ListField(
+        child=serializers.DictField(),
+        help_text="List of sales order line items to reserve against stock",
+    )
+    expires_at = serializers.DateTimeField(required=False, allow_null=True)
+    notes = serializers.CharField(required=False, allow_blank=True)
+
+    def validate_reservation_items(self, value):
+        required_fields = ['line_item_id', 'location_id']
+        for item in value:
+            for field in required_fields:
+                if field not in item:
+                    raise serializers.ValidationError(
+                        f"Missing required field '{field}' in reservation items"
+                    )
+            if 'quantity' in item and item['quantity'] <= 0:
+                raise serializers.ValidationError("Reservation quantity must be greater than zero")
+        return value
+
+
+class SalesOrderReleaseSerializer(serializers.Serializer):
+    reservation_items = serializers.ListField(
+        child=serializers.DictField(),
+        help_text="List of reservation records to release",
+    )
+    notes = serializers.CharField(required=False, allow_blank=True)
+
+    def validate_reservation_items(self, value):
+        for item in value:
+            if 'reservation_id' not in item:
+                raise serializers.ValidationError("Missing required field 'reservation_id'")
+            if 'quantity' in item and item['quantity'] <= 0:
+                raise serializers.ValidationError("Release quantity must be greater than zero")
+        return value
+
+
+class SalesOrderShipSerializer(serializers.Serializer):
+    shipment_items = serializers.ListField(
+        child=serializers.DictField(),
+        help_text="List of sales order line items to ship",
+    )
+    shipment_date = serializers.DateField(required=False, allow_null=True)
+    delivery_date = serializers.DateField(required=False, allow_null=True)
+    tracking_number = serializers.CharField(required=False, allow_blank=True)
+    invoice_number = serializers.CharField(required=False, allow_blank=True)
+    link = serializers.URLField(required=False, allow_blank=True)
+    notes = serializers.CharField(required=False, allow_blank=True)
+
+    def validate_shipment_items(self, value):
+        for item in value:
+            if 'reservation_id' not in item and 'line_item_id' not in item:
+                raise serializers.ValidationError(
+                    "Each shipment item must include either 'reservation_id' or 'line_item_id'"
+                )
+            if 'reservation_id' not in item and 'location_id' not in item:
+                raise serializers.ValidationError(
+                    "Shipment items without a reservation_id must include 'location_id'"
+                )
+            if 'quantity' in item and item['quantity'] <= 0:
+                raise serializers.ValidationError("Shipment quantity must be greater than zero")
+        return value
 
 class PurchaseOrderLineItemSerializer(UserDetailMixin, serializers.ModelSerializer):
     """Serializer for purchase order line items"""
+    inventory_item_name = serializers.CharField(source='inventory_item.name_snapshot', read_only=True)
+    inventory_item_details = InventoryItemReferenceSerializer(source='inventory_item', read_only=True)
     stock_item_details = InventoryStockItemListSerializer(source='stock_item', read_only=True)
     quantity_w_unit = serializers.SerializerMethodField()
     tax_amount = serializers.DecimalField(max_digits=18, decimal_places=2, read_only=True)
     total_price = serializers.DecimalField(max_digits=18, decimal_places=2, read_only=True)
 
     def get_quantity_w_unit(self, obj):
-        unit = obj.stock_item.inventory.unit if obj.stock_item and obj.stock_item.inventory else ''
+        unit = ''
+        if obj.inventory_item:
+            unit = obj.inventory_item.stock_uom_code or obj.inventory_item.default_uom_code or ''
+        elif obj.stock_item and obj.stock_item.inventory:
+            unit = obj.stock_item.inventory.unit or ''
         return f"{obj.quantity} {unit}"
 
     class Meta:
         model = PurchaseOrderLineItem
         fields = [
-            'id', 'purchase_order', 'stock_item', 'stock_item_details',
+            'id', 'purchase_order', 'inventory_item', 'inventory_item_name', 'inventory_item_details',
+            'stock_item', 'stock_item_details',
             'quantity', 'quantity_w_unit', 'unit_price',
             'discount_rate', 'tax_rate', 'description',
-            'batch_number', 'expiry_date', 'manufactured_date',
+            'batch_number', 'expiry_date', 'manufactured_date', 'quantity_received',
             'fully_received', 'tax_amount', 'discount', 'total_price'
         ]
         read_only_fields = ['tax_amount', 'discount', 'total_price']
@@ -214,6 +460,99 @@ class ReturnOrderCreateSerializer(serializers.Serializer):
                 raise serializers.ValidationError(
                     "Return quantity must be greater than 0"
                 )
+        return value
+
+
+class ReturnOrderLineItemSerializer(UserDetailMixin, serializers.ModelSerializer):
+    original_line_item_id = serializers.UUIDField(source='original_line_item.id', read_only=True)
+    inventory_item_name = serializers.SerializerMethodField()
+    remaining_quantity = serializers.DecimalField(max_digits=15, decimal_places=5, read_only=True)
+
+    class Meta:
+        model = ReturnOrderLineItem
+        fields = [
+            'id',
+            'original_line_item',
+            'original_line_item_id',
+            'inventory_item_name',
+            'quantity_returned',
+            'quantity_processed',
+            'remaining_quantity',
+            'return_reason',
+            'unit_price',
+            'tax_rate',
+            'discount',
+            'created_at',
+            'updated_at',
+        ]
+
+    def get_inventory_item_name(self, obj):
+        if obj.original_line_item.inventory_item:
+            return obj.original_line_item.inventory_item.name_snapshot
+        if obj.original_line_item.stock_item:
+            return obj.original_line_item.stock_item.name
+        return ""
+
+
+class ReturnOrderListSerializer(serializers.ModelSerializer):
+    purchase_order_reference = serializers.CharField(source='purchase_order.reference', read_only=True)
+    supplier_name = serializers.CharField(source='purchase_order.supplier.name', read_only=True)
+    line_items_count = serializers.SerializerMethodField()
+    total_price = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ReturnOrder
+        fields = [
+            'id',
+            'reference',
+            'status',
+            'purchase_order_reference',
+            'supplier_name',
+            'line_items_count',
+            'total_price',
+            'issue_date',
+            'complete_date',
+            'created_at',
+        ]
+
+    def get_line_items_count(self, obj):
+        return obj.line_items.count()
+
+    def get_total_price(self, obj):
+        return str(sum((line.total_price for line in obj.line_items.all()), Decimal('0.00')))
+
+
+class ReturnOrderDetailSerializer(UserDetailMixin, serializers.ModelSerializer):
+    line_items = ReturnOrderLineItemSerializer(many=True, read_only=True)
+    purchase_order_reference = serializers.CharField(source='purchase_order.reference', read_only=True)
+    supplier_name = serializers.CharField(source='purchase_order.supplier.name', read_only=True)
+    responsible_details = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ReturnOrder
+        fields = '__all__'
+
+    def get_responsible_details(self, obj):
+        return self.get_user_details(self.resolve_user_reference(obj, 'responsible_user_id', 'responsible'))
+
+
+class ReturnOrderProcessSerializer(serializers.Serializer):
+    return_items = serializers.ListField(
+        child=serializers.DictField(),
+        help_text="List of return line items to issue out of stock",
+    )
+    notes = serializers.CharField(required=False, allow_blank=True)
+
+    def validate_return_items(self, value):
+        required_fields = ['return_line_item_id', 'location_id']
+        for item in value:
+            for field in required_fields:
+                if field not in item:
+                    raise serializers.ValidationError(
+                        f"Missing required field '{field}' in return items"
+                    )
+            if 'quantity' in item and item['quantity'] <= 0:
+                raise serializers.ValidationError("Quantity must be greater than zero")
         return value
 
 

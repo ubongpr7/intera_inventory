@@ -543,6 +543,13 @@ class StockSerial(TenantStampedUUIDModel):
         blank=True,
         related_name='serials',
     )
+    stock_location = models.ForeignKey(
+        StockLocation,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='stock_serials',
+    )
     serial_number = models.CharField(max_length=100)
     status = models.CharField(
         max_length=20,
@@ -611,6 +618,13 @@ class StockReservation(TenantStampedUUIDModel):
     )
     stock_lot = models.ForeignKey(
         StockLot,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='stock_reservations',
+    )
+    stock_serial = models.ForeignKey(
+        StockSerial,
         on_delete=models.SET_NULL,
         null=True,
         blank=True,

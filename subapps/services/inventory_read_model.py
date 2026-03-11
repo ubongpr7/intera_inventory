@@ -5,11 +5,11 @@ from datetime import timedelta
 from decimal import Decimal
 
 from django.db import models
-from django.db.models import Avg, Count, F, Sum
+from django.db.models import Avg, Count, F, Max, Sum
 from django.utils import timezone
 
 from mainapps.inventory.models import Inventory, InventoryItem
-from mainapps.stock.models import StockBalance, StockItem
+from mainapps.stock.models import StockBalance, StockItem, StockMovement, StockSerial
 
 
 def _to_decimal(value) -> Decimal:
@@ -68,6 +68,22 @@ def _derive_stock_status(*, inventory: Inventory, current_stock_level: Decimal):
     if current_stock_level <= _to_decimal(inventory.minimum_stock_level):
         return "LOW_STOCK"
     if current_stock_level <= _to_decimal(inventory.re_order_point):
+        return "REORDER_NEEDED"
+    return "IN_STOCK"
+
+
+def _derive_inventory_item_status(*, inventory_item: InventoryItem, current_stock_level: Decimal):
+    if inventory_item.status == "archived":
+        return "ARCHIVED"
+    if inventory_item.status == "discontinued":
+        return "DISCONTINUED"
+    if inventory_item.status == "draft":
+        return "DRAFT"
+    if current_stock_level <= 0:
+        return "OUT_OF_STOCK"
+    if current_stock_level <= _to_decimal(inventory_item.minimum_stock_level):
+        return "LOW_STOCK"
+    if current_stock_level <= _to_decimal(inventory_item.reorder_point):
         return "REORDER_NEEDED"
     return "IN_STOCK"
 
@@ -188,6 +204,194 @@ def get_inventory_summary_map(inventories, *, expiring_days: int = 30):
         summary.pop("_location_ids", None)
         summary.pop("_location_quantities", None)
         summary.pop("_unit_costs", None)
+
+    return summaries
+
+
+def _empty_inventory_item_summary(inventory_item: InventoryItem):
+    return {
+        "inventory_item_id": inventory_item.id,
+        "inventory_id": (inventory_item.metadata or {}).get("legacy_inventory_id"),
+        "name": inventory_item.name_snapshot,
+        "inventory_name": inventory_item.name_snapshot,
+        "sku": inventory_item.sku_snapshot or "",
+        "product_variant": inventory_item.barcode_snapshot or (
+            str(inventory_item.product_variant_id) if inventory_item.product_variant_id else ""
+        ),
+        "quantity": Decimal("0"),
+        "quantity_reserved": Decimal("0"),
+        "quantity_available": Decimal("0"),
+        "total_stock_value": Decimal("0"),
+        "avg_purchase_price": Decimal("0"),
+        "purchase_price": Decimal("0"),
+        "status": _derive_inventory_item_status(
+            inventory_item=inventory_item,
+            current_stock_level=Decimal("0"),
+        ),
+        "expiry_date": None,
+        "days_to_expiry": None,
+        "location_id": None,
+        "location_name": "",
+        "location_count": 0,
+        "location_breakdown": [],
+        "serial_count": 0,
+        "lot_count": 0,
+        "last_movement_at": None,
+        "has_balances": False,
+        "_location_quantities": defaultdict(Decimal),
+        "_location_ids": set(),
+        "_unit_costs": [],
+    }
+
+
+def _finalize_inventory_item_summary(inventory_item: InventoryItem, summary: dict):
+    summary["location_count"] = len(summary.pop("_location_ids"))
+    location_quantities = summary.pop("_location_quantities")
+    ordered_locations = sorted(
+        location_quantities.items(),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+    summary["location_breakdown"] = [
+        {"location_name": location_name, "quantity": quantity}
+        for location_name, quantity in ordered_locations
+    ]
+    if ordered_locations:
+        summary["location_name"] = ordered_locations[0][0]
+    unit_costs = summary.pop("_unit_costs")
+    if unit_costs:
+        average_cost = sum(unit_costs, Decimal("0")) / Decimal(len(unit_costs))
+        summary["avg_purchase_price"] = average_cost
+        summary["purchase_price"] = average_cost
+    summary["status"] = _derive_inventory_item_status(
+        inventory_item=inventory_item,
+        current_stock_level=summary["quantity"],
+    )
+    if summary["expiry_date"]:
+        summary["days_to_expiry"] = (summary["expiry_date"] - timezone.now().date()).days
+    return summary
+
+
+def get_inventory_item_summary_map(inventory_items, *, stock_location=None, expiring_days: int = 30):
+    inventory_item_list = list(inventory_items)
+    if not inventory_item_list:
+        return {}
+
+    item_ids = [inventory_item.id for inventory_item in inventory_item_list]
+    summaries = {
+        inventory_item.id: _empty_inventory_item_summary(inventory_item)
+        for inventory_item in inventory_item_list
+    }
+
+    today = timezone.now().date()
+    cutoff_date = today + timedelta(days=expiring_days)
+    balances = (
+        StockBalance.objects.filter(inventory_item_id__in=item_ids)
+        .select_related("stock_location", "stock_lot")
+        .order_by("created_at")
+    )
+    if stock_location is not None:
+        balances = balances.filter(stock_location=stock_location)
+
+    for balance in balances:
+        summary = summaries.get(balance.inventory_item_id)
+        if summary is None:
+            continue
+
+        quantity_on_hand = _to_decimal(balance.quantity_on_hand)
+        quantity_reserved = _to_decimal(balance.quantity_reserved)
+        quantity_available = _to_decimal(balance.quantity_available)
+
+        summary["has_balances"] = True
+        summary["quantity"] += quantity_on_hand
+        summary["quantity_reserved"] += quantity_reserved
+        summary["quantity_available"] += quantity_available
+
+        if balance.stock_location_id:
+            summary["_location_ids"].add(balance.stock_location_id)
+            location_name = getattr(balance.stock_location, "name", "Unknown Location")
+            summary["_location_quantities"][location_name] += quantity_on_hand
+            if summary["location_id"] is None and quantity_on_hand > 0:
+                summary["location_id"] = balance.stock_location_id
+
+        if balance.stock_lot_id:
+            unit_cost = _to_decimal(balance.stock_lot.unit_cost)
+            summary["total_stock_value"] += quantity_on_hand * unit_cost
+            if quantity_on_hand > 0:
+                summary["_unit_costs"].append(unit_cost)
+            if quantity_on_hand > 0:
+                summary["lot_count"] += 1
+            if (
+                balance.stock_lot.expiry_date
+                and today <= balance.stock_lot.expiry_date <= cutoff_date
+                and quantity_on_hand > 0
+                and (summary["expiry_date"] is None or balance.stock_lot.expiry_date < summary["expiry_date"])
+            ):
+                summary["expiry_date"] = balance.stock_lot.expiry_date
+
+    movement_map = StockMovement.objects.filter(
+        inventory_item_id__in=item_ids
+    ).values("inventory_item_id").annotate(last_movement_at=Max("occurred_at"))
+    for row in movement_map:
+        summary = summaries.get(row["inventory_item_id"])
+        if summary is not None:
+            summary["last_movement_at"] = row["last_movement_at"]
+
+    serial_counts = {
+        row["inventory_item_id"]: row["count"]
+        for row in (
+            StockSerial.objects.filter(inventory_item_id__in=item_ids)
+            .values("inventory_item_id")
+            .annotate(count=Count("id"))
+        )
+    }
+
+    legacy_rows = (
+        StockItem.objects.filter(inventory_item_id__in=item_ids)
+        .select_related("location")
+        .order_by("created_at")
+    )
+    if stock_location is not None:
+        legacy_rows = legacy_rows.filter(location=stock_location)
+
+    for stock_item in legacy_rows:
+        summary = summaries.get(stock_item.inventory_item_id)
+        if summary is None:
+            continue
+
+        summary["serial_count"] = max(summary["serial_count"], serial_counts.get(stock_item.inventory_item_id, 0))
+        if summary["has_balances"]:
+            continue
+
+        quantity = _to_decimal(stock_item.quantity)
+        summary["quantity"] += quantity
+        summary["quantity_available"] += quantity
+        summary["purchase_price"] = _to_decimal(stock_item.purchase_price)
+        if quantity > 0:
+            summary["total_stock_value"] += quantity * _to_decimal(stock_item.purchase_price)
+        if stock_item.location_id:
+            location_name = getattr(stock_item.location, "name", "Unknown Location")
+            summary["_location_ids"].add(stock_item.location_id)
+            summary["_location_quantities"][location_name] += quantity
+            if summary["location_id"] is None and quantity > 0:
+                summary["location_id"] = stock_item.location_id
+        if stock_item.batch:
+            summary["lot_count"] += 1
+        if stock_item.serial:
+            summary["serial_count"] = max(summary["serial_count"], 1)
+        if (
+            stock_item.expiry_date
+            and today <= stock_item.expiry_date <= cutoff_date
+            and quantity > 0
+            and (summary["expiry_date"] is None or stock_item.expiry_date < summary["expiry_date"])
+        ):
+            summary["expiry_date"] = stock_item.expiry_date
+
+    for inventory_item in inventory_item_list:
+        summary = summaries[inventory_item.id]
+        if not summary["serial_count"]:
+            summary["serial_count"] = serial_counts.get(inventory_item.id, 0)
+        _finalize_inventory_item_summary(inventory_item, summary)
 
     return summaries
 
