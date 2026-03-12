@@ -1,145 +1,193 @@
 # Redesign Backlog
 
-Last updated: 2026-03-10
+Last updated: 2026-03-12
 
-This document tracks the remaining cross-service redesign work so it is not lost between implementation passes.
+This document is the current handoff for the four-service redesign:
 
-## Current Priority
+- `intera_users`
+- `product_service`
+- `intera_inventory`
+- `pos_backend_service`
 
-The next thing to prioritize is the remaining inventory-domain cleanup, followed by rollout and verification of the new Kafka reliability layer.
+It records what is already in place, what is still open, and the recommended order for the next execution passes.
 
-Why this comes next:
+## Working Rule
 
-- identity projection Kafka is already live
-- catalog projection Kafka is now also live
-- inventory availability, reservation, and fulfillment events are now live from `intera_inventory`
-- `product_service` and `pos_backend_service` now consume inventory projections locally
-- POS workflow events are now live and inventory reacts to reservation, release, fulfillment, and cancellation requests
-- POS now projects inventory reservation and fulfillment results back into local order workflow state
-- outbox, consumer idempotency, dead-letter persistence, and dead-letter replay infrastructure now exist across all four services
+- Agents should not create or edit migration files.
+- The owner will regenerate migrations from the final model code when bootstrapping the system.
+- Backlog items below refer to model/code state, runtime behavior, and rollout work, not generated migration artifacts.
 
-The immediate next implementation slice should be:
+## Architecture Snapshot
 
-- remove more of the remaining inventory compatibility paths
-- reduce `StockItem` and legacy bridge dependence further
-- then roll out the reliability layer in real environments with generated migrations and env enablement
+Current state in the local repos:
 
-## Priority Order
+- Service boundaries are mostly correct now.
+- Runtime cross-service communication is Kafka-first with local projections, not synchronous service-to-service HTTP.
+- The system is usable enough for frontend integration now.
+- Remaining work is mostly cleanup, ownership decisions, rollout, and runtime hardening, not a fresh redesign.
 
-1. Inventory domain redesign completion
-2. API and ownership cleanup
-3. Data integrity and generic relation cleanup
-4. Legacy structure removal
-5. Reliability rollout and verification
-6. Full runtime verification
+Service flow summary:
 
-## Backlog
+- `intera_users` owns identity and publishes identity events.
+- `product_service` owns catalog and publishes catalog product and catalog variant events.
+- `intera_inventory` owns stock truth and publishes inventory availability, reservation, and fulfillment events.
+- `pos_backend_service` owns POS workflow and publishes POS order and reservation workflow events.
+- `product_service`, `intera_inventory`, and `pos_backend_service` all rely on local Kafka-fed projections for shared data they do not own.
 
-### 1. Inventory availability Kafka wiring
+## What Has Been Achieved
 
-- `intera_inventory` now publishes:
-  - `inventory.availability.upserted`
-  - `inventory.reservation.upserted`
-  - `inventory.reservation.released`
-  - `inventory.fulfillment.completed`
-- `product_service` now consumes those topics into `InventoryVariantProjection`.
-- `pos_backend_service` now consumes those topics into `InventoryAvailabilityProjection`.
-- Backfill still needs to be run in each environment with `publish_inventory_events`.
+### 1. Core Kafka wiring is in place
 
-### 2. POS workflow Kafka wiring
+- Identity Kafka flow is live from `intera_users`.
+- Catalog Kafka flow is live from `product_service`.
+- Inventory availability, reservation, release, and fulfillment Kafka flow is live from `intera_inventory`.
+- POS workflow Kafka flow is live from `pos_backend_service`.
+- Inventory reacts to POS reservation, release, fulfillment, and cancellation flow through Kafka.
+- POS projects reservation and fulfillment results back into local order workflow state.
+- Product and POS both consume inventory events into local projection tables.
 
-- `pos_backend_service` now publishes:
-  - `pos.order.created`
-  - `pos.order.cancelled`
-  - `pos.order.paid`
-  - `pos.inventory.reservation.requested`
-  - `pos.inventory.reservation.released`
-  - `pos.inventory.reservation.confirmed`
-  - `pos.inventory.fulfillment.confirmed`
-- `intera_inventory` now consumes `pos.order` and executes:
-  - reservation requests
-  - reservation releases
-  - fulfillment confirmations
-  - cancellation-driven release
-- `pos_backend_service` now consumes inventory reservation and fulfillment events to update local order item workflow state.
+### 2. Cross-service runtime behavior is projection-based
 
-### 3. Event reliability and delivery guarantees
+- Product stock lookups now use local `InventoryVariantProjection`, not direct runtime calls to inventory.
+- Inventory stock and order flows now use local catalog projections instead of synchronous catalog fetches.
+- Identity data is projected locally into downstream services.
+- Runtime code no longer depends on direct inter-service HTTP for the main identity, catalog, inventory, and POS flows.
 
-- Producer-side outbox infrastructure now exists across all four services.
-- Consumer idempotency persistence now exists across all four services.
-- Dead-letter persistence and replay commands now exist across all four services.
-- Remaining work:
-  - generate and apply migrations for the new reliability tables
-  - decide service-by-service rollout of `KAFKA_USE_OUTBOX`
-  - validate DLQ topics and replay workflow in real environments
-  - formalize event versioning and recovery rules
+### 3. Inventory redesign cleanup already completed
 
-### 4. Inventory domain redesign completion
+- Purchase and sales order lines no longer auto-link through legacy bridge ID generation.
+- `StockItem.save()` no longer auto-populates `inventory_item` through bridge logic.
+- Stock views now resolve legacy inventory compatibility through `metadata__legacy_inventory_id` instead of `InventoryItem.legacy_bridge_id(...)`.
+- Inventory summaries, location summaries, and profile analytics now use normalized `InventoryItem` and `StockBalance` data instead of falling back to legacy `StockItem` rows.
+- `StockDomainService.ensure_inventory_item()` now resolves existing normalized items by metadata rather than bridge-ID synthesis.
+- New locked balances are zero-initialized instead of being seeded from legacy stock rows.
+- Inventory current stock and total stock value now go through the shared summary path instead of bridge-ID balance queries.
 
-- Finish removing legacy outbound assumptions still tied to `StockItem`.
-- Continue moving read/write flows fully onto:
-  - `stock_lot`
-  - `stock_serial`
-  - `stock_balance`
-  - `stock_movement`
-  - `stock_reservation`
-- Expose more of the new inventory model directly where needed instead of relying on compatibility summaries.
+### 4. Model and API cleanup already completed
 
-### 5. Cross-service reference normalization
+- `InventoryCategory` uniqueness was corrected in model code so tenant scope is the real uniqueness boundary.
+- Non-identity services had stale downstream JWT/simplejwt imports removed from URL modules.
+- POS now treats `catalog_variant_id` as the canonical variant reference.
+- POS `product_variant_id` is now a compatibility mirror, not the primary identifier.
+- Generic relation object IDs were updated in code to be UUID-safe instead of integer-only.
+- `StockDomainService` no longer reads `StockItem.product_variant` to resolve catalog variants.
+- `StockItemViewSet` no longer resolves legacy `StockItem` IDs on retrieve; normalized inventory item IDs are the active runtime path.
+- `StockItem.product_variant` has been removed from active model code.
+- `StockItem` no longer stores a persisted `inventory_item` bridge; compatibility stock flows resolve normalized inventory items lazily when they need them.
+- New normalized inventory items no longer seed `sku_snapshot` from `Inventory.external_system_id`.
+- `Inventory.external_system_id` now remains only as a read-only alias/search key; low-stock helper rows no longer treat it as a SKU.
+- `product_service` no longer exposes POS configuration API routes; POS is now the active API owner for POS configuration.
+- `product_service` no longer carries the dormant `POSConfiguration` model/view/serializer layer.
+- `product_service` variant creation no longer requires the legacy `Product.inventory` string to be populated.
+- Product bulk creation no longer writes catalog-side inventory references into newly created products.
+- `product_service` no longer keeps `Product.inventory` or `BulkTask.inventory` in active model code.
+- `product_service` runtime category filtering and analytics now prefer `category_ref` while keeping the legacy category string only as a compatibility fallback.
+- POS runtime event payloads now derive compatibility `product_variant_id` from `catalog_variant_id` instead of treating it as a separate active runtime source.
+- `pos_backend_service` no longer stores a separate `product_variant_id` field on `POSOrderItem`; that compatibility slot is now payload-derived only.
 
-- Replace remaining string-based cross-service references with local projection IDs or local FKs.
-- Remove catalog-side inventory references such as `BulkTask.inventory` and `Product.inventory`.
-- Retire `StockItem.product_variant` string usage in favor of normalized inventory/catalog links.
-- Retire `POSOrderItem.product_variant_id` once `catalog_variant_id` and `inventory_item_id` are the only identifiers needed.
+### 5. Reliability foundation is already implemented in code
 
-### 6. Ownership cleanup
+- Producer-side outbox code exists across all four services.
+- Consumer idempotency persistence code exists across all four services.
+- Dead-letter persistence and replay command support exists across all four services.
+- Kafka config and environment shape are already documented in `kafka-environment-matrix.md`.
 
-- Remove duplicated `POSConfiguration` ownership and choose a single write owner.
-- Confirm whether POS `Customer` stays POS-owned or becomes a projected/shared concept.
-- Finish catalog category normalization so string category fields become compatibility-only or are removed.
-- Decide the long-term role of `Inventory.external_system_id` as alias-only vs. active legacy key.
+## What Is Still Left
 
-### 7. Legacy bridge and compatibility removal
+### Priority 1. Finish inventory legacy retirement
 
-- Remove `InventoryItem.legacy_bridge_id(...)` usage after migration completes.
-- Remove `legacy_stock_items` bridging references.
-- Remove old dual-write or compatibility-only save hooks.
-- Remove compatibility-only comments and helper paths in bulk product commands and stock bridging code.
+Inventory runtime cleanup is mostly complete.
 
-### 8. Generic relation cleanup
+- Keep the compatibility `StockItem` API surface as a thin facade for frontend transition, or retire it later after frontend contracts are frozen.
+- Remove or reduce remaining compatibility-only helpers and commands that still target legacy stock records.
 
-- Fix integer-based generic relation infrastructure in inventory/shared models so it is compatible with UUID-heavy domains.
-- Review content-type based attachment/linking structures and normalize object ID types where needed.
+### Priority 2. Resolve identifier and ownership cleanup
 
-### 9. API cleanup
+- Regenerate final schema from the cleaned model code once the owner bootstraps the environment.
+- `Inventory.external_system_id` should now be treated as a read-only alias/search key unless the owner chooses to remove it entirely later.
+- POS configuration ownership is fully with `pos_backend_service`.
+- POS customer ownership should be treated as POS-owned for now:
+  - `pos_backend_service` keeps the writable `CustomerViewSet`
 
-- Simplify [product urls](/Users/ubongpr7/dev/pr7/inventory/product_service/mainapps/product/urls.py) so the large manual `as_view(...)` alias layer is reduced to cleaner router-native actions.
-- Decide whether analytics endpoints should remain aggregate viewsets or move to model-backed read models.
-- Remove stale downstream JWT minting imports and dead auth-route remnants from non-identity services.
+### Priority 3. Product service cleanup
 
-### 10. Data integrity fixes
+- Freeze the initial POS-facing catalog contract for frontend consumption:
+  - `/products/`
+  - `/variants/`
+  - `/pos/products/`
+  - `/pos/products/search/`
+  - `/pos/products/featured/`
+  - `/pos/products/categories/`
+  - `/pos/variants/`
+  - `/pos/variants/search/`
+  - `/pos/variants/barcode/`
 
-- Fix `InventoryCategory` uniqueness so tenant-scoped uniqueness is not undermined by a global `unique=True`.
-- Review other constraints and indexes that still assume legacy identifiers or tenant strings.
-- Revisit SKU, barcode, and external ID invariants after the new inventory structures are in place.
+### Priority 4. Reliability rollout in real environments
 
-### 11. Runtime verification
+The code exists, but rollout is still pending.
 
-- Install missing runtime dependencies:
-  - WeasyPrint libs in inventory
-  - `modal` in product
-  - `tinymce` in POS
-- Provide the full env needed for startup, including JWT public-key settings.
-- Run:
-  - `manage.py check`
-  - migration validation
-  - targeted API tests
-  - schema/data backfill verification
+- Generate owner-managed migrations from the current model code in each service.
+- Apply those migrations in each environment.
+- Enable `KAFKA_USE_OUTBOX` service by service after schema rollout.
+- Run inventory projection backfill with `publish_inventory_events`.
+- Validate:
+  - dead-letter capture
+  - replay workflow
+  - consumer idempotency behavior
+  - event versioning and recovery rules
 
-## Notes
+### Priority 5. Runtime verification and environment hardening
 
-- HTTP-based interservice calls have already been removed from runtime code.
-- App-level `api/` folders have already been flattened into app-root `views.py`, `serializers.py`, `urls.py`, and related files.
-- Identity Kafka infrastructure is already in place across all four services.
-- Catalog Kafka infrastructure is now also live from `product_service` into inventory and POS.
-- The Kafka environment matrix is documented in [kafka-environment-matrix.md](/Users/ubongpr7/dev/pr7/inventory/intera_inventory/docs/kafka-environment-matrix.md).
+- Fix missing native WeasyPrint dependencies where PDF services are imported at runtime.
+- Verify product runtime requirements for Modal-backed bulk creation paths if those flows are still required.
+- Run clean startup validation for all four services with the real environment variables in place.
+- Run targeted API verification against the endpoints the frontend will consume first.
+- Confirm docker/local startup parity for:
+  - consumer processes
+  - web processes
+  - Kafka bootstrap settings
+  - JWT key configuration
+
+## Frontend Readiness Notes
+
+Frontend work can start now.
+
+What is ready enough:
+
+- identity-driven authentication and projection flow
+- catalog list/detail and variant surfaces
+- inventory-backed stock availability surfaces
+- POS order and inventory reservation workflow surfaces
+
+What is not fully frozen yet:
+
+- some compatibility endpoint shapes around stock
+- POS ownership-related endpoints
+- final runtime verification of the frontend-facing service contracts
+
+Practical meaning:
+
+- Next.js integration can begin now.
+- Kotlin cross-platform integration can begin now.
+- Expect some endpoint and field cleanup while the remaining backlog items are completed.
+
+## Recommended Next Execution Order
+
+1. Run targeted API verification against the frontend-facing contract endpoints.
+2. Roll out outbox and replay infrastructure in real environments.
+3. Run full runtime verification and lock down the first frontend contracts.
+
+## Concrete Next Tasks
+
+These are the next tasks another agent should pick up immediately.
+
+1. Keep the compatibility `stock-items` endpoint as a frontend transition facade unless and until the frontend contract is frozen.
+2. Treat POS customer data as POS-owned unless the owner explicitly moves it elsewhere.
+3. Move to rollout work: owner-managed migrations, outbox enablement, backfill, and runtime verification.
+
+## Handoff Notes
+
+- Do not spend more agent time generating migrations.
+- Treat current large local changes in `product_service`, `intera_users`, and `pos_backend_service` as in-progress work unless the owner says otherwise.
+- When working on frontend-facing code, prefer stabilizing endpoint contracts over adding more compatibility layers.
+- When choosing between another compatibility patch and deleting legacy behavior, prefer removing runtime legacy dependence first, then letting the owner regenerate schema later.

@@ -69,17 +69,6 @@ def _resolve_catalog_variant(inventory_item: InventoryItem) -> CatalogVariantPro
         if normalized and normalized not in candidate_values:
             candidate_values.append(normalized)
 
-    legacy_values = (
-        inventory_item.legacy_stock_items.exclude(product_variant__isnull=True)
-        .exclude(product_variant="")
-        .values_list("product_variant", flat=True)
-        .distinct()
-    )
-    for raw_value in legacy_values:
-        normalized = str(raw_value or "").strip()
-        if normalized and normalized not in candidate_values:
-            candidate_values.append(normalized)
-
     for lookup in candidate_values:
         variant = queryset.filter(variant_barcode=lookup).first()
         if variant is not None:

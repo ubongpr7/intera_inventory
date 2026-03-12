@@ -74,12 +74,6 @@ class PurchaseOrderLineItem(UUIDBaseModel):
                 return code
 
     def save(self, *args, **kwargs):
-        if not self.inventory_item_id and self.stock_item_id and self.stock_item.inventory_id:
-            from mainapps.inventory.models import InventoryItem
-
-            bridge_id = InventoryItem.legacy_bridge_id(self.stock_item.inventory_id)
-            if InventoryItem.objects.filter(id=bridge_id).exists():
-                self.inventory_item_id = bridge_id
         if not self.batch_number:
             self.batch_number = self.generate_batch_number()
         self.full_clean()
@@ -558,12 +552,6 @@ class SalesOrderLineItem(UUIDBaseModel):
     description = models.TextField(null=True, blank=True)
 
     def save(self, *args, **kwargs):
-        if not self.inventory_item_id and self.inventory_id:
-            from mainapps.inventory.models import InventoryItem
-
-            bridge_id = InventoryItem.legacy_bridge_id(self.inventory_id)
-            if InventoryItem.objects.filter(id=bridge_id).exists():
-                self.inventory_item_id = bridge_id
         self.full_clean()
         super().save(*args, **kwargs)
 

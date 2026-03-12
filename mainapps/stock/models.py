@@ -204,24 +204,7 @@ class StockItem(MPTTModel, InventoryMixin):
         help_text=_('Name of the stock item'),
     )
     
-    product_variant = models.CharField(
-        max_length=200,
-        null=True,
-        blank=True,
-        verbose_name=_('Product Variant Barcode'),
-        help_text=_('Barcode to variant of the product'),
-    )
-
     inventory = models.ForeignKey('inventory.Inventory', on_delete=models.CASCADE, null=True,related_name='stock_items')
-    inventory_item = models.ForeignKey(
-        'inventory.InventoryItem',
-        on_delete=models.SET_NULL,
-        null=True,
-        blank=True,
-        related_name='legacy_stock_items',
-        verbose_name=_('Inventory Item'),
-        help_text=_('Bridging reference to the redesigned inventory item record.'),
-    )
     parent = TreeForeignKey(
         'self',
         verbose_name=_('Parent Stock Item'),
@@ -401,12 +384,6 @@ class StockItem(MPTTModel, InventoryMixin):
 
     def save(self, *args, **kwargs):
         _sync_identity_fields(self, canonical_field='stocktaker_user_id', legacy_field='stocktaker')
-        if not self.inventory_item_id and self.inventory_id:
-            from mainapps.inventory.models import InventoryItem
-
-            bridge_id = InventoryItem.legacy_bridge_id(self.inventory_id)
-            if InventoryItem.objects.filter(id=bridge_id).exists():
-                self.inventory_item_id = bridge_id
         
         try:
 

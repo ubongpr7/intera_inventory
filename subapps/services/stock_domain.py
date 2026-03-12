@@ -4,7 +4,6 @@ import uuid
 from decimal import Decimal
 
 from django.db import models, transaction
-from django.db.models import Sum
 from django.utils import timezone
 
 from mainapps.inventory.models import Inventory, InventoryItem
@@ -12,7 +11,6 @@ from mainapps.orders.models import GoodsReceipt, GoodsReceiptLine, PurchaseOrder
 from mainapps.stock.models import (
     StockBalance,
     StockItem,
-    StockItemTracking,
     StockLocation,
     StockLot,
     StockSerial,
@@ -486,8 +484,6 @@ class StockDomainService:
     ) -> InventoryItem:
         if purchase_order_line and purchase_order_line.inventory_item_id:
             return purchase_order_line.inventory_item
-        if stock_item and stock_item.inventory_item_id:
-            return stock_item.inventory_item
 
         if inventory is None:
             if stock_item and stock_item.inventory_id:
@@ -499,36 +495,40 @@ class StockDomainService:
             raise StockDomainError("Unable to resolve inventory item for stock operation.")
 
         profile_id = cls._resolve_profile_id(inventory)
-        bridge_id = InventoryItem.legacy_bridge_id(inventory.id)
-        inventory_item, created = InventoryItem.objects.get_or_create(
-            id=bridge_id,
-            defaults={
-                "profile_id": profile_id,
-                "name_snapshot": inventory.name,
-                "sku_snapshot": inventory.external_system_id or "",
-                "barcode_snapshot": "",
-                "description": inventory.description or "",
-                "inventory_category": inventory.category,
-                "inventory_type": inventory.inventory_type,
-                "default_uom_code": inventory.unit or "",
-                "stock_uom_code": inventory.unit_name or "",
-                "track_stock": True,
-                "track_lot": inventory.batch_tracking_enabled,
-                "track_serial": inventory.trackable,
-                "track_expiry": bool(inventory.expiration_threshold),
-                "allow_negative_stock": False,
-                "reorder_point": inventory.re_order_point,
-                "reorder_quantity": inventory.re_order_quantity,
-                "minimum_stock_level": inventory.minimum_stock_level,
-                "safety_stock_level": inventory.safety_stock_level,
-                "default_supplier": inventory.default_supplier,
-                "metadata": {"legacy_inventory_id": str(inventory.id)},
-                "created_by_user_id": actor_user_id,
-                "updated_by_user_id": actor_user_id,
-            },
+        inventory_item = (
+            InventoryItem.objects.filter(
+                metadata__legacy_inventory_id=str(inventory.id)
+            )
+            .order_by("created_at")
+            .first()
         )
+        changed = inventory_item is None
+        if inventory_item is None:
+            inventory_item = InventoryItem(
+                profile_id=profile_id,
+                name_snapshot=inventory.name,
+                sku_snapshot="",
+                barcode_snapshot="",
+                description=inventory.description or "",
+                inventory_category=inventory.category,
+                inventory_type=inventory.inventory_type,
+                default_uom_code=inventory.unit or "",
+                stock_uom_code=inventory.unit_name or "",
+                track_stock=True,
+                track_lot=inventory.batch_tracking_enabled,
+                track_serial=inventory.trackable,
+                track_expiry=bool(inventory.expiration_threshold),
+                allow_negative_stock=False,
+                reorder_point=inventory.re_order_point,
+                reorder_quantity=inventory.re_order_quantity,
+                minimum_stock_level=inventory.minimum_stock_level,
+                safety_stock_level=inventory.safety_stock_level,
+                default_supplier=inventory.default_supplier,
+                metadata={"legacy_inventory_id": str(inventory.id)},
+                created_by_user_id=actor_user_id,
+                updated_by_user_id=actor_user_id,
+            )
 
-        changed = False
         metadata = dict(inventory_item.metadata or {})
         if metadata.get("legacy_inventory_id") != str(inventory.id):
             metadata["legacy_inventory_id"] = str(inventory.id)
@@ -537,14 +537,16 @@ class StockDomainService:
         field_updates = {
             "profile_id": profile_id,
             "name_snapshot": inventory.name,
-            "sku_snapshot": inventory.external_system_id or "",
             "description": inventory.description or "",
             "inventory_category": inventory.category,
             "inventory_type": inventory.inventory_type,
             "default_uom_code": inventory.unit or "",
             "stock_uom_code": inventory.unit_name or "",
+            "track_stock": True,
             "track_lot": inventory.batch_tracking_enabled,
             "track_serial": inventory.trackable,
+            "track_expiry": bool(inventory.expiration_threshold),
+            "allow_negative_stock": False,
             "default_supplier": inventory.default_supplier,
             "reorder_point": inventory.re_order_point,
             "reorder_quantity": inventory.re_order_quantity,
@@ -584,32 +586,10 @@ class StockDomainService:
             inventory_item.updated_by_user_id = actor_user_id
             inventory_item.save()
 
-        if stock_item and stock_item.inventory_item_id != inventory_item.id:
-            stock_item.inventory_item = inventory_item
-            stock_item.updated_by_user_id = actor_user_id
-            stock_item.save()
-        variant_barcode = cls._resolve_product_variant_barcode(
-            inventory_item=inventory_item,
-            stock_item=stock_item,
-            purchase_order_line=purchase_order_line,
-        )
-        if stock_item and variant_barcode and stock_item.product_variant != variant_barcode:
-            stock_item.product_variant = variant_barcode
-            stock_item.updated_by_user_id = actor_user_id
-            stock_item.save()
         if purchase_order_line and purchase_order_line.inventory_item_id != inventory_item.id:
             purchase_order_line.inventory_item = inventory_item
             purchase_order_line.updated_by_user_id = actor_user_id
             purchase_order_line.save()
-        if (
-            purchase_order_line
-            and purchase_order_line.stock_item_id
-            and variant_barcode
-            and purchase_order_line.stock_item.product_variant != variant_barcode
-        ):
-            purchase_order_line.stock_item.product_variant = variant_barcode
-            purchase_order_line.stock_item.updated_by_user_id = actor_user_id
-            purchase_order_line.stock_item.save()
         return inventory_item
 
     @classmethod
@@ -1157,14 +1137,15 @@ class StockDomainService:
         candidate_values: list[str] = []
         metadata = inventory_item.metadata if inventory_item and isinstance(inventory_item.metadata, dict) else {}
         for raw_value in [
-            stock_item.product_variant if stock_item is not None else "",
+            inventory_item.barcode_snapshot if inventory_item is not None else "",
+            metadata.get("legacy_variant_barcode", ""),
+            inventory_item.sku_snapshot if inventory_item is not None else "",
+            stock_item.sku if stock_item is not None else "",
             (
-                purchase_order_line.stock_item.product_variant
+                purchase_order_line.stock_item.sku
                 if purchase_order_line is not None and purchase_order_line.stock_item_id
                 else ""
             ),
-            inventory_item.barcode_snapshot if inventory_item is not None else "",
-            metadata.get("legacy_variant_barcode", ""),
         ]:
             normalized = str(raw_value or "").strip()
             if normalized and normalized not in candidate_values:
@@ -1184,31 +1165,11 @@ class StockDomainService:
                 if variant is not None:
                     return variant
 
-        return None
+            variant = queryset.filter(variant_sku=lookup).first()
+            if variant is not None:
+                return variant
 
-    @classmethod
-    def _resolve_product_variant_barcode(
-        cls,
-        *,
-        inventory_item: InventoryItem | None = None,
-        stock_item: StockItem | None = None,
-        purchase_order_line: PurchaseOrderLineItem | None = None,
-    ) -> str:
-        metadata = inventory_item.metadata if inventory_item and isinstance(inventory_item.metadata, dict) else {}
-        for raw_value in [
-            stock_item.product_variant if stock_item is not None else "",
-            (
-                purchase_order_line.stock_item.product_variant
-                if purchase_order_line is not None and purchase_order_line.stock_item_id
-                else ""
-            ),
-            inventory_item.barcode_snapshot if inventory_item is not None else "",
-            metadata.get("legacy_variant_barcode", ""),
-        ]:
-            barcode = str(raw_value or "").strip()
-            if barcode:
-                return barcode
-        return ""
+        return None
 
     @classmethod
     def _publish_inventory_availability_on_commit(cls, inventory_item_id) -> None:
@@ -1262,43 +1223,16 @@ class StockDomainService:
         if balance is not None:
             return balance
 
-        quantity_on_hand = Decimal("0")
-        if legacy_inventory is not None:
-            quantity_on_hand = cls._legacy_location_quantity(
-                inventory=legacy_inventory,
-                stock_location=stock_location,
-                inventory_item=inventory_item,
-                stock_lot=stock_lot,
-            )
-
         return StockBalance.objects.create(
             profile_id=profile_id,
             inventory_item=inventory_item,
             stock_location=stock_location,
             stock_lot=stock_lot,
-            quantity_on_hand=quantity_on_hand,
+            quantity_on_hand=Decimal("0"),
             quantity_reserved=Decimal("0"),
             created_by_user_id=actor_user_id,
             updated_by_user_id=actor_user_id,
         )
-
-    @classmethod
-    def _legacy_location_quantity(
-        cls,
-        *,
-        inventory: Inventory,
-        stock_location: StockLocation,
-        inventory_item: InventoryItem,
-        stock_lot: StockLot | None = None,
-    ) -> Decimal:
-        queryset = StockItem.objects.filter(
-            inventory=inventory,
-            location=stock_location,
-        )
-        if stock_lot and stock_lot.lot_number:
-            queryset = queryset.filter(batch=stock_lot.lot_number)
-        aggregate = queryset.aggregate(total=Sum("quantity"))
-        return _to_decimal(aggregate["total"] or 0)
 
     @classmethod
     def _create_receipt_serials(
@@ -1332,285 +1266,3 @@ class StockDomainService:
                 )
             )
         return stock_serials
-
-    @classmethod
-    def _ensure_receipt_legacy_stock_items(
-        cls,
-        *,
-        purchase_order: PurchaseOrder,
-        purchase_order_line: PurchaseOrderLineItem,
-        inventory: Inventory | None,
-        inventory_item: InventoryItem,
-        stock_location: StockLocation,
-        unit_cost,
-        quantity_received,
-        lot_number: str = "",
-        expiry_date=None,
-        stock_serials: list[StockSerial] | None = None,
-        actor_user_id=None,
-        notes: str = "",
-    ):
-        if inventory is None:
-            return []
-
-        stock_serials = stock_serials or []
-        resolved_variant_barcode = cls._resolve_product_variant_barcode(
-            inventory_item=inventory_item,
-            purchase_order_line=purchase_order_line,
-        )
-        if inventory_item.track_serial and stock_serials:
-            created_items: list[StockItem] = []
-            for stock_serial in stock_serials:
-                stock_item = StockItem.objects.filter(
-                    inventory=inventory,
-                    location=stock_location,
-                    inventory_item=inventory_item,
-                    serial=stock_serial.serial_number,
-                ).order_by("created_at").first()
-
-                if stock_item is None:
-                    stock_item = StockItem(
-                        inventory=inventory,
-                        inventory_item=inventory_item,
-                        location=stock_location,
-                        purchase_order=purchase_order,
-                        name=inventory.name,
-                        quantity=Decimal("0"),
-                        purchase_price=unit_cost,
-                        product_variant=resolved_variant_barcode or "",
-                        batch=lot_number or purchase_order_line.batch_number or None,
-                        expiry_date=expiry_date,
-                        serial=stock_serial.serial_number,
-                        notes=notes or f"Received serial {stock_serial.serial_number} against PO {purchase_order.reference}",
-                        created_by_user_id=actor_user_id,
-                    )
-                else:
-                    stock_item.inventory_item = inventory_item
-                    stock_item.location = stock_location
-                    stock_item.serial = stock_serial.serial_number
-                    if purchase_order and not stock_item.purchase_order_id:
-                        stock_item.purchase_order = purchase_order
-                    if lot_number and not stock_item.batch:
-                        stock_item.batch = lot_number
-                    if expiry_date and not stock_item.expiry_date:
-                        stock_item.expiry_date = expiry_date
-                    if unit_cost is not None:
-                        stock_item.purchase_price = unit_cost
-                    if resolved_variant_barcode and stock_item.product_variant != resolved_variant_barcode:
-                        stock_item.product_variant = resolved_variant_barcode
-
-                stock_item.quantity = Decimal("1")
-                stock_item.updated_by_user_id = actor_user_id
-                stock_item.save()
-
-                StockItemTracking.objects.create(
-                    inventory=inventory,
-                    item=stock_item,
-                    tracking_type=TrackingType.RECEIVED,
-                    notes=notes or f"Received serial {stock_serial.serial_number} from PO {purchase_order.reference}",
-                    performed_by_user_id=actor_user_id,
-                    deltas={
-                        "quantity_received": 1.0,
-                        "purchase_price": float(unit_cost),
-                        "purchase_order_id": str(purchase_order.id),
-                        "purchase_order_line_id": str(purchase_order_line.id),
-                        "serial_number": stock_serial.serial_number,
-                    },
-                )
-                created_items.append(stock_item)
-            return created_items
-
-        stock_item = purchase_order_line.stock_item
-        if stock_item is None:
-            queryset = StockItem.objects.filter(
-                inventory=inventory,
-                location=stock_location,
-            )
-            if inventory_item:
-                queryset = queryset.filter(inventory_item=inventory_item)
-            if lot_number:
-                queryset = queryset.filter(batch=lot_number)
-            stock_item = queryset.order_by("created_at").first()
-
-        if stock_item is None:
-            stock_item = StockItem(
-                inventory=inventory,
-                inventory_item=inventory_item,
-                location=stock_location,
-                purchase_order=purchase_order,
-                name=inventory.name,
-                quantity=Decimal("0"),
-                purchase_price=unit_cost,
-                product_variant=resolved_variant_barcode or "",
-                batch=lot_number or purchase_order_line.batch_number or None,
-                expiry_date=expiry_date,
-                notes=notes or f"Received against PO {purchase_order.reference}",
-                created_by_user_id=actor_user_id,
-            )
-        else:
-            stock_item.inventory_item = inventory_item
-            stock_item.location = stock_location
-            if purchase_order and not stock_item.purchase_order_id:
-                stock_item.purchase_order = purchase_order
-            if lot_number and not stock_item.batch:
-                stock_item.batch = lot_number
-            if expiry_date and not stock_item.expiry_date:
-                stock_item.expiry_date = expiry_date
-            if unit_cost is not None:
-                stock_item.purchase_price = unit_cost
-            if resolved_variant_barcode and stock_item.product_variant != resolved_variant_barcode:
-                stock_item.product_variant = resolved_variant_barcode
-
-        stock_item.quantity = _to_decimal(stock_item.quantity or 0) + _to_decimal(quantity_received)
-        stock_item.updated_by_user_id = actor_user_id
-        stock_item.save()
-
-        StockItemTracking.objects.create(
-            inventory=inventory,
-            item=stock_item,
-            tracking_type=TrackingType.RECEIVED,
-            notes=notes or f"Received {quantity_received} units from PO {purchase_order.reference}",
-            performed_by_user_id=actor_user_id,
-            deltas={
-                "quantity_received": float(quantity_received),
-                "purchase_price": float(unit_cost),
-                "purchase_order_id": str(purchase_order.id),
-                "purchase_order_line_id": str(purchase_order_line.id),
-            },
-        )
-
-        return [stock_item]
-
-    @classmethod
-    def _ensure_transfer_destination_stock_item(
-        cls,
-        *,
-        inventory: Inventory,
-        inventory_item: InventoryItem,
-        to_location: StockLocation,
-        quantity,
-        stock_lot: StockLot | None = None,
-        stock_serial: StockSerial | None = None,
-        source_stock_item: StockItem | None = None,
-        actor_user_id=None,
-    ):
-        queryset = StockItem.objects.filter(
-            inventory=inventory,
-            location=to_location,
-        )
-        if inventory_item:
-            queryset = queryset.filter(inventory_item=inventory_item)
-        batch_value = stock_lot.lot_number if stock_lot is not None else getattr(source_stock_item, 'batch', None)
-        if batch_value:
-            queryset = queryset.filter(batch=batch_value)
-        if stock_serial is not None:
-            queryset = queryset.filter(serial=stock_serial.serial_number)
-        destination_stock_item = queryset.order_by("created_at").first()
-
-        if destination_stock_item is None:
-            destination_stock_item = StockItem(
-                inventory=inventory,
-                inventory_item=inventory_item,
-                location=to_location,
-                purchase_order=getattr(source_stock_item, 'purchase_order', None),
-                name=source_stock_item.name if source_stock_item is not None else inventory_item.name_snapshot,
-                quantity=Decimal("0"),
-                purchase_price=(
-                    getattr(source_stock_item, 'purchase_price', None)
-                    if source_stock_item is not None
-                    else (stock_lot.unit_cost if stock_lot is not None else None)
-                ),
-                product_variant=(
-                    source_stock_item.product_variant
-                    if source_stock_item is not None
-                    else cls._resolve_product_variant_barcode(inventory_item=inventory_item)
-                ),
-                batch=batch_value,
-                expiry_date=(
-                    getattr(source_stock_item, 'expiry_date', None)
-                    if source_stock_item is not None
-                    else getattr(stock_lot, 'expiry_date', None)
-                ),
-                serial=stock_serial.serial_number if stock_serial else getattr(source_stock_item, 'serial', None),
-                notes=getattr(source_stock_item, 'notes', ''),
-                created_by_user_id=actor_user_id,
-            )
-        else:
-            destination_stock_item.inventory_item = inventory_item
-            if batch_value and not destination_stock_item.batch:
-                destination_stock_item.batch = batch_value
-            if stock_lot is not None and not destination_stock_item.expiry_date and stock_lot.expiry_date:
-                destination_stock_item.expiry_date = stock_lot.expiry_date
-            if (
-                source_stock_item is not None
-                and source_stock_item.product_variant
-                and destination_stock_item.product_variant != source_stock_item.product_variant
-            ):
-                destination_stock_item.product_variant = source_stock_item.product_variant
-
-        if stock_serial is not None:
-            destination_stock_item.quantity = Decimal("1")
-            destination_stock_item.serial = stock_serial.serial_number
-        else:
-            destination_stock_item.quantity = _to_decimal(destination_stock_item.quantity or 0) + quantity
-        destination_stock_item.updated_by_user_id = actor_user_id
-        destination_stock_item.save()
-        return destination_stock_item
-
-    @classmethod
-    def _ensure_adjustment_legacy_stock_item(
-        cls,
-        *,
-        inventory: Inventory,
-        inventory_item: InventoryItem,
-        stock_location: StockLocation,
-        quantity_change,
-        actor_user_id=None,
-    ):
-        stock_item = StockItem.objects.filter(
-            inventory=inventory,
-            location=stock_location,
-        ).order_by("created_at").first()
-
-        if stock_item is None and quantity_change < 0:
-            return None
-
-        if stock_item is None:
-            stock_item = StockItem(
-                inventory=inventory,
-                inventory_item=inventory_item,
-                location=stock_location,
-                name=inventory.name,
-                quantity=Decimal("0"),
-                product_variant=cls._resolve_product_variant_barcode(inventory_item=inventory_item),
-                created_by_user_id=actor_user_id,
-            )
-
-        stock_item.inventory_item = inventory_item
-        stock_item.quantity = _to_decimal(stock_item.quantity or 0) + quantity_change
-        stock_item.updated_by_user_id = actor_user_id
-        stock_item.save()
-        return stock_item
-
-    @classmethod
-    def _find_legacy_stock_item(
-        cls,
-        *,
-        inventory: Inventory | None,
-        inventory_item: InventoryItem,
-        stock_location: StockLocation,
-        stock_lot: StockLot | None = None,
-        stock_serial: StockSerial | None = None,
-    ):
-        if inventory is None:
-            return None
-        queryset = StockItem.objects.filter(
-            inventory=inventory,
-            location=stock_location,
-            inventory_item=inventory_item,
-        )
-        if stock_lot and stock_lot.lot_number:
-            queryset = queryset.filter(batch=stock_lot.lot_number)
-        if stock_serial is not None:
-            queryset = queryset.filter(serial=stock_serial.serial_number)
-        return queryset.order_by("created_at").first()

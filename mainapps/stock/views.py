@@ -3,7 +3,7 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 import uuid
 from django_filters.rest_framework import DjangoFilterBackend
-from django.db.models import F
+from django.db.models import F, Q
 from django.utils import timezone
 from datetime import timedelta
 from decimal import Decimal
@@ -45,6 +45,22 @@ from subapps.services.inventory_read_model import (
 from subapps.services.stock_domain import StockDomainError, StockDomainService
 from subapps.utils.request_context import get_request_profile_id, get_request_user_id, scope_queryset_by_identity
 
+
+def filter_inventory_items_for_legacy_inventory(queryset, legacy_inventory_id):
+    return queryset.filter(metadata__legacy_inventory_id=str(legacy_inventory_id))
+
+
+def filter_inventory_items_for_location(queryset, location_id):
+    return queryset.filter(stock_balances__stock_location_id=location_id).distinct()
+
+
+def filter_inventory_items_for_purchase_order(queryset, purchase_order_id):
+    return queryset.filter(purchase_order_lines__purchase_order_id=purchase_order_id).distinct()
+
+
+def filter_inventory_items_for_sales_order(queryset, sales_order_id):
+    return queryset.filter(sales_order_lines__sales_order_id=sales_order_id).distinct()
+
 class ReadStockLocationType(viewsets.ReadOnlyModelViewSet):
     serializer_class= StockLocationTypeSerializer
     queryset = StockLocationType.objects.all()
@@ -69,13 +85,6 @@ class StockLocationViewSet(BaseInventoryViewSet):
         location = self.get_object()
         inventory_item_ids = set(
             location.stock_balances.values_list('inventory_item_id', flat=True)
-        )
-        inventory_item_ids.update(
-            location.stock_items.exclude(inventory_item_id__isnull=True).values_list('inventory_item_id', flat=True)
-        )
-        inventory_item_ids.update(
-            InventoryItem.legacy_bridge_id(inventory_id)
-            for inventory_id in location.stock_items.filter(inventory_id__isnull=False).values_list('inventory_id', flat=True)
         )
         stock_items = InventoryItem.objects.filter(id__in=inventory_item_ids).order_by('-created_at')
         summary_map = get_inventory_item_summary_map(stock_items, stock_location=location)
@@ -136,14 +145,13 @@ class StockLocationViewSet(BaseInventoryViewSet):
                     canonical_field='inventory__profile_id',
                     legacy_field='inventory__profile',
                     value=get_request_profile_id(request, required=True, as_str=False),
-                ).select_related('inventory', 'inventory_item').first()
+                ).select_related('inventory').first()
                 if stock_item is None:
                     return Response(
                         {'error': 'Stock item not found in this location'},
                         status=status.HTTP_404_NOT_FOUND
                     )
-                inventory_item = stock_item.inventory_item
-                if inventory_item is None and (stock_lot_id or stock_serial_id or serial_number):
+                if stock_lot_id or stock_serial_id or serial_number:
                     inventory_item = StockDomainService.ensure_inventory_item(
                         stock_item=stock_item,
                         actor_user_id=get_request_user_id(request, as_str=False),
@@ -257,7 +265,7 @@ class BaseInventoryViewSetMixin(CachingMixin,PermissionRequiredMixin,viewsets.Mo
     
 
 class StockItemViewSet(BaseInventoryViewSetMixin):
-    """Compatibility stock API now backed by InventoryItem and stock balances."""
+    """Frontend-transition stock facade backed by InventoryItem and stock balances."""
     required_permission = UNIFIED_PERMISSION_DICT.get('stock_item')
     profile_scope_field = 'profile_id'
     legacy_profile_scope_field = 'profile'
@@ -292,19 +300,13 @@ class StockItemViewSet(BaseInventoryViewSetMixin):
         product_variant = self.request.query_params.get('product_variant')
 
         if inventory:
-            queryset = queryset.filter(
-                Q(id=InventoryItem.legacy_bridge_id(inventory)) |
-                Q(metadata__legacy_inventory_id=str(inventory))
-            )
+            queryset = filter_inventory_items_for_legacy_inventory(queryset, inventory)
         if location:
-            queryset = queryset.filter(
-                Q(stock_balances__stock_location_id=location) |
-                Q(legacy_stock_items__location_id=location)
-            ).distinct()
+            queryset = filter_inventory_items_for_location(queryset, location)
         if purchase_order:
-            queryset = queryset.filter(legacy_stock_items__purchase_order_id=purchase_order).distinct()
+            queryset = filter_inventory_items_for_purchase_order(queryset, purchase_order)
         if sales_order:
-            queryset = queryset.filter(legacy_stock_items__sales_order_id=sales_order).distinct()
+            queryset = filter_inventory_items_for_sales_order(queryset, sales_order)
         if product_variant:
             queryset = queryset.filter(
                 Q(barcode_snapshot=product_variant) |
@@ -333,33 +335,6 @@ class StockItemViewSet(BaseInventoryViewSetMixin):
             queryset = queryset.filter(id__in=matching_ids) if matching_ids else queryset.none()
 
         return queryset
-
-    def get_object(self):
-        queryset = self.filter_queryset(self.get_queryset())
-        lookup_value = self.kwargs.get(self.lookup_field or 'pk')
-        inventory_item = queryset.filter(id=lookup_value).first()
-        if inventory_item is not None:
-            self.check_object_permissions(self.request, inventory_item)
-            return inventory_item
-
-        legacy_stock_item = scope_queryset_by_identity(
-            StockItem.objects.filter(id=lookup_value).select_related('inventory', 'inventory_item'),
-            canonical_field='inventory__profile_id',
-            legacy_field='inventory__profile',
-            value=get_request_profile_id(self.request, required=True, as_str=False),
-        ).first()
-        if legacy_stock_item is None:
-            return super().get_object()
-
-        inventory_item = legacy_stock_item.inventory_item
-        if inventory_item is None and legacy_stock_item.inventory_id:
-            bridge_id = InventoryItem.legacy_bridge_id(legacy_stock_item.inventory_id)
-            inventory_item = queryset.filter(id=bridge_id).first()
-        if inventory_item is None:
-            return super().get_object()
-
-        self.check_object_permissions(self.request, inventory_item)
-        return inventory_item
 
     @action(detail=False, methods=['get'])
     def expiring_soon(self, request):
@@ -462,7 +437,7 @@ class StockItemViewSet(BaseInventoryViewSetMixin):
 
         defaults = {
             'name_snapshot': data.get('name') or variant.display_name or inventory.name,
-            'sku_snapshot': variant.variant_sku or inventory.external_system_id or '',
+            'sku_snapshot': variant.variant_sku or '',
             'barcode_snapshot': variant.variant_barcode or '',
             'description': inventory.description or '',
             'inventory_category': inventory.category,
@@ -528,10 +503,7 @@ class StockItemViewSet(BaseInventoryViewSetMixin):
                 {'error': 'Inventory not found'},
                 status=status.HTTP_404_NOT_FOUND
             )
-        stock_items = self.get_queryset().filter(
-            Q(id=InventoryItem.legacy_bridge_id(inventory.id)) |
-            Q(metadata__legacy_inventory_id=str(inventory.id))
-        )
+        stock_items = filter_inventory_items_for_legacy_inventory(self.get_queryset(), inventory.id)
         serializer = StockItemListSerializer(
             stock_items,
             many=True,
@@ -606,10 +578,7 @@ class StockReservationViewSet(BaseCachePermissionViewset):
 
         inventory_id = self.request.query_params.get('inventory')
         if inventory_id:
-            queryset = queryset.filter(
-                Q(inventory_item_id=InventoryItem.legacy_bridge_id(inventory_id)) |
-                Q(inventory_item__metadata__legacy_inventory_id=str(inventory_id))
-            )
+            queryset = queryset.filter(inventory_item__metadata__legacy_inventory_id=str(inventory_id))
         inventory_item_id = self.request.query_params.get('inventory_item')
         if inventory_item_id:
             queryset = queryset.filter(inventory_item_id=inventory_item_id)

@@ -409,8 +409,7 @@ class InventoryCategory(ProfileMixin, MPTTModel):
     
     name = models.CharField(
         max_length=200, 
-        unique=True, 
-        help_text='It must be unique', 
+        help_text='It must be unique within a tenant profile.', 
         verbose_name='Category name*'
     )
   
@@ -554,10 +553,6 @@ class InventoryItem(TenantStampedUUIDModel):
                 name='unique_inventory_item_profile_variant',
             ),
         ]
-
-    @staticmethod
-    def legacy_bridge_id(legacy_inventory_id):
-        return uuid.uuid5(uuid.NAMESPACE_URL, f"inventory-item:{legacy_inventory_id}")
 
     @property
     def display_name(self):
@@ -749,46 +744,19 @@ class Inventory(InventoryProperty):
             raise ValidationError("Lead time cannot be negative")
     @property
     def total_stock_value(self):
-        """Calculate total value of all stock for this inventory"""
-        from mainapps.stock.models import StockBalance
+        """Calculate total value of all stock for this inventory."""
+        from subapps.services.inventory_read_model import get_inventory_summary_map
 
-        bridge_id = InventoryItem.legacy_bridge_id(self.id)
-        balance_total = StockBalance.objects.filter(
-            inventory_item_id=bridge_id,
-            stock_lot__isnull=False,
-        ).aggregate(
-            total=models.Sum(
-                models.F('quantity_on_hand') * models.F('stock_lot__unit_cost'),
-                output_field=models.DecimalField(max_digits=20, decimal_places=5),
-            )
-        )['total']
-        if balance_total is not None:
-            return balance_total
-
-        return self.stock_items.aggregate(
-            total=models.Sum(
-                models.F('quantity') * models.F('purchase_price'),
-                output_field=models.DecimalField()
-            )
-        )['total'] or Decimal('0.00')
+        summary = get_inventory_summary_map([self]).get(self.id, {})
+        return summary.get('total_stock_value', Decimal('0.00'))
     
     @property
     def current_stock_level(self):
-        """Get current total stock across all locations"""
-        from mainapps.stock.models import StockBalance
+        """Get current total stock across all locations."""
+        from subapps.services.inventory_read_model import get_inventory_summary_map
 
-        bridge_id = InventoryItem.legacy_bridge_id(self.id)
-        balance_total = StockBalance.objects.filter(
-            inventory_item_id=bridge_id,
-        ).aggregate(
-            total=models.Sum('quantity_on_hand')
-        )['total']
-        if balance_total is not None:
-            return balance_total
-
-        return self.stock_items.aggregate(
-            total=models.Sum('quantity')
-        )['total'] or 0
+        summary = get_inventory_summary_map([self]).get(self.id, {})
+        return summary.get('current_stock_level', Decimal('0'))
     
     
 

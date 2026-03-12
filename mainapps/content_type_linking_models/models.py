@@ -17,6 +17,12 @@ def _coerce_identity_id(value):
         return None
 
 
+def _coerce_generic_object_id(value):
+    if value in (None, ""):
+        return ""
+    return str(value).strip()
+
+
 def _sync_identity_fields(instance, *, canonical_field, legacy_field):
     if not hasattr(instance, canonical_field) or not hasattr(instance, legacy_field):
         return
@@ -181,7 +187,9 @@ class GenericModel(models.Model):
         verbose_name='Content Type',
         help_text='The content type of the linked object.'
     )
-    object_id = models.PositiveIntegerField(
+    object_id = models.CharField(
+        max_length=64,
+        db_index=True,
         verbose_name='Object ID',
         help_text='The ID of the linked object.'
     )
@@ -202,6 +210,10 @@ class GenericModel(models.Model):
         """
         return f"Instance for {self.content_type.model} ({self.object_id})"
 
+    def save(self, *args, **kwargs):
+        self.object_id = _coerce_generic_object_id(self.object_id)
+        super().save(*args, **kwargs)
+
 def attachment_upload_path(instance, filename):
     return f'attachments/{instance.attachment.content_type.model}/{instance.attachment.object_id}/{instance.attachment.id}/{instance.id}/{filename}'
 
@@ -219,11 +231,11 @@ class ContentTypeLink(models.Model):
         - content_object_2 (GenericForeignKey): Generic relation to the related object for the second content type.
     """
     content_type_1 = models.ForeignKey(ContentType, on_delete=models.CASCADE, related_name='link_type_1')
-    object_id_1 = models.PositiveIntegerField()
+    object_id_1 = models.CharField(max_length=64, db_index=True)
     content_object_1 = GenericForeignKey('content_type_1', 'object_id_1')
 
     content_type_2 = models.ForeignKey(ContentType, on_delete=models.CASCADE, related_name='link_type_2')
-    object_id_2 = models.PositiveIntegerField()
+    object_id_2 = models.CharField(max_length=64, db_index=True)
     content_object_2 = GenericForeignKey('content_type_2', 'object_id_2')
 
     def __str__(self):
@@ -232,3 +244,8 @@ class ContentTypeLink(models.Model):
     class Meta:
         verbose_name = "Content Type Link"
         verbose_name_plural = "Content Type Links"
+
+    def save(self, *args, **kwargs):
+        self.object_id_1 = _coerce_generic_object_id(self.object_id_1)
+        self.object_id_2 = _coerce_generic_object_id(self.object_id_2)
+        super().save(*args, **kwargs)

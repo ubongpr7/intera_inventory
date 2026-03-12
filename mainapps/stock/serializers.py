@@ -23,7 +23,7 @@ class ProductImageMixin:
                 or obj.get('product_variant_id')
                 or ''
             )
-        for attribute in ('barcode_snapshot', 'product_variant'):
+        for attribute in ('barcode_snapshot',):
             value = getattr(obj, attribute, '')
             if value:
                 return value
