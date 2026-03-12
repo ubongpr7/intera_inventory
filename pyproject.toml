@@ -8,6 +8,7 @@ dependencies = [
     "boto3>=1.40.56",
     "celery>=5.5.3",
     "confluent-kafka>=2.13.2",
+    "dj-database-url>=3.1.2",
     "django>=5.2.7",
     "django-cities-light>=3.10.2",
     "django-cors-headers>=4.9.0",

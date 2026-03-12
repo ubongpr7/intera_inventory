@@ -1,0 +1,42 @@
+services:
+  kafka:
+    image: confluentinc/cp-kafka:7.8.3
+    container_name: ka2a-kafka-sasl
+    ports:
+      - "9094:9094"
+    env_file:
+      - .env
+    volumes:
+      - kafka_kraft_sasl:/var/lib/kafka/data
+      - ./init-jaas.sh:/init-jaas.sh:ro
+    command:
+      ["bash", "-lc", "bash /init-jaas.sh && source /etc/kafka/secrets/ka2a_env.sh && /etc/confluent/docker/run"]
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "bash",
+          "-lc",
+          "kafka-topics --bootstrap-server localhost:9092 --command-config /etc/kafka/secrets/admin.properties --list >/dev/null 2>&1",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  acl-init:
+    image: confluentinc/cp-kafka:7.8.3
+    container_name: ka2a-kafka-sasl-acl-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    env_file:
+      - .env
+    volumes:
+      - ./init-acls.sh:/init-acls.sh:ro
+      - ./init-jaas.sh:/init-jaas.sh:ro
+    command: ["bash", "-lc", "bash /init-jaas.sh && bash /init-acls.sh"]
+    restart: "no"
+
+volumes:
+  kafka_kraft_sasl:
+

@@ -5,6 +5,7 @@ from pathlib import Path
 
 from django.core.exceptions import ImproperlyConfigured
 from dotenv import load_dotenv
+import dj_database_url
 
 load_dotenv()
 
@@ -14,13 +15,66 @@ LOCAL_SERVER = os.getenv('LOCAL_SERVER', 'False')=='True'
 
 SECRET_KEY = os.getenv('SECRET_KEY')
 
-DEBUG = True
+if not SECRET_KEY:
+    raise ImproperlyConfigured("SECRET_KEY must be set.")
 
-ALLOWED_HOSTS = [
+DEBUG = os.getenv("DEBUG", "False") == "True"
+
+# Logging
+# Django's default logging config won't show `logger.info(...)` from our modules unless you
+# define `LOGGING`. This ensures Kafka consumers/producers log to stdout (Docker logs).
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+DJANGO_LOG_LEVEL = os.getenv("DJANGO_LOG_LEVEL", LOG_LEVEL).upper()
+KAFKA_LOG_LEVEL = os.getenv("KAFKA_LOG_LEVEL", LOG_LEVEL).upper()
+
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "console": {
+            "format": "%(asctime)s %(levelname)s %(name)s %(message)s",
+        },
+    },
+    "handlers": {
+        "console": {
+            "class": "logging.StreamHandler",
+            "formatter": "console",
+        },
+    },
+    "root": {
+        "handlers": ["console"],
+        "level": LOG_LEVEL,
+    },
+    "loggers": {
+        "django": {
+            "handlers": ["console"],
+            "level": DJANGO_LOG_LEVEL,
+            "propagate": False,
+        },
+        "django.server": {
+            "handlers": ["console"],
+            "level": DJANGO_LOG_LEVEL,
+            "propagate": False,
+        },
+        "subapps.kafka": {
+            "handlers": ["console"],
+            "level": KAFKA_LOG_LEVEL,
+            "propagate": False,
+        },
+    },
+}
+
+_default_allowed_hosts = [
     'localhost',
     '127.0.0.1',
     'dev.inventory.interaims.com',
 ]
+_allowed_hosts_env = os.getenv("ALLOWED_HOSTS", "").strip()
+ALLOWED_HOSTS = (
+    [host.strip() for host in _allowed_hosts_env.split(",") if host.strip()]
+    if _allowed_hosts_env
+    else _default_allowed_hosts
+)
 
 
 # ALLOWED_HOSTS = ['*']
@@ -107,16 +161,12 @@ if LOCAL_SERVER:
     }
 else:
     DATABASES = {
-        'default': {
-            'ENGINE': 'django.db.backends.postgresql',
-            'NAME': os.getenv('DB_NAME'),
-            'USER': os.getenv('DB_USER'),
-            'PASSWORD': os.getenv('DB_PASSWORD'),
-            'HOST': os.getenv('DB_HOST'),
-            'PORT': os.getenv('DB_PORT'),
-        }
+        'default': dj_database_url.config(
+            default=os.getenv('DATABASE_URL'),
+            conn_max_age=600,
+            conn_health_checks=True,
+        )
     }
-
 AUTH_PASSWORD_VALIDATORS = [
     {
         'NAME': 'django.contrib.auth.password_validation.UserAttributeSimilarityValidator',
@@ -141,18 +191,16 @@ AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
 # S3 Configuration
 AWS_STORAGE_BUCKET_NAME = os.getenv('AWS_STORAGE_BUCKET_NAME')
 AWS_S3_REGION_NAME = os.getenv('AWS_S3_REGION_NAME')
-AWS_S3_CUSTOM_DOMAIN = "%s.s3.amazonaws.com" % AWS_STORAGE_BUCKET_NAME
-AWS_S3_CONNECT_TIMEOUT = 10  
-AWS_S3_TIMEOUT = 60 
-AWS_S3_FILE_OVERWRITE = True
+if AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY and AWS_STORAGE_BUCKET_NAME and AWS_S3_REGION_NAME:
+    AWS_S3_CUSTOM_DOMAIN = "%s.s3.amazonaws.com" % AWS_STORAGE_BUCKET_NAME
+    AWS_S3_CONNECT_TIMEOUT = 10
+    AWS_S3_TIMEOUT = 60
+    AWS_S3_FILE_OVERWRITE = True
 
-
-
-
-STORAGES = {
-        "default": {"BACKEND": "storages.backends.s3boto3.S3Boto3Storage"},
-        "staticfiles": {"BACKEND": "storages.backends.s3boto3.S3Boto3Storage"},
-}
+    STORAGES = {
+            "default": {"BACKEND": "storages.backends.s3boto3.S3Boto3Storage"},
+            "staticfiles": {"BACKEND": "storages.backends.s3boto3.S3Boto3Storage"},
+    }
 
 # Internationalization
 # https://docs.djangoproject.com/en/5.0/topics/i18n/
@@ -178,13 +226,13 @@ MEDIA_URL = '/media/'
 MEDIAFILES_DIRS=[os.path.join(BASE_DIR,'media')]
 MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
 
-EMAIL_BACKEND = 'django_smtp_ssl.SSLEmailBackend'
-EMAIL_HOST = 'smtp.gmail.com'
+EMAIL_BACKEND = os.getenv("EMAIL_BACKEND", "django_smtp_ssl.SSLEmailBackend")
+EMAIL_HOST = os.getenv("EMAIL_HOST", "smtp.gmail.com")
 EMAIL_PORT = 465  
 EMAIL_USE_SSL = True
 EMAIL_USE_TLS = False
-EMAIL_HOST_USER = "ubongpr7@gmail.com"
-EMAIL_HOST_PASSWORD = "nmcmiwlgwdrwesef"
+EMAIL_HOST_USER = os.getenv("EMAIL_HOST_USER")
+EMAIL_HOST_PASSWORD = os.getenv("EMAIL_HOST_PASSWORD")
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
     
@@ -258,9 +306,10 @@ SIMPLE_JWT = {
     'ALGORITHM': JWT_ALGORITHM,
     'SIGNING_KEY': None,
     'VERIFYING_KEY': JWT_VERIFYING_KEY,
-    'AUDIENCE': os.getenv("JWT_AUDIENCE"),
-    'ISSUER': os.getenv("JWT_ISSUER"),
-    'JWK_URL': os.getenv("JWT_JWK_URL"),
+    # Treat empty strings as unset so we don't enforce/emit `aud`/`iss` with "".
+    'AUDIENCE': os.getenv("JWT_AUDIENCE") or None,
+    'ISSUER': os.getenv("JWT_ISSUER") or None,
+    'JWK_URL': os.getenv("JWT_JWK_URL") or None,
     'LEEWAY': 0,
 
     'AUTH_HEADER_TYPES': ('Bearer',),
@@ -333,16 +382,25 @@ CORS_ALLOWED_ORIGINS = [
     'https://www.interaims.com',
     ]
 
-SECURE_SSL_REDIRECT = os.getenv('SECURE_SSL_REDIRECT', 'False')=='True'
+# Security / HTTPS.
+# For local development (`DEBUG=True` or `LOCAL_SERVER=True`), force these off to avoid
+# confusing localhost HTTPS redirects and missing cookies.
+SECURE_SSL_REDIRECT = os.getenv("SECURE_SSL_REDIRECT", "False") == "True"
 
 SECURE_PROXY_SSL_HEADER = (
-    ('HTTP_X_FORWARDED_PROTO', 'https')
-    if os.getenv('SECURE_PROXY_SSL_HEADER_ENABLED', 'False') == 'True'
+    ("HTTP_X_FORWARDED_PROTO", "https")
+    if os.getenv("SECURE_PROXY_SSL_HEADER_ENABLED", "False") == "True"
     else None
 )
-SESSION_COOKIE_SECURE = os.getenv('SESSION_COOKIE_SECURE', 'True')=='True'
 
-CSRF_COOKIE_SECURE = os.getenv('CSRF_COOKIE_SECURE', 'True')=='True'
+SESSION_COOKIE_SECURE = os.getenv("SESSION_COOKIE_SECURE", "False") == "True"
+CSRF_COOKIE_SECURE = os.getenv("CSRF_COOKIE_SECURE", "False") == "True"
+
+if DEBUG or LOCAL_SERVER:
+    SECURE_SSL_REDIRECT = False
+    SECURE_PROXY_SSL_HEADER = None
+    SESSION_COOKIE_SECURE = False
+    CSRF_COOKIE_SECURE = False
 FILE_UPLOAD_TIMEOUT = 3600
 DATA_UPLOAD_MAX_MEMORY_SIZE = 2147483648  # 2GB
 FILE_UPLOAD_MAX_MEMORY_SIZE = 2147483648  # 2GB
