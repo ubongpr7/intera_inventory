@@ -45,6 +45,24 @@ services:
       - .:/app
       - venv:/app/.venv
     restart: unless-stopped
+  inventory_mcp:
+    build:
+      context: .
+    container_name: inventory-mcp
+    env_file:
+      - .env
+    command: >
+      sh -c "
+        uv run python -m mcp_server.server
+      "
+    volumes:
+      - .:/app
+      - venv:/app/.venv
+    ports:
+      - "7020:8000"
+    depends_on:
+      - web
+    restart: unless-stopped
 
 volumes:
   venv:
