@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import os
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
@@ -7,6 +8,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
+from urllib.parse import urlencode
 
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "core.settings")
 
@@ -20,6 +22,7 @@ if not apps.ready:
 from django.db.models import Q, QuerySet
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
+from rest_framework.test import APIRequestFactory
 from rest_framework_simplejwt.tokens import UntypedToken
 from starlette.applications import Starlette
 from starlette.datastructures import Headers
@@ -29,7 +32,9 @@ from starlette.routing import Mount, Route
 import uvicorn
 
 from mainapps.inventory.models import Inventory, InventoryItem
+from mainapps.inventory.views import InventoryCategoryViewSet, InventoryViewSet
 from mainapps.stock.models import StockLocation, StockMovement, StockReservation, StockSerial, StockLot
+from mainapps.stock.views import StockItemViewSet, StockLocationViewSet, StockReservationViewSet
 from subapps.services.inventory_read_model import (
     get_inventory_item_summary_map,
     get_inventory_summary_map,
@@ -701,6 +706,554 @@ def _get_stock_analytics_sync(*, principal: InventoryMcpPrincipal) -> dict[str, 
     }
 
 
+def _invoke_view_action_sync(
+    *,
+    principal: InventoryMcpPrincipal,
+    viewset_cls,
+    action: str,
+    method: str,
+    pk: str | None = None,
+    data: dict[str, Any] | None = None,
+    query_params: dict[str, Any] | None = None,
+) -> Any:
+    factory = APIRequestFactory()
+    http_method = method.lower().strip()
+    path = "/mcp/internal"
+    if query_params:
+        encoded_query = urlencode(
+            {key: value for key, value in query_params.items() if value not in (None, "")},
+            doseq=True,
+        )
+        if encoded_query:
+            path = f"{path}?{encoded_query}"
+    auth_header = f"Bearer {principal.token}"
+
+    if http_method == "get":
+        request = factory.get(path, data=query_params or {}, format="json", HTTP_AUTHORIZATION=auth_header)
+    elif http_method == "post":
+        request = factory.post(path, data=data or {}, format="json", HTTP_AUTHORIZATION=auth_header)
+    elif http_method == "patch":
+        request = factory.patch(path, data=data or {}, format="json", HTTP_AUTHORIZATION=auth_header)
+    elif http_method == "put":
+        request = factory.put(path, data=data or {}, format="json", HTTP_AUTHORIZATION=auth_header)
+    elif http_method == "delete":
+        request = factory.delete(path, data=data or {}, format="json", HTTP_AUTHORIZATION=auth_header)
+    else:
+        raise ValueError(f"Unsupported method: {method}")
+
+    view = viewset_cls.as_view({http_method: action})
+    response = view(request, pk=pk) if pk is not None else view(request)
+    status_code = getattr(response, "status_code", 200)
+    payload = getattr(response, "data", None)
+    if payload is None:
+        content = None
+        if hasattr(response, "getvalue"):
+            try:
+                content = response.getvalue()
+            except Exception:
+                content = None
+        if content is None and hasattr(response, "streaming_content"):
+            try:
+                content = b"".join(response.streaming_content)
+            except Exception:
+                content = None
+        if content is None and hasattr(response, "content"):
+            try:
+                content = response.content
+            except Exception:
+                content = None
+        if content is not None:
+            filename = ""
+            if hasattr(response, "headers"):
+                disposition = response.headers.get("Content-Disposition", "")
+                if "filename=" in disposition:
+                    filename = disposition.split("filename=", 1)[1].strip('"')
+            payload = {
+                "content_type": getattr(response, "headers", {}).get("Content-Type", "application/octet-stream")
+                if hasattr(response, "headers")
+                else "application/octet-stream",
+                "filename": filename or None,
+                "size": len(content),
+                "base64": base64.b64encode(content).decode("ascii"),
+            }
+    payload = _to_json_compatible(payload)
+    if status_code >= 400:
+        detail = payload if payload is not None else {"detail": "Request failed."}
+        raise ValueError(str(detail))
+    return payload
+
+
+def _search_purchase_orders_sync(
+    *,
+    principal: InventoryMcpPrincipal,
+    query: str | None,
+    status: str | None,
+    limit: int,
+) -> dict[str, Any]:
+    from mainapps.orders.views import PurchaseOrderViewSet
+
+    payload = _invoke_view_action_sync(
+        principal=principal,
+        viewset_cls=PurchaseOrderViewSet,
+        action="list",
+        method="get",
+        query_params={
+            "search": str(query or "").strip(),
+            "status": status or "",
+            "page_size": limit,
+        },
+    )
+    return {
+        "profile_id": principal.profile_id,
+        "query": str(query or "").strip() or None,
+        "status": status,
+        "results": payload,
+    }
+
+
+def _get_purchase_order_details_sync(*, principal: InventoryMcpPrincipal, purchase_order_id: str) -> dict[str, Any]:
+    from mainapps.orders.views import PurchaseOrderViewSet
+
+    payload = _invoke_view_action_sync(
+        principal=principal,
+        viewset_cls=PurchaseOrderViewSet,
+        action="retrieve",
+        method="get",
+        pk=purchase_order_id,
+    )
+    return {
+        "profile_id": principal.profile_id,
+        "purchase_order": payload,
+    }
+
+
+def _get_purchase_order_analytics_sync(*, principal: InventoryMcpPrincipal) -> dict[str, Any]:
+    from mainapps.orders.views import PurchaseOrderViewSet
+
+    payload = _invoke_view_action_sync(
+        principal=principal,
+        viewset_cls=PurchaseOrderViewSet,
+        action="analytics",
+        method="get",
+    )
+    return {
+        "profile_id": principal.profile_id,
+        "analytics": payload,
+    }
+
+
+def _purchase_order_action_sync(
+    *,
+    principal: InventoryMcpPrincipal,
+    purchase_order_id: str,
+    action: str,
+    method: str = "patch",
+    data: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    from mainapps.orders.views import PurchaseOrderViewSet
+
+    payload = _invoke_view_action_sync(
+        principal=principal,
+        viewset_cls=PurchaseOrderViewSet,
+        action=action,
+        method=method,
+        pk=purchase_order_id,
+        data=data,
+    )
+    return {
+        "profile_id": principal.profile_id,
+        "purchase_order": payload,
+    }
+
+
+def _search_sales_orders_sync(
+    *,
+    principal: InventoryMcpPrincipal,
+    query: str | None,
+    status: str | None,
+    limit: int,
+) -> dict[str, Any]:
+    from mainapps.orders.views import SalesOrderViewSet
+
+    payload = _invoke_view_action_sync(
+        principal=principal,
+        viewset_cls=SalesOrderViewSet,
+        action="list",
+        method="get",
+        query_params={
+            "search": str(query or "").strip(),
+            "status": status or "",
+            "page_size": limit,
+        },
+    )
+    return {
+        "profile_id": principal.profile_id,
+        "query": str(query or "").strip() or None,
+        "status": status,
+        "results": payload,
+    }
+
+
+def _get_sales_order_details_sync(*, principal: InventoryMcpPrincipal, sales_order_id: str) -> dict[str, Any]:
+    from mainapps.orders.views import SalesOrderViewSet
+
+    payload = _invoke_view_action_sync(
+        principal=principal,
+        viewset_cls=SalesOrderViewSet,
+        action="retrieve",
+        method="get",
+        pk=sales_order_id,
+    )
+    return {
+        "profile_id": principal.profile_id,
+        "sales_order": payload,
+    }
+
+
+def _sales_order_action_sync(
+    *,
+    principal: InventoryMcpPrincipal,
+    sales_order_id: str,
+    action: str,
+    method: str = "post",
+    data: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    from mainapps.orders.views import SalesOrderViewSet
+
+    payload = _invoke_view_action_sync(
+        principal=principal,
+        viewset_cls=SalesOrderViewSet,
+        action=action,
+        method=method,
+        pk=sales_order_id,
+        data=data,
+    )
+    return {
+        "profile_id": principal.profile_id,
+        "sales_order": payload,
+    }
+
+
+def _search_return_orders_sync(
+    *,
+    principal: InventoryMcpPrincipal,
+    query: str | None,
+    status: str | None,
+    limit: int,
+) -> dict[str, Any]:
+    from mainapps.orders.views import ReturnOrderViewSet
+
+    payload = _invoke_view_action_sync(
+        principal=principal,
+        viewset_cls=ReturnOrderViewSet,
+        action="list",
+        method="get",
+        query_params={
+            "search": str(query or "").strip(),
+            "status": status or "",
+            "page_size": limit,
+        },
+    )
+    return {
+        "profile_id": principal.profile_id,
+        "query": str(query or "").strip() or None,
+        "status": status,
+        "results": payload,
+    }
+
+
+def _get_return_order_details_sync(*, principal: InventoryMcpPrincipal, return_order_id: str) -> dict[str, Any]:
+    from mainapps.orders.views import ReturnOrderViewSet
+
+    payload = _invoke_view_action_sync(
+        principal=principal,
+        viewset_cls=ReturnOrderViewSet,
+        action="retrieve",
+        method="get",
+        pk=return_order_id,
+    )
+    return {
+        "profile_id": principal.profile_id,
+        "return_order": payload,
+    }
+
+
+def _return_order_action_sync(
+    *,
+    principal: InventoryMcpPrincipal,
+    return_order_id: str,
+    action: str,
+    data: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    from mainapps.orders.views import ReturnOrderViewSet
+
+    payload = _invoke_view_action_sync(
+        principal=principal,
+        viewset_cls=ReturnOrderViewSet,
+        action=action,
+        method="post",
+        pk=return_order_id,
+        data=data,
+    )
+    return {
+        "profile_id": principal.profile_id,
+        "return_order": payload,
+    }
+
+
+def _adjust_inventory_stock_via_view_sync(
+    *,
+    principal: InventoryMcpPrincipal,
+    inventory_id: str,
+    data: dict[str, Any],
+) -> dict[str, Any]:
+    payload = _invoke_view_action_sync(
+        principal=principal,
+        viewset_cls=InventoryViewSet,
+        action="adjust_stock",
+        method="post",
+        pk=inventory_id,
+        data=data,
+    )
+    return {
+        "profile_id": principal.profile_id,
+        "inventory_adjustment": payload,
+    }
+
+
+def _transfer_stock_via_view_sync(
+    *,
+    principal: InventoryMcpPrincipal,
+    location_id: str,
+    data: dict[str, Any],
+) -> dict[str, Any]:
+    payload = _invoke_view_action_sync(
+        principal=principal,
+        viewset_cls=StockLocationViewSet,
+        action="transfer_stock",
+        method="post",
+        pk=location_id,
+        data=data,
+    )
+    return {
+        "profile_id": principal.profile_id,
+        "stock_transfer": payload,
+    }
+
+
+def _create_stock_reservation_via_view_sync(
+    *,
+    principal: InventoryMcpPrincipal,
+    data: dict[str, Any],
+) -> dict[str, Any]:
+    payload = _invoke_view_action_sync(
+        principal=principal,
+        viewset_cls=StockReservationViewSet,
+        action="create",
+        method="post",
+        data=data,
+    )
+    return {
+        "profile_id": principal.profile_id,
+        "reservation": payload,
+    }
+
+
+def _reservation_action_via_view_sync(
+    *,
+    principal: InventoryMcpPrincipal,
+    reservation_id: str,
+    action: str,
+    data: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    payload = _invoke_view_action_sync(
+        principal=principal,
+        viewset_cls=StockReservationViewSet,
+        action=action,
+        method="post",
+        pk=reservation_id,
+        data=data,
+    )
+    return {
+        "profile_id": principal.profile_id,
+        "reservation": payload,
+    }
+
+
+def _inventory_category_action_sync(
+    *,
+    principal: InventoryMcpPrincipal,
+    action: str,
+    method: str,
+    category_id: str | None = None,
+    data: dict[str, Any] | None = None,
+    query_params: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    payload = _invoke_view_action_sync(
+        principal=principal,
+        viewset_cls=InventoryCategoryViewSet,
+        action=action,
+        method=method,
+        pk=category_id,
+        data=data,
+        query_params=query_params,
+    )
+    return {
+        "profile_id": principal.profile_id,
+        "category": payload,
+    }
+
+
+def _inventory_crud_action_sync(
+    *,
+    principal: InventoryMcpPrincipal,
+    action: str,
+    method: str,
+    inventory_id: str | None = None,
+    data: dict[str, Any] | None = None,
+    query_params: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    payload = _invoke_view_action_sync(
+        principal=principal,
+        viewset_cls=InventoryViewSet,
+        action=action,
+        method=method,
+        pk=inventory_id,
+        data=data,
+        query_params=query_params,
+    )
+    return {
+        "profile_id": principal.profile_id,
+        "inventory": payload,
+    }
+
+
+def _stock_location_action_sync(
+    *,
+    principal: InventoryMcpPrincipal,
+    action: str,
+    method: str,
+    location_id: str | None = None,
+    data: dict[str, Any] | None = None,
+    query_params: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    payload = _invoke_view_action_sync(
+        principal=principal,
+        viewset_cls=StockLocationViewSet,
+        action=action,
+        method=method,
+        pk=location_id,
+        data=data,
+        query_params=query_params,
+    )
+    return {
+        "profile_id": principal.profile_id,
+        "location": payload,
+    }
+
+
+def _stock_item_action_sync(
+    *,
+    principal: InventoryMcpPrincipal,
+    action: str,
+    method: str,
+    inventory_item_id: str | None = None,
+    data: dict[str, Any] | None = None,
+    query_params: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    payload = _invoke_view_action_sync(
+        principal=principal,
+        viewset_cls=StockItemViewSet,
+        action=action,
+        method=method,
+        pk=inventory_item_id,
+        data=data,
+        query_params=query_params,
+    )
+    return {
+        "profile_id": principal.profile_id,
+        "inventory_item": payload,
+    }
+
+
+def _purchase_order_line_item_action_sync(
+    *,
+    principal: InventoryMcpPrincipal,
+    purchase_order_id: str,
+    action: str,
+    method: str,
+    data: dict[str, Any] | None = None,
+    query_params: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    from mainapps.orders.views import PurchaseOrderViewSet
+
+    payload = _invoke_view_action_sync(
+        principal=principal,
+        viewset_cls=PurchaseOrderViewSet,
+        action=action,
+        method=method,
+        pk=purchase_order_id,
+        data=data,
+        query_params=query_params,
+    )
+    return {
+        "profile_id": principal.profile_id,
+        "purchase_order": payload,
+    }
+
+
+def _sales_order_line_item_action_sync(
+    *,
+    principal: InventoryMcpPrincipal,
+    sales_order_id: str,
+    action: str,
+    method: str,
+    data: dict[str, Any] | None = None,
+    query_params: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    from mainapps.orders.views import SalesOrderViewSet
+
+    payload = _invoke_view_action_sync(
+        principal=principal,
+        viewset_cls=SalesOrderViewSet,
+        action=action,
+        method=method,
+        pk=sales_order_id,
+        data=data,
+        query_params=query_params,
+    )
+    return {
+        "profile_id": principal.profile_id,
+        "sales_order": payload,
+    }
+
+
+def _purchase_order_admin_action_sync(
+    *,
+    principal: InventoryMcpPrincipal,
+    action: str,
+    method: str,
+    purchase_order_id: str | None = None,
+    data: dict[str, Any] | None = None,
+    query_params: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    from mainapps.orders.views import PurchaseOrderViewSet
+
+    payload = _invoke_view_action_sync(
+        principal=principal,
+        viewset_cls=PurchaseOrderViewSet,
+        action=action,
+        method=method,
+        pk=purchase_order_id,
+        data=data,
+        query_params=query_params,
+    )
+    return {
+        "profile_id": principal.profile_id,
+        "purchase_order": payload,
+    }
+
+
 def _build_transport_security_settings() -> TransportSecuritySettings:
     allowed_hosts = ["127.0.0.1:*", "localhost:*", "[::1]:*"]
     allowed_hosts.extend(_parse_csv(os.getenv("INVENTORY_MCP_ALLOWED_HOSTS") or os.getenv("ALLOWED_HOSTS")))
@@ -924,6 +1477,964 @@ async def search_stock_movements(
 async def get_stock_analytics() -> dict[str, Any]:
     principal = get_current_principal(required=True)
     return await sync_to_async(_get_stock_analytics_sync, thread_sensitive=True)(principal=principal)
+
+
+@mcp.tool(
+    name="search_purchase_orders",
+    description="Search purchase orders for the authenticated workspace by reference, supplier, or status.",
+)
+async def search_purchase_orders(
+    query: str | None = None,
+    status: str | None = None,
+    limit: int = 10,
+) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    limit_value = max(1, min(int(limit), 50))
+    return await sync_to_async(_search_purchase_orders_sync, thread_sensitive=True)(
+        principal=principal,
+        query=query,
+        status=status,
+        limit=limit_value,
+    )
+
+
+@mcp.tool(
+    name="get_purchase_order_details",
+    description="Get a single purchase order with the backend's canonical detail payload.",
+)
+async def get_purchase_order_details(purchase_order_id: str) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    target_id = str(purchase_order_id or "").strip()
+    if not target_id:
+        raise ValueError("purchase_order_id is required")
+    return await sync_to_async(_get_purchase_order_details_sync, thread_sensitive=True)(
+        principal=principal,
+        purchase_order_id=target_id,
+    )
+
+
+@mcp.tool(
+    name="get_purchase_order_analytics",
+    description="Get purchase-order analytics for the authenticated workspace.",
+)
+async def get_purchase_order_analytics() -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    return await sync_to_async(_get_purchase_order_analytics_sync, thread_sensitive=True)(
+        principal=principal,
+    )
+
+
+@mcp.tool(
+    name="approve_purchase_order",
+    description="Approve a purchase order. Optional payload may include notes or approval metadata expected by the backend.",
+)
+async def approve_purchase_order(
+    purchase_order_id: str,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    target_id = str(purchase_order_id or "").strip()
+    if not target_id:
+        raise ValueError("purchase_order_id is required")
+    return await sync_to_async(_purchase_order_action_sync, thread_sensitive=True)(
+        principal=principal,
+        purchase_order_id=target_id,
+        action="approve",
+        data=payload,
+    )
+
+
+@mcp.tool(
+    name="issue_purchase_order",
+    description="Issue a purchase order to the supplier. Payload may include notes or workflow data required by the backend.",
+)
+async def issue_purchase_order(
+    purchase_order_id: str,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    target_id = str(purchase_order_id or "").strip()
+    if not target_id:
+        raise ValueError("purchase_order_id is required")
+    return await sync_to_async(_purchase_order_action_sync, thread_sensitive=True)(
+        principal=principal,
+        purchase_order_id=target_id,
+        action="issue",
+        data=payload,
+    )
+
+
+@mcp.tool(
+    name="receive_purchase_order_items",
+    description="Receive specific items on a purchase order. Payload should match the backend receive_items action schema.",
+)
+async def receive_purchase_order_items(
+    purchase_order_id: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    target_id = str(purchase_order_id or "").strip()
+    if not target_id:
+        raise ValueError("purchase_order_id is required")
+    if not payload:
+        raise ValueError("payload is required")
+    return await sync_to_async(_purchase_order_action_sync, thread_sensitive=True)(
+        principal=principal,
+        purchase_order_id=target_id,
+        action="receive_items",
+        data=payload,
+    )
+
+
+@mcp.tool(
+    name="complete_purchase_order",
+    description="Mark a purchase order as complete.",
+)
+async def complete_purchase_order(
+    purchase_order_id: str,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    target_id = str(purchase_order_id or "").strip()
+    if not target_id:
+        raise ValueError("purchase_order_id is required")
+    return await sync_to_async(_purchase_order_action_sync, thread_sensitive=True)(
+        principal=principal,
+        purchase_order_id=target_id,
+        action="complete",
+        data=payload,
+    )
+
+
+@mcp.tool(
+    name="cancel_purchase_order",
+    description="Cancel a purchase order. Payload can include notes or a cancellation reason.",
+)
+async def cancel_purchase_order(
+    purchase_order_id: str,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    target_id = str(purchase_order_id or "").strip()
+    if not target_id:
+        raise ValueError("purchase_order_id is required")
+    return await sync_to_async(_purchase_order_action_sync, thread_sensitive=True)(
+        principal=principal,
+        purchase_order_id=target_id,
+        action="cancel",
+        data=payload,
+    )
+
+
+@mcp.tool(
+    name="create_purchase_return_order",
+    description="Create a return order from a purchase order. Payload can include reason, items, and notes expected by the backend.",
+)
+async def create_purchase_return_order(
+    purchase_order_id: str,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    target_id = str(purchase_order_id or "").strip()
+    if not target_id:
+        raise ValueError("purchase_order_id is required")
+    return await sync_to_async(_purchase_order_action_sync, thread_sensitive=True)(
+        principal=principal,
+        purchase_order_id=target_id,
+        action="create_return_order",
+        method="post",
+        data=payload,
+    )
+
+
+@mcp.tool(
+    name="search_sales_orders",
+    description="Search sales orders for the authenticated workspace by reference, customer, or status.",
+)
+async def search_sales_orders(
+    query: str | None = None,
+    status: str | None = None,
+    limit: int = 10,
+) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    limit_value = max(1, min(int(limit), 50))
+    return await sync_to_async(_search_sales_orders_sync, thread_sensitive=True)(
+        principal=principal,
+        query=query,
+        status=status,
+        limit=limit_value,
+    )
+
+
+@mcp.tool(
+    name="get_sales_order_details",
+    description="Get a single sales order with the backend's canonical detail payload.",
+)
+async def get_sales_order_details(sales_order_id: str) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    target_id = str(sales_order_id or "").strip()
+    if not target_id:
+        raise ValueError("sales_order_id is required")
+    return await sync_to_async(_get_sales_order_details_sync, thread_sensitive=True)(
+        principal=principal,
+        sales_order_id=target_id,
+    )
+
+
+@mcp.tool(
+    name="reserve_sales_order",
+    description="Request stock reservation for a sales order. Payload should match the backend reserve action schema.",
+)
+async def reserve_sales_order(
+    sales_order_id: str,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    target_id = str(sales_order_id or "").strip()
+    if not target_id:
+        raise ValueError("sales_order_id is required")
+    return await sync_to_async(_sales_order_action_sync, thread_sensitive=True)(
+        principal=principal,
+        sales_order_id=target_id,
+        action="reserve",
+        data=payload,
+    )
+
+
+@mcp.tool(
+    name="release_sales_order",
+    description="Release stock reservation for a sales order.",
+)
+async def release_sales_order(
+    sales_order_id: str,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    target_id = str(sales_order_id or "").strip()
+    if not target_id:
+        raise ValueError("sales_order_id is required")
+    return await sync_to_async(_sales_order_action_sync, thread_sensitive=True)(
+        principal=principal,
+        sales_order_id=target_id,
+        action="release",
+        data=payload,
+    )
+
+
+@mcp.tool(
+    name="ship_sales_order",
+    description="Ship a sales order. Payload should match the backend ship action schema.",
+)
+async def ship_sales_order(
+    sales_order_id: str,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    target_id = str(sales_order_id or "").strip()
+    if not target_id:
+        raise ValueError("sales_order_id is required")
+    return await sync_to_async(_sales_order_action_sync, thread_sensitive=True)(
+        principal=principal,
+        sales_order_id=target_id,
+        action="ship",
+        data=payload,
+    )
+
+
+@mcp.tool(
+    name="complete_sales_order",
+    description="Mark a sales order as complete.",
+)
+async def complete_sales_order(
+    sales_order_id: str,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    target_id = str(sales_order_id or "").strip()
+    if not target_id:
+        raise ValueError("sales_order_id is required")
+    return await sync_to_async(_sales_order_action_sync, thread_sensitive=True)(
+        principal=principal,
+        sales_order_id=target_id,
+        action="complete",
+        data=payload,
+    )
+
+
+@mcp.tool(
+    name="cancel_sales_order",
+    description="Cancel a sales order. Payload can include notes or a cancellation reason.",
+)
+async def cancel_sales_order(
+    sales_order_id: str,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    target_id = str(sales_order_id or "").strip()
+    if not target_id:
+        raise ValueError("sales_order_id is required")
+    return await sync_to_async(_sales_order_action_sync, thread_sensitive=True)(
+        principal=principal,
+        sales_order_id=target_id,
+        action="cancel",
+        data=payload,
+    )
+
+
+@mcp.tool(
+    name="search_return_orders",
+    description="Search return orders for the authenticated workspace.",
+)
+async def search_return_orders(
+    query: str | None = None,
+    status: str | None = None,
+    limit: int = 10,
+) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    limit_value = max(1, min(int(limit), 50))
+    return await sync_to_async(_search_return_orders_sync, thread_sensitive=True)(
+        principal=principal,
+        query=query,
+        status=status,
+        limit=limit_value,
+    )
+
+
+@mcp.tool(
+    name="get_return_order_details",
+    description="Get a single return order with the backend's canonical detail payload.",
+)
+async def get_return_order_details(return_order_id: str) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    target_id = str(return_order_id or "").strip()
+    if not target_id:
+        raise ValueError("return_order_id is required")
+    return await sync_to_async(_get_return_order_details_sync, thread_sensitive=True)(
+        principal=principal,
+        return_order_id=target_id,
+    )
+
+
+@mcp.tool(
+    name="dispatch_return_order",
+    description="Dispatch a return order.",
+)
+async def dispatch_return_order(
+    return_order_id: str,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    target_id = str(return_order_id or "").strip()
+    if not target_id:
+        raise ValueError("return_order_id is required")
+    return await sync_to_async(_return_order_action_sync, thread_sensitive=True)(
+        principal=principal,
+        return_order_id=target_id,
+        action="dispatch",
+        data=payload,
+    )
+
+
+@mcp.tool(
+    name="complete_return_order",
+    description="Complete a return order.",
+)
+async def complete_return_order(
+    return_order_id: str,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    target_id = str(return_order_id or "").strip()
+    if not target_id:
+        raise ValueError("return_order_id is required")
+    return await sync_to_async(_return_order_action_sync, thread_sensitive=True)(
+        principal=principal,
+        return_order_id=target_id,
+        action="complete",
+        data=payload,
+    )
+
+
+@mcp.tool(
+    name="cancel_return_order",
+    description="Cancel a return order. Payload can include notes or a cancellation reason.",
+)
+async def cancel_return_order(
+    return_order_id: str,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    target_id = str(return_order_id or "").strip()
+    if not target_id:
+        raise ValueError("return_order_id is required")
+    return await sync_to_async(_return_order_action_sync, thread_sensitive=True)(
+        principal=principal,
+        return_order_id=target_id,
+        action="cancel",
+        data=payload,
+    )
+
+
+@mcp.tool(
+    name="adjust_inventory_stock",
+    description="Adjust stock on an inventory ledger. Payload should match the backend adjust_stock action schema.",
+)
+async def adjust_inventory_stock(
+    inventory_id: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    target_id = str(inventory_id or "").strip()
+    if not target_id:
+        raise ValueError("inventory_id is required")
+    if not payload:
+        raise ValueError("payload is required")
+    return await sync_to_async(_adjust_inventory_stock_via_view_sync, thread_sensitive=True)(
+        principal=principal,
+        inventory_id=target_id,
+        data=payload,
+    )
+
+
+@mcp.tool(
+    name="transfer_location_stock",
+    description="Transfer stock from one location to another. Payload should match the backend transfer_stock action schema.",
+)
+async def transfer_location_stock(
+    location_id: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    target_id = str(location_id or "").strip()
+    if not target_id:
+        raise ValueError("location_id is required")
+    if not payload:
+        raise ValueError("payload is required")
+    return await sync_to_async(_transfer_stock_via_view_sync, thread_sensitive=True)(
+        principal=principal,
+        location_id=target_id,
+        data=payload,
+    )
+
+
+@mcp.tool(
+    name="create_stock_reservation",
+    description="Create a stock reservation. Payload should match the backend reservation create schema.",
+)
+async def create_stock_reservation(payload: dict[str, Any]) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    if not payload:
+        raise ValueError("payload is required")
+    return await sync_to_async(_create_stock_reservation_via_view_sync, thread_sensitive=True)(
+        principal=principal,
+        data=payload,
+    )
+
+
+@mcp.tool(
+    name="release_stock_reservation",
+    description="Release a stock reservation. Payload can include notes or quantities required by the backend.",
+)
+async def release_stock_reservation(
+    reservation_id: str,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    target_id = str(reservation_id or "").strip()
+    if not target_id:
+        raise ValueError("reservation_id is required")
+    return await sync_to_async(_reservation_action_via_view_sync, thread_sensitive=True)(
+        principal=principal,
+        reservation_id=target_id,
+        action="release",
+        data=payload,
+    )
+
+
+@mcp.tool(
+    name="fulfill_stock_reservation",
+    description="Fulfill a stock reservation. Payload can include notes or quantities required by the backend.",
+)
+async def fulfill_stock_reservation(
+    reservation_id: str,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    target_id = str(reservation_id or "").strip()
+    if not target_id:
+        raise ValueError("reservation_id is required")
+    return await sync_to_async(_reservation_action_via_view_sync, thread_sensitive=True)(
+        principal=principal,
+        reservation_id=target_id,
+        action="fulfill",
+        data=payload,
+    )
+
+
+@mcp.tool(
+    name="list_inventory_categories",
+    description="List inventory categories for the authenticated workspace.",
+)
+async def list_inventory_categories(
+    query: str | None = None,
+    limit: int = 25,
+    active_only: bool | None = None,
+) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    payload = await sync_to_async(_inventory_category_action_sync, thread_sensitive=True)(
+        principal=principal,
+        action="list",
+        method="get",
+        query_params={
+            "search": query,
+            "is_active": active_only,
+            "page_size": max(1, min(int(limit), 50)),
+        },
+    )
+    return payload
+
+
+@mcp.tool(
+    name="get_inventory_category_tree",
+    description="Get the hierarchical tree of inventory categories.",
+)
+async def get_inventory_category_tree() -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    return await sync_to_async(_inventory_category_action_sync, thread_sensitive=True)(
+        principal=principal,
+        action="tree",
+        method="get",
+    )
+
+
+@mcp.tool(
+    name="get_inventory_category_details",
+    description="Get a single inventory category in the backend's canonical detail payload.",
+)
+async def get_inventory_category_details(category_id: str) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    target_id = str(category_id or "").strip()
+    if not target_id:
+        raise ValueError("category_id is required")
+    return await sync_to_async(_inventory_category_action_sync, thread_sensitive=True)(
+        principal=principal,
+        action="retrieve",
+        method="get",
+        category_id=target_id,
+    )
+
+
+@mcp.tool(
+    name="get_inventory_category_children",
+    description="Get direct child categories for an inventory category.",
+)
+async def get_inventory_category_children(category_id: str) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    target_id = str(category_id or "").strip()
+    if not target_id:
+        raise ValueError("category_id is required")
+    return await sync_to_async(_inventory_category_action_sync, thread_sensitive=True)(
+        principal=principal,
+        action="children",
+        method="get",
+        category_id=target_id,
+    )
+
+
+@mcp.tool(
+    name="get_inventory_category_inventories",
+    description="Get inventories attached to an inventory category.",
+)
+async def get_inventory_category_inventories(category_id: str) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    target_id = str(category_id or "").strip()
+    if not target_id:
+        raise ValueError("category_id is required")
+    return await sync_to_async(_inventory_category_action_sync, thread_sensitive=True)(
+        principal=principal,
+        action="inventories",
+        method="get",
+        category_id=target_id,
+    )
+
+
+@mcp.tool(
+    name="create_inventory_category",
+    description="Create an inventory category. Payload should match the backend create schema.",
+)
+async def create_inventory_category(payload: dict[str, Any]) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    if not payload:
+        raise ValueError("payload is required")
+    return await sync_to_async(_inventory_category_action_sync, thread_sensitive=True)(
+        principal=principal,
+        action="create",
+        method="post",
+        data=payload,
+    )
+
+
+@mcp.tool(
+    name="update_inventory_category",
+    description="Update an inventory category. Payload should match the backend partial-update schema.",
+)
+async def update_inventory_category(category_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    target_id = str(category_id or "").strip()
+    if not target_id:
+        raise ValueError("category_id is required")
+    if not payload:
+        raise ValueError("payload is required")
+    return await sync_to_async(_inventory_category_action_sync, thread_sensitive=True)(
+        principal=principal,
+        action="partial_update",
+        method="patch",
+        category_id=target_id,
+        data=payload,
+    )
+
+
+@mcp.tool(
+    name="create_inventory",
+    description="Create an inventory ledger/item definition. Payload should match the backend create schema.",
+)
+async def create_inventory(payload: dict[str, Any]) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    if not payload:
+        raise ValueError("payload is required")
+    return await sync_to_async(_inventory_crud_action_sync, thread_sensitive=True)(
+        principal=principal,
+        action="create",
+        method="post",
+        data=payload,
+    )
+
+
+@mcp.tool(
+    name="update_inventory",
+    description="Update an inventory ledger/item definition. Payload should match the backend partial-update schema.",
+)
+async def update_inventory(inventory_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    target_id = str(inventory_id or "").strip()
+    if not target_id:
+        raise ValueError("inventory_id is required")
+    if not payload:
+        raise ValueError("payload is required")
+    return await sync_to_async(_inventory_crud_action_sync, thread_sensitive=True)(
+        principal=principal,
+        action="partial_update",
+        method="patch",
+        inventory_id=target_id,
+        data=payload,
+    )
+
+
+@mcp.tool(
+    name="create_stock_location",
+    description="Create a stock location. Payload should match the backend create schema.",
+)
+async def create_stock_location(payload: dict[str, Any]) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    if not payload:
+        raise ValueError("payload is required")
+    return await sync_to_async(_stock_location_action_sync, thread_sensitive=True)(
+        principal=principal,
+        action="create",
+        method="post",
+        data=payload,
+    )
+
+
+@mcp.tool(
+    name="update_stock_location",
+    description="Update a stock location. Payload should match the backend partial-update schema.",
+)
+async def update_stock_location(location_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    target_id = str(location_id or "").strip()
+    if not target_id:
+        raise ValueError("location_id is required")
+    if not payload:
+        raise ValueError("payload is required")
+    return await sync_to_async(_stock_location_action_sync, thread_sensitive=True)(
+        principal=principal,
+        action="partial_update",
+        method="patch",
+        location_id=target_id,
+        data=payload,
+    )
+
+
+@mcp.tool(
+    name="get_stock_item_tracking_history",
+    description="Get the full movement history for an inventory stock item.",
+)
+async def get_stock_item_tracking_history(inventory_item_id: str) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    target_id = str(inventory_item_id or "").strip()
+    if not target_id:
+        raise ValueError("inventory_item_id is required")
+    return await sync_to_async(_stock_item_action_sync, thread_sensitive=True)(
+        principal=principal,
+        action="tracking_history",
+        method="get",
+        inventory_item_id=target_id,
+    )
+
+
+@mcp.tool(
+    name="update_stock_item_status",
+    description="Update the lifecycle status of an inventory stock item.",
+)
+async def update_stock_item_status(inventory_item_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    target_id = str(inventory_item_id or "").strip()
+    if not target_id:
+        raise ValueError("inventory_item_id is required")
+    if not payload:
+        raise ValueError("payload is required")
+    return await sync_to_async(_stock_item_action_sync, thread_sensitive=True)(
+        principal=principal,
+        action="update_status",
+        method="post",
+        inventory_item_id=target_id,
+        data=payload,
+    )
+
+
+@mcp.tool(
+    name="search_expiring_stock_items",
+    description="List stock items that are expiring soon.",
+)
+async def search_expiring_stock_items(days: int = 30) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    return await sync_to_async(_stock_item_action_sync, thread_sensitive=True)(
+        principal=principal,
+        action="expiring_soon",
+        method="get",
+        query_params={"days": max(1, min(int(days), 365))},
+    )
+
+
+@mcp.tool(
+    name="search_low_stock_items",
+    description="List low-stock inventory items from the stock service dashboard view.",
+)
+async def search_low_stock_items() -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    return await sync_to_async(_stock_item_action_sync, thread_sensitive=True)(
+        principal=principal,
+        action="low_stock",
+        method="get",
+    )
+
+
+@mcp.tool(
+    name="list_purchase_order_line_items",
+    description="List line items for a purchase order.",
+)
+async def list_purchase_order_line_items(purchase_order_id: str) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    target_id = str(purchase_order_id or "").strip()
+    if not target_id:
+        raise ValueError("purchase_order_id is required")
+    return await sync_to_async(_purchase_order_line_item_action_sync, thread_sensitive=True)(
+        principal=principal,
+        purchase_order_id=target_id,
+        action="line_items",
+        method="get",
+    )
+
+
+@mcp.tool(
+    name="add_purchase_order_line_item",
+    description="Add a line item to a purchase order.",
+)
+async def add_purchase_order_line_item(purchase_order_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    target_id = str(purchase_order_id or "").strip()
+    if not target_id:
+        raise ValueError("purchase_order_id is required")
+    if not payload:
+        raise ValueError("payload is required")
+    return await sync_to_async(_purchase_order_line_item_action_sync, thread_sensitive=True)(
+        principal=principal,
+        purchase_order_id=target_id,
+        action="add_line_item",
+        method="post",
+        data=payload,
+    )
+
+
+@mcp.tool(
+    name="update_purchase_order_line_item",
+    description="Update an existing purchase-order line item.",
+)
+async def update_purchase_order_line_item(purchase_order_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    target_id = str(purchase_order_id or "").strip()
+    if not target_id:
+        raise ValueError("purchase_order_id is required")
+    if not payload:
+        raise ValueError("payload is required")
+    return await sync_to_async(_purchase_order_line_item_action_sync, thread_sensitive=True)(
+        principal=principal,
+        purchase_order_id=target_id,
+        action="update_line_item",
+        method="patch",
+        data=payload,
+    )
+
+
+@mcp.tool(
+    name="remove_purchase_order_line_item",
+    description="Remove a line item from a purchase order.",
+)
+async def remove_purchase_order_line_item(purchase_order_id: str, line_item_id: str) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    target_order_id = str(purchase_order_id or "").strip()
+    target_line_item_id = str(line_item_id or "").strip()
+    if not target_order_id:
+        raise ValueError("purchase_order_id is required")
+    if not target_line_item_id:
+        raise ValueError("line_item_id is required")
+    return await sync_to_async(_purchase_order_line_item_action_sync, thread_sensitive=True)(
+        principal=principal,
+        purchase_order_id=target_order_id,
+        action="remove_line_item",
+        method="delete",
+        query_params={"line_item_id": target_line_item_id},
+    )
+
+
+@mcp.tool(
+    name="download_purchase_order_pdf",
+    description="Download a purchase order PDF. Returns filename, content type, size, and base64 payload.",
+)
+async def download_purchase_order_pdf(purchase_order_id: str) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    target_id = str(purchase_order_id or "").strip()
+    if not target_id:
+        raise ValueError("purchase_order_id is required")
+    return await sync_to_async(_purchase_order_admin_action_sync, thread_sensitive=True)(
+        principal=principal,
+        action="download_pdf",
+        method="get",
+        purchase_order_id=target_id,
+    )
+
+
+@mcp.tool(
+    name="resend_purchase_order_email",
+    description="Resend a purchase-order email to the supplier.",
+)
+async def resend_purchase_order_email(purchase_order_id: str) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    target_id = str(purchase_order_id or "").strip()
+    if not target_id:
+        raise ValueError("purchase_order_id is required")
+    return await sync_to_async(_purchase_order_admin_action_sync, thread_sensitive=True)(
+        principal=principal,
+        action="resend_email",
+        method="post",
+        data={"order_id": target_id},
+    )
+
+
+@mcp.tool(
+    name="list_sales_order_line_items",
+    description="List line items for a sales order.",
+)
+async def list_sales_order_line_items(sales_order_id: str) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    target_id = str(sales_order_id or "").strip()
+    if not target_id:
+        raise ValueError("sales_order_id is required")
+    return await sync_to_async(_sales_order_line_item_action_sync, thread_sensitive=True)(
+        principal=principal,
+        sales_order_id=target_id,
+        action="line_items",
+        method="get",
+    )
+
+
+@mcp.tool(
+    name="get_sales_order_shipments",
+    description="Get shipments for a sales order.",
+)
+async def get_sales_order_shipments(sales_order_id: str) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    target_id = str(sales_order_id or "").strip()
+    if not target_id:
+        raise ValueError("sales_order_id is required")
+    return await sync_to_async(_sales_order_line_item_action_sync, thread_sensitive=True)(
+        principal=principal,
+        sales_order_id=target_id,
+        action="shipments",
+        method="get",
+    )
+
+
+@mcp.tool(
+    name="add_sales_order_line_item",
+    description="Add a line item to a sales order.",
+)
+async def add_sales_order_line_item(sales_order_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    target_id = str(sales_order_id or "").strip()
+    if not target_id:
+        raise ValueError("sales_order_id is required")
+    if not payload:
+        raise ValueError("payload is required")
+    return await sync_to_async(_sales_order_line_item_action_sync, thread_sensitive=True)(
+        principal=principal,
+        sales_order_id=target_id,
+        action="add_line_item",
+        method="post",
+        data=payload,
+    )
+
+
+@mcp.tool(
+    name="update_sales_order_line_item",
+    description="Update an existing sales-order line item.",
+)
+async def update_sales_order_line_item(sales_order_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    target_id = str(sales_order_id or "").strip()
+    if not target_id:
+        raise ValueError("sales_order_id is required")
+    if not payload:
+        raise ValueError("payload is required")
+    return await sync_to_async(_sales_order_line_item_action_sync, thread_sensitive=True)(
+        principal=principal,
+        sales_order_id=target_id,
+        action="update_line_item",
+        method="patch",
+        data=payload,
+    )
+
+
+@mcp.tool(
+    name="remove_sales_order_line_item",
+    description="Remove a line item from a sales order.",
+)
+async def remove_sales_order_line_item(sales_order_id: str, line_item_id: str) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    target_order_id = str(sales_order_id or "").strip()
+    target_line_item_id = str(line_item_id or "").strip()
+    if not target_order_id:
+        raise ValueError("sales_order_id is required")
+    if not target_line_item_id:
+        raise ValueError("line_item_id is required")
+    return await sync_to_async(_sales_order_line_item_action_sync, thread_sensitive=True)(
+        principal=principal,
+        sales_order_id=target_order_id,
+        action="remove_line_item",
+        method="delete",
+        query_params={"line_item_id": target_line_item_id},
+    )
 
 
 async def health(_: Any) -> JSONResponse:
