@@ -10,6 +10,8 @@ from decimal import Decimal
 from typing import Any
 from urllib.parse import urlencode
 
+from pydantic import BaseModel
+
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "core.settings")
 
 import django
@@ -42,6 +44,10 @@ from subapps.services.inventory_read_model import (
     get_profile_stock_analytics,
 )
 from subapps.utils.request_context import coerce_identity_id, scope_queryset_by_identity
+import uuid
+from mainapps.inventory import payloads as inventory_payloads
+from mainapps.stock import payloads as stock_payloads
+from mainapps.orders import payloads as orders_payloads
 
 
 def _parse_bool(value: str | None, *, default: bool = False) -> bool:
@@ -87,6 +93,14 @@ def _to_json_compatible(value: Any) -> Any:
         return {str(key): _to_json_compatible(item) for key, item in value.items()}
     if isinstance(value, list):
         return [_to_json_compatible(item) for item in value]
+    return value
+
+
+def _payload_to_data(value: BaseModel | dict[str, Any] | None) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if isinstance(value, BaseModel):
+        return value.model_dump(mode="json", exclude_none=True)
     return value
 
 
@@ -373,6 +387,44 @@ def _stock_movement_queryset(*, principal: InventoryMcpPrincipal) -> QuerySet[St
         legacy_field="profile",
         value=principal.profile_id,
     )
+
+def _get_all_inventory_sync(*, principal: InventoryMcpPrincipal) -> dict[str, Any]:
+    queryset = _inventory_queryset(principal=principal)
+    inventories = list(queryset)
+    summary_map = get_inventory_summary_map(inventories)
+    return {
+        "profile_id": principal.profile_id, 
+        "company_code": principal.company_code,
+        "count": len(inventories),
+        "results": [
+            _inventory_payload(inventory, summary=summary_map.get(inventory.id, {}))
+            for inventory in inventories
+        ],
+    }
+
+def _list_inventory_items_sync(
+    *,
+    principal: InventoryMcpPrincipal,
+    inventory_id: str | None = None,
+) -> dict[str, Any]:
+    queryset = _inventory_item_queryset(principal=principal)
+    if inventory_id:
+        inventory = _inventory_queryset(principal=principal).filter(id=inventory_id).first()
+        if inventory is None:
+            raise ValueError("Inventory not found.")
+        queryset = queryset.filter(inventory_id=inventory_id)
+    items = list(queryset)
+    summary_map = get_inventory_item_summary_map(items) 
+    return {
+        "profile_id": principal.profile_id,
+        "company_code": principal.company_code,
+        "count": len(items),
+        "results": [
+            _inventory_item_payload(item, summary=summary_map.get(item.id, {}))
+            for item in items
+        ],
+    }
+
 
 
 def _search_inventories_sync(
@@ -1290,6 +1342,32 @@ mcp = FastMCP(
     transport_security=_build_transport_security_settings(),
 )
 
+# _get_all_inventory_sync
+@mcp.tool(
+    name="get_all_inventory",
+    description="Retrieve all inventory ledgers for the authenticated workspace.",
+)
+async def get_all_inventory() -> inventory_payloads.InventoryCollectionResponsePayload:
+    principal = get_current_principal(required=True)
+    return await sync_to_async(_get_all_inventory_sync, thread_sensitive=True)(
+        principal=principal
+    )
+# _list_inventory_items_sync
+@mcp.tool(
+    name="list_inventory_items",
+    description="Retrieve all inventory items for the authenticated workspace.",
+)
+async def list_inventory_items(
+    inventory_id: str | None = None,
+) -> inventory_payloads.InventoryItemCollectionResponsePayload:
+    principal = get_current_principal(required=True)
+    return await sync_to_async(_list_inventory_items_sync, thread_sensitive=True)(
+        principal=principal,
+        inventory_id=str(inventory_id).strip() if inventory_id else None,
+    )
+
+
+# _search_inventories_sync
 
 @mcp.tool(
     name="search_inventories",
@@ -1300,7 +1378,7 @@ async def search_inventories(
     limit: int = 10,
     active_only: bool | None = True,
     inventory_type: str | None = None,
-) -> dict[str, Any]:
+) -> inventory_payloads.InventoryCollectionResponsePayload:
     principal = get_current_principal(required=True)
     search_term = str(query or "").strip()
     if not search_term:
@@ -1319,7 +1397,9 @@ async def search_inventories(
     name="get_inventory_details",
     description="Get detailed stock posture for a single inventory ledger.",
 )
-async def get_inventory_details(inventory_id: str) -> dict[str, Any]:
+async def get_inventory_details(
+    inventory_id: str,
+) -> inventory_payloads.InventoryDetailResponsePayload:
     principal = get_current_principal(required=True)
     target_inventory_id = str(inventory_id or "").strip()
     if not target_inventory_id:
@@ -1340,7 +1420,7 @@ async def search_stock_items(
     inventory_type: str | None = None,
     status: str | None = None,
     inventory_item_id: str | None = None,
-) -> dict[str, Any]:
+) -> inventory_payloads.InventoryItemCollectionResponsePayload:
     principal = get_current_principal(required=True)
     limit_value = max(1, min(int(limit), 25))
     return await sync_to_async(_search_stock_items_sync, thread_sensitive=True)(
@@ -1360,7 +1440,7 @@ async def search_stock_items(
 async def get_inventory_item_details(
     inventory_item_id: str,
     history_limit: int = 10,
-) -> dict[str, Any]:
+) -> stock_payloads.InventoryItemDetailResponsePayload:
     principal = get_current_principal(required=True)
     target_item_id = str(inventory_item_id or "").strip()
     if not target_item_id:
@@ -1377,7 +1457,10 @@ async def get_inventory_item_details(
     name="get_inventory_alerts",
     description="Return low-stock, reorder, out-of-stock, and expiring inventory queues.",
 )
-async def get_inventory_alerts(limit: int = 10, expiring_days: int = 30) -> dict[str, Any]:
+async def get_inventory_alerts(
+    limit: int = 10,
+    expiring_days: int = 30,
+) -> inventory_payloads.InventoryAlertsResponsePayload:
     principal = get_current_principal(required=True)
     limit_value = max(1, min(int(limit), 25))
     day_window = max(1, min(int(expiring_days), 365))
@@ -1397,7 +1480,7 @@ async def search_stock_locations(
     limit: int = 10,
     structural_only: bool | None = None,
     external_only: bool | None = None,
-) -> dict[str, Any]:
+) -> stock_payloads.StockLocationCollectionResponsePayload:
     principal = get_current_principal(required=True)
     limit_value = max(1, min(int(limit), 25))
     return await sync_to_async(_search_stock_locations_sync, thread_sensitive=True)(
@@ -1413,7 +1496,9 @@ async def search_stock_locations(
     name="get_stock_location_summary",
     description="Get detailed quantity, value, and expiry posture for a stock location.",
 )
-async def get_stock_location_summary(location_id: str) -> dict[str, Any]:
+async def get_stock_location_summary(
+    location_id: str,
+) -> stock_payloads.StockLocationSummaryResponsePayload:
     principal = get_current_principal(required=True)
     target_location_id = str(location_id or "").strip()
     if not target_location_id:
@@ -1434,7 +1519,7 @@ async def search_stock_reservations(
     status: str | None = None,
     external_order_type: str | None = None,
     inventory_item_id: str | None = None,
-) -> dict[str, Any]:
+) -> stock_payloads.StockReservationCollectionResponsePayload:
     principal = get_current_principal(required=True)
     limit_value = max(1, min(int(limit), 25))
     return await sync_to_async(_search_stock_reservations_sync, thread_sensitive=True)(
@@ -1457,7 +1542,7 @@ async def search_stock_movements(
     movement_type: str | None = None,
     inventory_item_id: str | None = None,
     reference_id: str | None = None,
-) -> dict[str, Any]:
+) -> stock_payloads.StockMovementCollectionResponsePayload:
     principal = get_current_principal(required=True)
     limit_value = max(1, min(int(limit), 25))
     return await sync_to_async(_search_stock_movements_sync, thread_sensitive=True)(
@@ -1474,7 +1559,7 @@ async def search_stock_movements(
     name="get_stock_analytics",
     description="Get workspace-level stock analytics across locations, value, and aging posture.",
 )
-async def get_stock_analytics() -> dict[str, Any]:
+async def get_stock_analytics() -> inventory_payloads.InventoryAnalyticsResponsePayload:
     principal = get_current_principal(required=True)
     return await sync_to_async(_get_stock_analytics_sync, thread_sensitive=True)(principal=principal)
 
@@ -1487,7 +1572,7 @@ async def search_purchase_orders(
     query: str | None = None,
     status: str | None = None,
     limit: int = 10,
-) -> dict[str, Any]:
+) -> orders_payloads.PurchaseOrderSearchResponsePayload:
     principal = get_current_principal(required=True)
     limit_value = max(1, min(int(limit), 50))
     return await sync_to_async(_search_purchase_orders_sync, thread_sensitive=True)(
@@ -1502,7 +1587,9 @@ async def search_purchase_orders(
     name="get_purchase_order_details",
     description="Get a single purchase order with the backend's canonical detail payload.",
 )
-async def get_purchase_order_details(purchase_order_id: str) -> dict[str, Any]:
+async def get_purchase_order_details(
+    purchase_order_id: str,
+) -> orders_payloads.PurchaseOrderDetailResponsePayload:
     principal = get_current_principal(required=True)
     target_id = str(purchase_order_id or "").strip()
     if not target_id:
@@ -1517,7 +1604,7 @@ async def get_purchase_order_details(purchase_order_id: str) -> dict[str, Any]:
     name="get_purchase_order_analytics",
     description="Get purchase-order analytics for the authenticated workspace.",
 )
-async def get_purchase_order_analytics() -> dict[str, Any]:
+async def get_purchase_order_analytics() -> orders_payloads.PurchaseOrderAnalyticsResponsePayload:
     principal = get_current_principal(required=True)
     return await sync_to_async(_get_purchase_order_analytics_sync, thread_sensitive=True)(
         principal=principal,
@@ -1530,8 +1617,8 @@ async def get_purchase_order_analytics() -> dict[str, Any]:
 )
 async def approve_purchase_order(
     purchase_order_id: str,
-    payload: dict[str, Any] | None = None,
-) -> dict[str, Any]:
+    payload: orders_payloads.OrderActionPayload | None = None,
+) -> orders_payloads.PurchaseOrderActionResponsePayload:
     principal = get_current_principal(required=True)
     target_id = str(purchase_order_id or "").strip()
     if not target_id:
@@ -1540,7 +1627,7 @@ async def approve_purchase_order(
         principal=principal,
         purchase_order_id=target_id,
         action="approve",
-        data=payload,
+        data=_payload_to_data(payload),
     )
 
 
@@ -1550,8 +1637,8 @@ async def approve_purchase_order(
 )
 async def issue_purchase_order(
     purchase_order_id: str,
-    payload: dict[str, Any] | None = None,
-) -> dict[str, Any]:
+    payload: orders_payloads.OrderActionPayload | None = None,
+) -> orders_payloads.PurchaseOrderActionResponsePayload:
     principal = get_current_principal(required=True)
     target_id = str(purchase_order_id or "").strip()
     if not target_id:
@@ -1560,7 +1647,7 @@ async def issue_purchase_order(
         principal=principal,
         purchase_order_id=target_id,
         action="issue",
-        data=payload,
+        data=_payload_to_data(payload),
     )
 
 
@@ -1570,8 +1657,8 @@ async def issue_purchase_order(
 )
 async def receive_purchase_order_items(
     purchase_order_id: str,
-    payload: dict[str, Any],
-) -> dict[str, Any]:
+    payload: orders_payloads.PurchaseOrderReceiveItemsPayload,
+) -> orders_payloads.PurchaseOrderActionResponsePayload:
     principal = get_current_principal(required=True)
     target_id = str(purchase_order_id or "").strip()
     if not target_id:
@@ -1582,7 +1669,7 @@ async def receive_purchase_order_items(
         principal=principal,
         purchase_order_id=target_id,
         action="receive_items",
-        data=payload,
+        data=_payload_to_data(payload),
     )
 
 
@@ -1592,8 +1679,8 @@ async def receive_purchase_order_items(
 )
 async def complete_purchase_order(
     purchase_order_id: str,
-    payload: dict[str, Any] | None = None,
-) -> dict[str, Any]:
+    payload: orders_payloads.OrderActionPayload | None = None,
+) -> orders_payloads.PurchaseOrderActionResponsePayload:
     principal = get_current_principal(required=True)
     target_id = str(purchase_order_id or "").strip()
     if not target_id:
@@ -1602,7 +1689,7 @@ async def complete_purchase_order(
         principal=principal,
         purchase_order_id=target_id,
         action="complete",
-        data=payload,
+        data=_payload_to_data(payload),
     )
 
 
@@ -1612,8 +1699,8 @@ async def complete_purchase_order(
 )
 async def cancel_purchase_order(
     purchase_order_id: str,
-    payload: dict[str, Any] | None = None,
-) -> dict[str, Any]:
+    payload: orders_payloads.OrderActionPayload | None = None,
+) -> orders_payloads.PurchaseOrderActionResponsePayload:
     principal = get_current_principal(required=True)
     target_id = str(purchase_order_id or "").strip()
     if not target_id:
@@ -1622,7 +1709,7 @@ async def cancel_purchase_order(
         principal=principal,
         purchase_order_id=target_id,
         action="cancel",
-        data=payload,
+        data=_payload_to_data(payload),
     )
 
 
@@ -1632,8 +1719,8 @@ async def cancel_purchase_order(
 )
 async def create_purchase_return_order(
     purchase_order_id: str,
-    payload: dict[str, Any] | None = None,
-) -> dict[str, Any]:
+    payload: orders_payloads.OrderActionPayload | None = None,
+) -> orders_payloads.PurchaseOrderActionResponsePayload:
     principal = get_current_principal(required=True)
     target_id = str(purchase_order_id or "").strip()
     if not target_id:
@@ -1643,7 +1730,7 @@ async def create_purchase_return_order(
         purchase_order_id=target_id,
         action="create_return_order",
         method="post",
-        data=payload,
+        data=_payload_to_data(payload),
     )
 
 
@@ -1655,7 +1742,7 @@ async def search_sales_orders(
     query: str | None = None,
     status: str | None = None,
     limit: int = 10,
-) -> dict[str, Any]:
+) -> orders_payloads.SalesOrderSearchResponsePayload:
     principal = get_current_principal(required=True)
     limit_value = max(1, min(int(limit), 50))
     return await sync_to_async(_search_sales_orders_sync, thread_sensitive=True)(
@@ -1670,7 +1757,9 @@ async def search_sales_orders(
     name="get_sales_order_details",
     description="Get a single sales order with the backend's canonical detail payload.",
 )
-async def get_sales_order_details(sales_order_id: str) -> dict[str, Any]:
+async def get_sales_order_details(
+    sales_order_id: str,
+) -> orders_payloads.SalesOrderDetailResponsePayload:
     principal = get_current_principal(required=True)
     target_id = str(sales_order_id or "").strip()
     if not target_id:
@@ -1687,8 +1776,8 @@ async def get_sales_order_details(sales_order_id: str) -> dict[str, Any]:
 )
 async def reserve_sales_order(
     sales_order_id: str,
-    payload: dict[str, Any] | None = None,
-) -> dict[str, Any]:
+    payload: orders_payloads.OrderActionPayload | None = None,
+) -> orders_payloads.SalesOrderActionResponsePayload:
     principal = get_current_principal(required=True)
     target_id = str(sales_order_id or "").strip()
     if not target_id:
@@ -1697,7 +1786,7 @@ async def reserve_sales_order(
         principal=principal,
         sales_order_id=target_id,
         action="reserve",
-        data=payload,
+        data=_payload_to_data(payload),
     )
 
 
@@ -1707,8 +1796,8 @@ async def reserve_sales_order(
 )
 async def release_sales_order(
     sales_order_id: str,
-    payload: dict[str, Any] | None = None,
-) -> dict[str, Any]:
+    payload: orders_payloads.OrderActionPayload | None = None,
+) -> orders_payloads.SalesOrderActionResponsePayload:
     principal = get_current_principal(required=True)
     target_id = str(sales_order_id or "").strip()
     if not target_id:
@@ -1717,7 +1806,7 @@ async def release_sales_order(
         principal=principal,
         sales_order_id=target_id,
         action="release",
-        data=payload,
+        data=_payload_to_data(payload),
     )
 
 
@@ -1727,8 +1816,8 @@ async def release_sales_order(
 )
 async def ship_sales_order(
     sales_order_id: str,
-    payload: dict[str, Any] | None = None,
-) -> dict[str, Any]:
+    payload: orders_payloads.OrderActionPayload | None = None,
+) -> orders_payloads.SalesOrderActionResponsePayload:
     principal = get_current_principal(required=True)
     target_id = str(sales_order_id or "").strip()
     if not target_id:
@@ -1737,7 +1826,7 @@ async def ship_sales_order(
         principal=principal,
         sales_order_id=target_id,
         action="ship",
-        data=payload,
+        data=_payload_to_data(payload),
     )
 
 
@@ -1747,8 +1836,8 @@ async def ship_sales_order(
 )
 async def complete_sales_order(
     sales_order_id: str,
-    payload: dict[str, Any] | None = None,
-) -> dict[str, Any]:
+    payload: orders_payloads.OrderActionPayload | None = None,
+) -> orders_payloads.SalesOrderActionResponsePayload:
     principal = get_current_principal(required=True)
     target_id = str(sales_order_id or "").strip()
     if not target_id:
@@ -1757,7 +1846,7 @@ async def complete_sales_order(
         principal=principal,
         sales_order_id=target_id,
         action="complete",
-        data=payload,
+        data=_payload_to_data(payload),
     )
 
 
@@ -1767,8 +1856,8 @@ async def complete_sales_order(
 )
 async def cancel_sales_order(
     sales_order_id: str,
-    payload: dict[str, Any] | None = None,
-) -> dict[str, Any]:
+    payload: orders_payloads.OrderActionPayload | None = None,
+) -> orders_payloads.SalesOrderActionResponsePayload:
     principal = get_current_principal(required=True)
     target_id = str(sales_order_id or "").strip()
     if not target_id:
@@ -1777,7 +1866,7 @@ async def cancel_sales_order(
         principal=principal,
         sales_order_id=target_id,
         action="cancel",
-        data=payload,
+        data=_payload_to_data(payload),
     )
 
 
@@ -1789,7 +1878,7 @@ async def search_return_orders(
     query: str | None = None,
     status: str | None = None,
     limit: int = 10,
-) -> dict[str, Any]:
+) -> orders_payloads.ReturnOrderSearchResponsePayload:
     principal = get_current_principal(required=True)
     limit_value = max(1, min(int(limit), 50))
     return await sync_to_async(_search_return_orders_sync, thread_sensitive=True)(
@@ -1804,7 +1893,9 @@ async def search_return_orders(
     name="get_return_order_details",
     description="Get a single return order with the backend's canonical detail payload.",
 )
-async def get_return_order_details(return_order_id: str) -> dict[str, Any]:
+async def get_return_order_details(
+    return_order_id: str,
+) -> orders_payloads.ReturnOrderDetailResponsePayload:
     principal = get_current_principal(required=True)
     target_id = str(return_order_id or "").strip()
     if not target_id:
@@ -1821,8 +1912,8 @@ async def get_return_order_details(return_order_id: str) -> dict[str, Any]:
 )
 async def dispatch_return_order(
     return_order_id: str,
-    payload: dict[str, Any] | None = None,
-) -> dict[str, Any]:
+    payload: orders_payloads.OrderActionPayload | None = None,
+) -> orders_payloads.ReturnOrderActionResponsePayload:
     principal = get_current_principal(required=True)
     target_id = str(return_order_id or "").strip()
     if not target_id:
@@ -1831,7 +1922,7 @@ async def dispatch_return_order(
         principal=principal,
         return_order_id=target_id,
         action="dispatch",
-        data=payload,
+        data=_payload_to_data(payload),
     )
 
 
@@ -1841,8 +1932,8 @@ async def dispatch_return_order(
 )
 async def complete_return_order(
     return_order_id: str,
-    payload: dict[str, Any] | None = None,
-) -> dict[str, Any]:
+    payload: orders_payloads.OrderActionPayload | None = None,
+) -> orders_payloads.ReturnOrderActionResponsePayload:
     principal = get_current_principal(required=True)
     target_id = str(return_order_id or "").strip()
     if not target_id:
@@ -1851,7 +1942,7 @@ async def complete_return_order(
         principal=principal,
         return_order_id=target_id,
         action="complete",
-        data=payload,
+        data=_payload_to_data(payload),
     )
 
 
@@ -1861,8 +1952,8 @@ async def complete_return_order(
 )
 async def cancel_return_order(
     return_order_id: str,
-    payload: dict[str, Any] | None = None,
-) -> dict[str, Any]:
+    payload: orders_payloads.OrderActionPayload | None = None,
+) -> orders_payloads.ReturnOrderActionResponsePayload:
     principal = get_current_principal(required=True)
     target_id = str(return_order_id or "").strip()
     if not target_id:
@@ -1871,7 +1962,7 @@ async def cancel_return_order(
         principal=principal,
         return_order_id=target_id,
         action="cancel",
-        data=payload,
+        data=_payload_to_data(payload),
     )
 
 
@@ -1881,8 +1972,8 @@ async def cancel_return_order(
 )
 async def adjust_inventory_stock(
     inventory_id: str,
-    payload: dict[str, Any],
-) -> dict[str, Any]:
+    payload: stock_payloads.InventoryAdjustmentRequestPayload,
+) -> stock_payloads.StockAdjustmentResultPayload:
     principal = get_current_principal(required=True)
     target_id = str(inventory_id or "").strip()
     if not target_id:
@@ -1892,7 +1983,7 @@ async def adjust_inventory_stock(
     return await sync_to_async(_adjust_inventory_stock_via_view_sync, thread_sensitive=True)(
         principal=principal,
         inventory_id=target_id,
-        data=payload,
+        data=_payload_to_data(payload),
     )
 
 
@@ -1902,8 +1993,8 @@ async def adjust_inventory_stock(
 )
 async def transfer_location_stock(
     location_id: str,
-    payload: dict[str, Any],
-) -> dict[str, Any]:
+    payload: stock_payloads.StockTransferRequestPayload,
+) -> stock_payloads.StockTransferResultPayload:
     principal = get_current_principal(required=True)
     target_id = str(location_id or "").strip()
     if not target_id:
@@ -1913,7 +2004,7 @@ async def transfer_location_stock(
     return await sync_to_async(_transfer_stock_via_view_sync, thread_sensitive=True)(
         principal=principal,
         location_id=target_id,
-        data=payload,
+        data=_payload_to_data(payload),
     )
 
 
@@ -1921,13 +2012,15 @@ async def transfer_location_stock(
     name="create_stock_reservation",
     description="Create a stock reservation. Payload should match the backend reservation create schema.",
 )
-async def create_stock_reservation(payload: dict[str, Any]) -> dict[str, Any]:
+async def create_stock_reservation(
+    payload: stock_payloads.StockReservationCreateUpdatePayload,
+) -> stock_payloads.StockReservationMutationResponsePayload:
     principal = get_current_principal(required=True)
     if not payload:
         raise ValueError("payload is required")
     return await sync_to_async(_create_stock_reservation_via_view_sync, thread_sensitive=True)(
         principal=principal,
-        data=payload,
+        data=_payload_to_data(payload),
     )
 
 
@@ -1937,8 +2030,8 @@ async def create_stock_reservation(payload: dict[str, Any]) -> dict[str, Any]:
 )
 async def release_stock_reservation(
     reservation_id: str,
-    payload: dict[str, Any] | None = None,
-) -> dict[str, Any]:
+    payload: stock_payloads.StockReservationActionPayload | None = None,
+) -> stock_payloads.StockReservationMutationResponsePayload:
     principal = get_current_principal(required=True)
     target_id = str(reservation_id or "").strip()
     if not target_id:
@@ -1947,7 +2040,7 @@ async def release_stock_reservation(
         principal=principal,
         reservation_id=target_id,
         action="release",
-        data=payload,
+        data=_payload_to_data(payload),
     )
 
 
@@ -1957,8 +2050,8 @@ async def release_stock_reservation(
 )
 async def fulfill_stock_reservation(
     reservation_id: str,
-    payload: dict[str, Any] | None = None,
-) -> dict[str, Any]:
+    payload: stock_payloads.StockReservationActionPayload | None = None,
+) -> stock_payloads.StockReservationMutationResponsePayload:
     principal = get_current_principal(required=True)
     target_id = str(reservation_id or "").strip()
     if not target_id:
@@ -1967,7 +2060,7 @@ async def fulfill_stock_reservation(
         principal=principal,
         reservation_id=target_id,
         action="fulfill",
-        data=payload,
+        data=_payload_to_data(payload),
     )
 
 
@@ -1979,7 +2072,7 @@ async def list_inventory_categories(
     query: str | None = None,
     limit: int = 25,
     active_only: bool | None = None,
-) -> dict[str, Any]:
+) -> inventory_payloads.InventoryCategoryCollectionResponsePayload:
     principal = get_current_principal(required=True)
     payload = await sync_to_async(_inventory_category_action_sync, thread_sensitive=True)(
         principal=principal,
@@ -1998,7 +2091,7 @@ async def list_inventory_categories(
     name="get_inventory_category_tree",
     description="Get the hierarchical tree of inventory categories.",
 )
-async def get_inventory_category_tree() -> dict[str, Any]:
+async def get_inventory_category_tree() -> inventory_payloads.InventoryCategoryCollectionResponsePayload:
     principal = get_current_principal(required=True)
     return await sync_to_async(_inventory_category_action_sync, thread_sensitive=True)(
         principal=principal,
@@ -2011,7 +2104,9 @@ async def get_inventory_category_tree() -> dict[str, Any]:
     name="get_inventory_category_details",
     description="Get a single inventory category in the backend's canonical detail payload.",
 )
-async def get_inventory_category_details(category_id: str) -> dict[str, Any]:
+async def get_inventory_category_details(
+    category_id: str,
+) -> inventory_payloads.InventoryCategoryDetailResponsePayload:
     principal = get_current_principal(required=True)
     target_id = str(category_id or "").strip()
     if not target_id:
@@ -2028,7 +2123,9 @@ async def get_inventory_category_details(category_id: str) -> dict[str, Any]:
     name="get_inventory_category_children",
     description="Get direct child categories for an inventory category.",
 )
-async def get_inventory_category_children(category_id: str) -> dict[str, Any]:
+async def get_inventory_category_children(
+    category_id: str,
+) -> inventory_payloads.InventoryCategoryCollectionResponsePayload:
     principal = get_current_principal(required=True)
     target_id = str(category_id or "").strip()
     if not target_id:
@@ -2045,7 +2142,9 @@ async def get_inventory_category_children(category_id: str) -> dict[str, Any]:
     name="get_inventory_category_inventories",
     description="Get inventories attached to an inventory category.",
 )
-async def get_inventory_category_inventories(category_id: str) -> dict[str, Any]:
+async def get_inventory_category_inventories(
+    category_id: str,
+) -> inventory_payloads.InventoryCategoryCollectionResponsePayload:
     principal = get_current_principal(required=True)
     target_id = str(category_id or "").strip()
     if not target_id:
@@ -2062,7 +2161,9 @@ async def get_inventory_category_inventories(category_id: str) -> dict[str, Any]
     name="create_inventory_category",
     description="Create an inventory category. Payload should match the backend create schema.",
 )
-async def create_inventory_category(payload: dict[str, Any]) -> dict[str, Any]:
+async def create_inventory_category(
+    payload: inventory_payloads.InventoryCategoryCreateUpdatePayload,
+) -> inventory_payloads.InventoryCategoryMutationResponsePayload:
     principal = get_current_principal(required=True)
     if not payload:
         raise ValueError("payload is required")
@@ -2070,7 +2171,7 @@ async def create_inventory_category(payload: dict[str, Any]) -> dict[str, Any]:
         principal=principal,
         action="create",
         method="post",
-        data=payload,
+        data=_payload_to_data(payload),
     )
 
 
@@ -2078,7 +2179,10 @@ async def create_inventory_category(payload: dict[str, Any]) -> dict[str, Any]:
     name="update_inventory_category",
     description="Update an inventory category. Payload should match the backend partial-update schema.",
 )
-async def update_inventory_category(category_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+async def update_inventory_category(
+    category_id: str,
+    payload: inventory_payloads.InventoryCategoryCreateUpdatePayload,
+) -> inventory_payloads.InventoryCategoryMutationResponsePayload:
     principal = get_current_principal(required=True)
     target_id = str(category_id or "").strip()
     if not target_id:
@@ -2090,15 +2194,17 @@ async def update_inventory_category(category_id: str, payload: dict[str, Any]) -
         action="partial_update",
         method="patch",
         category_id=target_id,
-        data=payload,
+        data=_payload_to_data(payload),
     )
-
 
 @mcp.tool(
     name="create_inventory",
     description="Create an inventory ledger/item definition. Payload should match the backend create schema.",
 )
-async def create_inventory(payload: dict[str, Any]) -> dict[str, Any]:
+async def create_inventory(
+    payload: inventory_payloads.InventoryCreateUpdatePayload,
+) -> inventory_payloads.InventoryMutationResponsePayload:
+    #  we need to properly define all payload fields and validation for this tool before we can safely expose it, as it has significant potential to cause data integrity issues if used incorrectly. For now, we'll leave this as a passthrough to the view action and require internal access until we can build out a more robust interface for inventory creation.
     principal = get_current_principal(required=True)
     if not payload:
         raise ValueError("payload is required")
@@ -2106,7 +2212,7 @@ async def create_inventory(payload: dict[str, Any]) -> dict[str, Any]:
         principal=principal,
         action="create",
         method="post",
-        data=payload,
+        data=_payload_to_data(payload),
     )
 
 
@@ -2114,7 +2220,10 @@ async def create_inventory(payload: dict[str, Any]) -> dict[str, Any]:
     name="update_inventory",
     description="Update an inventory ledger/item definition. Payload should match the backend partial-update schema.",
 )
-async def update_inventory(inventory_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+async def update_inventory(
+    inventory_id: str,
+    payload: inventory_payloads.InventoryCreateUpdatePayload,
+) -> inventory_payloads.InventoryMutationResponsePayload:
     principal = get_current_principal(required=True)
     target_id = str(inventory_id or "").strip()
     if not target_id:
@@ -2126,7 +2235,7 @@ async def update_inventory(inventory_id: str, payload: dict[str, Any]) -> dict[s
         action="partial_update",
         method="patch",
         inventory_id=target_id,
-        data=payload,
+        data=_payload_to_data(payload),
     )
 
 
@@ -2134,7 +2243,9 @@ async def update_inventory(inventory_id: str, payload: dict[str, Any]) -> dict[s
     name="create_stock_location",
     description="Create a stock location. Payload should match the backend create schema.",
 )
-async def create_stock_location(payload: dict[str, Any]) -> dict[str, Any]:
+async def create_stock_location(
+    payload: stock_payloads.StockLocationCreateUpdatePayload,
+) -> stock_payloads.StockLocationMutationResponsePayload:
     principal = get_current_principal(required=True)
     if not payload:
         raise ValueError("payload is required")
@@ -2142,7 +2253,7 @@ async def create_stock_location(payload: dict[str, Any]) -> dict[str, Any]:
         principal=principal,
         action="create",
         method="post",
-        data=payload,
+        data=_payload_to_data(payload),
     )
 
 
@@ -2150,7 +2261,10 @@ async def create_stock_location(payload: dict[str, Any]) -> dict[str, Any]:
     name="update_stock_location",
     description="Update a stock location. Payload should match the backend partial-update schema.",
 )
-async def update_stock_location(location_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+async def update_stock_location(
+    location_id: str,
+    payload: stock_payloads.StockLocationCreateUpdatePayload,
+) -> stock_payloads.StockLocationMutationResponsePayload:
     principal = get_current_principal(required=True)
     target_id = str(location_id or "").strip()
     if not target_id:
@@ -2162,7 +2276,7 @@ async def update_stock_location(location_id: str, payload: dict[str, Any]) -> di
         action="partial_update",
         method="patch",
         location_id=target_id,
-        data=payload,
+        data=_payload_to_data(payload),
     )
 
 
@@ -2170,7 +2284,9 @@ async def update_stock_location(location_id: str, payload: dict[str, Any]) -> di
     name="get_stock_item_tracking_history",
     description="Get the full movement history for an inventory stock item.",
 )
-async def get_stock_item_tracking_history(inventory_item_id: str) -> dict[str, Any]:
+async def get_stock_item_tracking_history(
+    inventory_item_id: str,
+) -> stock_payloads.StockItemActionResponsePayload:
     principal = get_current_principal(required=True)
     target_id = str(inventory_item_id or "").strip()
     if not target_id:
@@ -2187,7 +2303,10 @@ async def get_stock_item_tracking_history(inventory_item_id: str) -> dict[str, A
     name="update_stock_item_status",
     description="Update the lifecycle status of an inventory stock item.",
 )
-async def update_stock_item_status(inventory_item_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+async def update_stock_item_status(
+    inventory_item_id: str,
+    payload: stock_payloads.StockStatusUpdatePayload,
+) -> stock_payloads.StockItemActionResponsePayload:
     principal = get_current_principal(required=True)
     target_id = str(inventory_item_id or "").strip()
     if not target_id:
@@ -2199,7 +2318,7 @@ async def update_stock_item_status(inventory_item_id: str, payload: dict[str, An
         action="update_status",
         method="post",
         inventory_item_id=target_id,
-        data=payload,
+        data=_payload_to_data(payload),
     )
 
 
@@ -2207,7 +2326,9 @@ async def update_stock_item_status(inventory_item_id: str, payload: dict[str, An
     name="search_expiring_stock_items",
     description="List stock items that are expiring soon.",
 )
-async def search_expiring_stock_items(days: int = 30) -> dict[str, Any]:
+async def search_expiring_stock_items(
+    days: int = 30,
+) -> stock_payloads.StockItemActionResponsePayload:
     principal = get_current_principal(required=True)
     return await sync_to_async(_stock_item_action_sync, thread_sensitive=True)(
         principal=principal,
@@ -2221,7 +2342,7 @@ async def search_expiring_stock_items(days: int = 30) -> dict[str, Any]:
     name="search_low_stock_items",
     description="List low-stock inventory items from the stock service dashboard view.",
 )
-async def search_low_stock_items() -> dict[str, Any]:
+async def search_low_stock_items() -> stock_payloads.StockItemActionResponsePayload:
     principal = get_current_principal(required=True)
     return await sync_to_async(_stock_item_action_sync, thread_sensitive=True)(
         principal=principal,
@@ -2234,7 +2355,9 @@ async def search_low_stock_items() -> dict[str, Any]:
     name="list_purchase_order_line_items",
     description="List line items for a purchase order.",
 )
-async def list_purchase_order_line_items(purchase_order_id: str) -> dict[str, Any]:
+async def list_purchase_order_line_items(
+    purchase_order_id: str,
+) -> orders_payloads.PurchaseOrderLineItemsResponsePayload:
     principal = get_current_principal(required=True)
     target_id = str(purchase_order_id or "").strip()
     if not target_id:
@@ -2251,7 +2374,10 @@ async def list_purchase_order_line_items(purchase_order_id: str) -> dict[str, An
     name="add_purchase_order_line_item",
     description="Add a line item to a purchase order.",
 )
-async def add_purchase_order_line_item(purchase_order_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+async def add_purchase_order_line_item(
+    purchase_order_id: str,
+    payload: orders_payloads.PurchaseOrderLineItemActionPayload,
+) -> orders_payloads.PurchaseOrderLineItemsResponsePayload:
     principal = get_current_principal(required=True)
     target_id = str(purchase_order_id or "").strip()
     if not target_id:
@@ -2263,7 +2389,7 @@ async def add_purchase_order_line_item(purchase_order_id: str, payload: dict[str
         purchase_order_id=target_id,
         action="add_line_item",
         method="post",
-        data=payload,
+        data=_payload_to_data(payload),
     )
 
 
@@ -2271,7 +2397,10 @@ async def add_purchase_order_line_item(purchase_order_id: str, payload: dict[str
     name="update_purchase_order_line_item",
     description="Update an existing purchase-order line item.",
 )
-async def update_purchase_order_line_item(purchase_order_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+async def update_purchase_order_line_item(
+    purchase_order_id: str,
+    payload: orders_payloads.PurchaseOrderLineItemActionPayload,
+) -> orders_payloads.PurchaseOrderLineItemsResponsePayload:
     principal = get_current_principal(required=True)
     target_id = str(purchase_order_id or "").strip()
     if not target_id:
@@ -2283,7 +2412,7 @@ async def update_purchase_order_line_item(purchase_order_id: str, payload: dict[
         purchase_order_id=target_id,
         action="update_line_item",
         method="patch",
-        data=payload,
+        data=_payload_to_data(payload),
     )
 
 
@@ -2291,7 +2420,10 @@ async def update_purchase_order_line_item(purchase_order_id: str, payload: dict[
     name="remove_purchase_order_line_item",
     description="Remove a line item from a purchase order.",
 )
-async def remove_purchase_order_line_item(purchase_order_id: str, line_item_id: str) -> dict[str, Any]:
+async def remove_purchase_order_line_item(
+    purchase_order_id: str,
+    line_item_id: str,
+) -> orders_payloads.PurchaseOrderLineItemsResponsePayload:
     principal = get_current_principal(required=True)
     target_order_id = str(purchase_order_id or "").strip()
     target_line_item_id = str(line_item_id or "").strip()
@@ -2312,7 +2444,9 @@ async def remove_purchase_order_line_item(purchase_order_id: str, line_item_id: 
     name="download_purchase_order_pdf",
     description="Download a purchase order PDF. Returns filename, content type, size, and base64 payload.",
 )
-async def download_purchase_order_pdf(purchase_order_id: str) -> dict[str, Any]:
+async def download_purchase_order_pdf(
+    purchase_order_id: str,
+) -> orders_payloads.PurchaseOrderAdminResponsePayload:
     principal = get_current_principal(required=True)
     target_id = str(purchase_order_id or "").strip()
     if not target_id:
@@ -2329,7 +2463,9 @@ async def download_purchase_order_pdf(purchase_order_id: str) -> dict[str, Any]:
     name="resend_purchase_order_email",
     description="Resend a purchase-order email to the supplier.",
 )
-async def resend_purchase_order_email(purchase_order_id: str) -> dict[str, Any]:
+async def resend_purchase_order_email(
+    purchase_order_id: str,
+) -> orders_payloads.PurchaseOrderAdminResponsePayload:
     principal = get_current_principal(required=True)
     target_id = str(purchase_order_id or "").strip()
     if not target_id:
@@ -2346,7 +2482,9 @@ async def resend_purchase_order_email(purchase_order_id: str) -> dict[str, Any]:
     name="list_sales_order_line_items",
     description="List line items for a sales order.",
 )
-async def list_sales_order_line_items(sales_order_id: str) -> dict[str, Any]:
+async def list_sales_order_line_items(
+    sales_order_id: str,
+) -> orders_payloads.SalesOrderLineItemsResponsePayload:
     principal = get_current_principal(required=True)
     target_id = str(sales_order_id or "").strip()
     if not target_id:
@@ -2363,7 +2501,9 @@ async def list_sales_order_line_items(sales_order_id: str) -> dict[str, Any]:
     name="get_sales_order_shipments",
     description="Get shipments for a sales order.",
 )
-async def get_sales_order_shipments(sales_order_id: str) -> dict[str, Any]:
+async def get_sales_order_shipments(
+    sales_order_id: str,
+) -> orders_payloads.SalesOrderLineItemsResponsePayload:
     principal = get_current_principal(required=True)
     target_id = str(sales_order_id or "").strip()
     if not target_id:
@@ -2380,7 +2520,10 @@ async def get_sales_order_shipments(sales_order_id: str) -> dict[str, Any]:
     name="add_sales_order_line_item",
     description="Add a line item to a sales order.",
 )
-async def add_sales_order_line_item(sales_order_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+async def add_sales_order_line_item(
+    sales_order_id: str,
+    payload: orders_payloads.SalesOrderLineItemActionPayload,
+) -> orders_payloads.SalesOrderLineItemsResponsePayload:
     principal = get_current_principal(required=True)
     target_id = str(sales_order_id or "").strip()
     if not target_id:
@@ -2392,7 +2535,7 @@ async def add_sales_order_line_item(sales_order_id: str, payload: dict[str, Any]
         sales_order_id=target_id,
         action="add_line_item",
         method="post",
-        data=payload,
+        data=_payload_to_data(payload),
     )
 
 
@@ -2400,7 +2543,10 @@ async def add_sales_order_line_item(sales_order_id: str, payload: dict[str, Any]
     name="update_sales_order_line_item",
     description="Update an existing sales-order line item.",
 )
-async def update_sales_order_line_item(sales_order_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+async def update_sales_order_line_item(
+    sales_order_id: str,
+    payload: orders_payloads.SalesOrderLineItemActionPayload,
+) -> orders_payloads.SalesOrderLineItemsResponsePayload:
     principal = get_current_principal(required=True)
     target_id = str(sales_order_id or "").strip()
     if not target_id:
@@ -2412,7 +2558,7 @@ async def update_sales_order_line_item(sales_order_id: str, payload: dict[str, A
         sales_order_id=target_id,
         action="update_line_item",
         method="patch",
-        data=payload,
+        data=_payload_to_data(payload),
     )
 
 
@@ -2420,7 +2566,10 @@ async def update_sales_order_line_item(sales_order_id: str, payload: dict[str, A
     name="remove_sales_order_line_item",
     description="Remove a line item from a sales order.",
 )
-async def remove_sales_order_line_item(sales_order_id: str, line_item_id: str) -> dict[str, Any]:
+async def remove_sales_order_line_item(
+    sales_order_id: str,
+    line_item_id: str,
+) -> orders_payloads.SalesOrderLineItemsResponsePayload:
     principal = get_current_principal(required=True)
     target_order_id = str(sales_order_id or "").strip()
     target_line_item_id = str(line_item_id or "").strip()
