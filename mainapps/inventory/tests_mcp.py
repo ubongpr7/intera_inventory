@@ -1,6 +1,7 @@
 import asyncio
 import os
 from decimal import Decimal
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from django.test import SimpleTestCase
@@ -8,11 +9,13 @@ from starlette.testclient import TestClient
 
 from mainapps.inventory.models import Inventory, InventoryItem
 from mcp_server.server import (
+    InventoryMcpPrincipal,
     _build_principal_from_token,
     _build_transport_security_settings,
     _extract_bearer_token,
     _inventory_item_payload,
     _inventory_payload,
+    _invoke_view_action_sync,
     _principal_var,
     app as inventory_mcp_app,
     search_inventories,
@@ -129,6 +132,43 @@ class InventoryMcpToolTests(SimpleTestCase):
                 asyncio.run(search_inventories(query="warehouse"))
         finally:
             _principal_var.reset(token)
+
+    @patch("mcp_server.server.APIRequestFactory.get")
+    def test_invoke_view_action_sync_omits_none_query_params_from_get_request(self, factory_get):
+        principal = InventoryMcpPrincipal(
+            token="jwt-token",
+            claims={},
+            user_id="1",
+            profile_id=1,
+            company_code=None,
+            permissions=set(),
+        )
+
+        captured_request = object()
+        factory_get.return_value = captured_request
+
+        class _DummyViewSet:
+            @staticmethod
+            def as_view(actions):
+                _ = actions
+                return lambda request, pk=None: SimpleNamespace(status_code=200, data={"request_matches": request is captured_request, "pk": pk})
+
+        payload = _invoke_view_action_sync(
+            principal=principal,
+            viewset_cls=_DummyViewSet,
+            action="list",
+            method="get",
+            query_params={
+                "search": "",
+                "is_active": None,
+                "page_size": 25,
+            },
+        )
+
+        self.assertEqual(payload, {"request_matches": True, "pk": None})
+        _, kwargs = factory_get.call_args
+        self.assertEqual(kwargs["data"], {"page_size": 25})
+        self.assertEqual(kwargs["HTTP_AUTHORIZATION"], "Bearer jwt-token")
 
 
 class InventoryMcpAppTests(SimpleTestCase):

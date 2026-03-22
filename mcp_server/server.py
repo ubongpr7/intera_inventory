@@ -771,9 +771,12 @@ def _invoke_view_action_sync(
     factory = APIRequestFactory()
     http_method = method.lower().strip()
     path = "/mcp/internal"
+    sanitized_query_params = {
+        key: value for key, value in (query_params or {}).items() if value not in (None, "")
+    }
     if query_params:
         encoded_query = urlencode(
-            {key: value for key, value in query_params.items() if value not in (None, "")},
+            sanitized_query_params,
             doseq=True,
         )
         if encoded_query:
@@ -781,7 +784,7 @@ def _invoke_view_action_sync(
     auth_header = f"Bearer {principal.token}"
 
     if http_method == "get":
-        request = factory.get(path, data=query_params or {}, format="json", HTTP_AUTHORIZATION=auth_header)
+        request = factory.get(path, data=sanitized_query_params, format="json", HTTP_AUTHORIZATION=auth_header)
     elif http_method == "post":
         request = factory.post(path, data=data or {}, format="json", HTTP_AUTHORIZATION=auth_header)
     elif http_method == "patch":
