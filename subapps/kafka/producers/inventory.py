@@ -8,7 +8,7 @@ from typing import Any
 
 from django.db.models import Sum
 
-from mainapps.inventory.models import Inventory, InventoryItem, InventoryItemStatus
+from mainapps.inventory.models import InventoryItem, InventoryItemStatus
 from mainapps.projections.models import CatalogVariantProjection
 from mainapps.stock.models import StockBalance, StockReservation
 from subapps.kafka.client import publish_event
@@ -36,19 +36,6 @@ def _coerce_threshold(value: Any) -> int | None:
     if threshold <= 0:
         return None
     return int(math.ceil(float(threshold)))
-
-
-def _resolve_legacy_inventory_external_id(inventory_item: InventoryItem) -> str:
-    metadata = inventory_item.metadata or {}
-    legacy_inventory_id = metadata.get("legacy_inventory_id")
-    if not legacy_inventory_id:
-        return ""
-    return (
-        Inventory.objects.filter(id=legacy_inventory_id)
-        .values_list("external_system_id", flat=True)
-        .first()
-        or ""
-    )
 
 
 def _resolve_catalog_variant(inventory_item: InventoryItem) -> CatalogVariantProjection | None:
@@ -171,7 +158,6 @@ def _build_availability_snapshot(inventory_item: InventoryItem) -> dict[str, Any
         ),
         "profile_id": inventory_item.profile_id,
         "inventory_item_id": str(inventory_item.id),
-        "inventory_external_id": _resolve_legacy_inventory_external_id(inventory_item),
         "variant_barcode": (
             variant.variant_barcode if variant is not None else inventory_item.barcode_snapshot or None
         ),

@@ -33,13 +33,19 @@ from starlette.responses import JSONResponse
 from starlette.routing import Mount, Route
 import uvicorn
 
-from mainapps.inventory.models import Inventory, InventoryItem
-from mainapps.inventory.views import InventoryCategoryViewSet, InventoryViewSet
+from mainapps.inventory.models import InventoryItem
+from mainapps.inventory.views import (
+    InventoryCategoryViewSet,
+    InventoryItemViewSet as InventoryCatalogItemViewSet,
+)
 from mainapps.stock.models import StockLocation, StockMovement, StockReservation, StockSerial, StockLot
-from mainapps.stock.views import StockItemViewSet, StockLocationViewSet, StockReservationViewSet
+from mainapps.stock.views import (
+    InventoryItemViewSet as InventoryOperationsItemViewSet,
+    StockLocationViewSet,
+    StockReservationViewSet,
+)
 from subapps.services.inventory_read_model import (
     get_inventory_item_summary_map,
-    get_inventory_summary_map,
     get_location_stock_summary,
     get_profile_stock_analytics,
 )
@@ -194,35 +200,6 @@ def _stringify(value: Any) -> str:
     return str(value).strip()
 
 
-def _inventory_payload(inventory: Inventory, *, summary: dict[str, Any] | None = None) -> dict[str, Any]:
-    resolved_summary = summary or {}
-    return {
-        "id": str(inventory.id),
-        "name": inventory.name,
-        "external_system_id": inventory.external_system_id,
-        "description": inventory.description or "",
-        "inventory_type": inventory.inventory_type,
-        "category": inventory.category.name if inventory.category_id and inventory.category else None,
-        "unit_name": inventory.unit_name,
-        "active": inventory.active,
-        "trackable": inventory.trackable,
-        "batch_tracking_enabled": inventory.batch_tracking_enabled,
-        "automate_reorder": inventory.automate_reorder,
-        "minimum_stock_level": _decimal_to_float(inventory.minimum_stock_level),
-        "re_order_point": _decimal_to_float(inventory.re_order_point),
-        "re_order_quantity": _decimal_to_float(inventory.re_order_quantity),
-        "current_stock_level": _decimal_to_float(resolved_summary.get("current_stock_level", Decimal("0"))),
-        "quantity_reserved": _decimal_to_float(resolved_summary.get("quantity_reserved", Decimal("0"))),
-        "quantity_available": _decimal_to_float(resolved_summary.get("quantity_available", Decimal("0"))),
-        "total_stock_value": _decimal_to_float(resolved_summary.get("total_stock_value", Decimal("0"))),
-        "stock_status": resolved_summary.get("stock_status") or inventory.stock_status,
-        "total_locations": resolved_summary.get("total_locations", 0),
-        "expiring_soon_count": resolved_summary.get("expiring_soon_count", 0),
-        "location_breakdown": _to_json_compatible(resolved_summary.get("location_breakdown", [])),
-        "expiring_lots": _to_json_compatible(resolved_summary.get("expiring_lots", [])),
-    }
-
-
 def _inventory_item_payload(inventory_item: InventoryItem, *, summary: dict[str, Any] | None = None) -> dict[str, Any]:
     resolved_summary = summary or {}
     return {
@@ -333,9 +310,9 @@ def _movement_payload(movement: StockMovement) -> dict[str, Any]:
     }
 
 
-def _inventory_queryset(*, principal: InventoryMcpPrincipal) -> QuerySet[Inventory]:
+def _inventory_queryset(*, principal: InventoryMcpPrincipal) -> QuerySet[InventoryItem]:
     return scope_queryset_by_identity(
-        Inventory.objects.select_related("category", "default_supplier").order_by("-created_at", "name"),
+        InventoryItem.objects.select_related("inventory_category", "default_supplier").order_by("-created_at", "name_snapshot"),
         canonical_field="profile_id",
         legacy_field="profile",
         value=principal.profile_id,
@@ -388,31 +365,11 @@ def _stock_movement_queryset(*, principal: InventoryMcpPrincipal) -> QuerySet[St
         value=principal.profile_id,
     )
 
-def _get_all_inventory_sync(*, principal: InventoryMcpPrincipal) -> dict[str, Any]:
-    queryset = _inventory_queryset(principal=principal)
-    inventories = list(queryset)
-    summary_map = get_inventory_summary_map(inventories)
-    return {
-        "profile_id": principal.profile_id, 
-        "company_code": principal.company_code,
-        "count": len(inventories),
-        "results": [
-            _inventory_payload(inventory, summary=summary_map.get(inventory.id, {}))
-            for inventory in inventories
-        ],
-    }
-
 def _list_inventory_items_sync(
     *,
     principal: InventoryMcpPrincipal,
-    inventory_id: str | None = None,
 ) -> dict[str, Any]:
     queryset = _inventory_item_queryset(principal=principal)
-    if inventory_id:
-        inventory = _inventory_queryset(principal=principal).filter(id=inventory_id).first()
-        if inventory is None:
-            raise ValueError("Inventory not found.")
-        queryset = queryset.filter(inventory_id=inventory_id)
     items = list(queryset)
     summary_map = get_inventory_item_summary_map(items) 
     return {
@@ -424,60 +381,7 @@ def _list_inventory_items_sync(
             for item in items
         ],
     }
-
-
-
-def _search_inventories_sync(
-    *,
-    principal: InventoryMcpPrincipal,
-    query: str,
-    limit: int,
-    active_only: bool | None,
-    inventory_type: str | None,
-) -> dict[str, Any]:
-    queryset = _inventory_queryset(principal=principal)
-    if active_only is True:
-        queryset = queryset.filter(active=True)
-    elif active_only is False:
-        queryset = queryset.filter(active=False)
-    if inventory_type:
-        queryset = queryset.filter(inventory_type=inventory_type)
-
-    search_term = query.strip()
-    queryset = queryset.filter(
-        Q(name__icontains=search_term)
-        | Q(description__icontains=search_term)
-        | Q(external_system_id__icontains=search_term)
-        | Q(category__name__icontains=search_term)
-    ).distinct()
-    inventories = list(queryset[:limit])
-    summary_map = get_inventory_summary_map(inventories)
-    return {
-        "query": search_term,
-        "count": len(inventories),
-        "limit": limit,
-        "profile_id": principal.profile_id,
-        "company_code": principal.company_code,
-        "results": [
-            _inventory_payload(inventory, summary=summary_map.get(inventory.id, {}))
-            for inventory in inventories
-        ],
-    }
-
-
-def _get_inventory_details_sync(*, principal: InventoryMcpPrincipal, inventory_id: str) -> dict[str, Any]:
-    inventory = _inventory_queryset(principal=principal).filter(id=inventory_id).first()
-    if inventory is None:
-        raise ValueError("Inventory not found.")
-    summary = get_inventory_summary_map([inventory]).get(inventory.id, {})
-    return {
-        "profile_id": principal.profile_id,
-        "company_code": principal.company_code,
-        "inventory": _inventory_payload(inventory, summary=summary),
-    }
-
-
-def _search_stock_items_sync(
+def _search_inventory_items_sync(
     *,
     principal: InventoryMcpPrincipal,
     query: str | None,
@@ -585,8 +489,10 @@ def _get_inventory_alerts_sync(
     limit: int,
     expiring_days: int,
 ) -> dict[str, Any]:
-    inventories = list(_inventory_queryset(principal=principal).filter(active=True))
-    summary_map = get_inventory_summary_map(inventories, expiring_days=expiring_days)
+    inventories = list(
+        _inventory_queryset(principal=principal).exclude(status__in=["archived", "discontinued"])
+    )
+    summary_map = get_inventory_item_summary_map(inventories, expiring_days=expiring_days)
     low_stock = []
     needs_reorder = []
     out_of_stock = []
@@ -594,15 +500,16 @@ def _get_inventory_alerts_sync(
 
     for inventory in inventories:
         summary = summary_map.get(inventory.id, {})
-        current_stock = Decimal(summary.get("current_stock_level", Decimal("0")))
-        payload = _inventory_payload(inventory, summary=summary)
+        current_stock = Decimal(summary.get("quantity", Decimal("0")))
+        payload = _inventory_item_payload(inventory, summary=summary)
         if current_stock <= 0:
             out_of_stock.append(payload)
         elif current_stock <= Decimal(inventory.minimum_stock_level):
             low_stock.append(payload)
-        elif current_stock <= Decimal(inventory.re_order_point):
+        elif current_stock <= Decimal(inventory.reorder_point):
             needs_reorder.append(payload)
-        if summary.get("expiring_soon_count", 0) > 0:
+        days_to_expiry = summary.get("days_to_expiry")
+        if days_to_expiry is not None and 0 <= int(days_to_expiry) <= expiring_days:
             expiring.append(payload)
 
     return {
@@ -1056,18 +963,18 @@ def _return_order_action_sync(
     }
 
 
-def _adjust_inventory_stock_via_view_sync(
+def _adjust_inventory_item_stock_via_view_sync(
     *,
     principal: InventoryMcpPrincipal,
-    inventory_id: str,
+    inventory_item_id: str,
     data: dict[str, Any],
 ) -> dict[str, Any]:
     payload = _invoke_view_action_sync(
         principal=principal,
-        viewset_cls=InventoryViewSet,
+        viewset_cls=InventoryCatalogItemViewSet,
         action="adjust_stock",
         method="post",
-        pk=inventory_id,
+        pk=inventory_item_id,
         data=data,
     )
     return {
@@ -1159,27 +1066,27 @@ def _inventory_category_action_sync(
     }
 
 
-def _inventory_crud_action_sync(
+def _inventory_item_crud_action_sync(
     *,
     principal: InventoryMcpPrincipal,
     action: str,
     method: str,
-    inventory_id: str | None = None,
+    inventory_item_id: str | None = None,
     data: dict[str, Any] | None = None,
     query_params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     payload = _invoke_view_action_sync(
         principal=principal,
-        viewset_cls=InventoryViewSet,
+        viewset_cls=InventoryCatalogItemViewSet,
         action=action,
         method=method,
-        pk=inventory_id,
+        pk=inventory_item_id,
         data=data,
         query_params=query_params,
     )
     return {
         "profile_id": principal.profile_id,
-        "inventory": payload,
+        "inventory_item": payload,
     }
 
 
@@ -1207,7 +1114,7 @@ def _stock_location_action_sync(
     }
 
 
-def _stock_item_action_sync(
+def _inventory_item_action_sync(
     *,
     principal: InventoryMcpPrincipal,
     action: str,
@@ -1218,7 +1125,7 @@ def _stock_item_action_sync(
 ) -> dict[str, Any]:
     payload = _invoke_view_action_sync(
         principal=principal,
-        viewset_cls=StockItemViewSet,
+        viewset_cls=InventoryOperationsItemViewSet,
         action=action,
         method=method,
         pk=inventory_item_id,
@@ -1345,79 +1252,20 @@ mcp = FastMCP(
     transport_security=_build_transport_security_settings(),
 )
 
-# _get_all_inventory_sync
-@mcp.tool(
-    name="get_all_inventory",
-    description="Retrieve all inventory ledgers for the authenticated workspace.",
-)
-async def get_all_inventory() -> inventory_payloads.InventoryCollectionResponsePayload:
-    principal = get_current_principal(required=True)
-    return await sync_to_async(_get_all_inventory_sync, thread_sensitive=True)(
-        principal=principal
-    )
-# _list_inventory_items_sync
 @mcp.tool(
     name="list_inventory_items",
     description="Retrieve all inventory items for the authenticated workspace.",
 )
-async def list_inventory_items(
-    inventory_id: str | None = None,
-) -> inventory_payloads.InventoryItemCollectionResponsePayload:
+async def list_inventory_items() -> inventory_payloads.InventoryItemCollectionResponsePayload:
     principal = get_current_principal(required=True)
     return await sync_to_async(_list_inventory_items_sync, thread_sensitive=True)(
         principal=principal,
-        inventory_id=str(inventory_id).strip() if inventory_id else None,
     )
-
-
-# _search_inventories_sync
-
 @mcp.tool(
-    name="search_inventories",
-    description="Search inventory ledgers for the authenticated workspace.",
-)
-async def search_inventories(
-    query: str,
-    limit: int = 10,
-    active_only: bool | None = True,
-    inventory_type: str | None = None,
-) -> inventory_payloads.InventoryCollectionResponsePayload:
-    principal = get_current_principal(required=True)
-    search_term = str(query or "").strip()
-    if not search_term:
-        raise ValueError("query is required")
-    limit_value = max(1, min(int(limit), 25))
-    return await sync_to_async(_search_inventories_sync, thread_sensitive=True)(
-        principal=principal,
-        query=search_term,
-        limit=limit_value,
-        active_only=active_only,
-        inventory_type=inventory_type,
-    )
-
-
-@mcp.tool(
-    name="get_inventory_details",
-    description="Get detailed stock posture for a single inventory ledger.",
-)
-async def get_inventory_details(
-    inventory_id: str,
-) -> inventory_payloads.InventoryDetailResponsePayload:
-    principal = get_current_principal(required=True)
-    target_inventory_id = str(inventory_id or "").strip()
-    if not target_inventory_id:
-        raise ValueError("inventory_id is required")
-    return await sync_to_async(_get_inventory_details_sync, thread_sensitive=True)(
-        principal=principal,
-        inventory_id=target_inventory_id,
-    )
-
-
-@mcp.tool(
-    name="search_stock_items",
+    name="search_inventory_items",
     description="Search inventory item records by name, SKU, barcode, or description.",
 )
-async def search_stock_items(
+async def search_inventory_items(
     query: str | None = None,
     limit: int = 10,
     inventory_type: str | None = None,
@@ -1426,7 +1274,7 @@ async def search_stock_items(
 ) -> inventory_payloads.InventoryItemCollectionResponsePayload:
     principal = get_current_principal(required=True)
     limit_value = max(1, min(int(limit), 25))
-    return await sync_to_async(_search_stock_items_sync, thread_sensitive=True)(
+    return await sync_to_async(_search_inventory_items_sync, thread_sensitive=True)(
         principal=principal,
         query=query,
         limit=limit_value,
@@ -1970,22 +1818,22 @@ async def cancel_return_order(
 
 
 @mcp.tool(
-    name="adjust_inventory_stock",
-    description="Adjust stock on an inventory ledger. Payload should match the backend adjust_stock action schema.",
+    name="adjust_inventory_item_stock",
+    description="Adjust stock on an inventory item. Payload should match the backend adjust_stock action schema.",
 )
-async def adjust_inventory_stock(
-    inventory_id: str,
+async def adjust_inventory_item_stock(
+    inventory_item_id: str,
     payload: stock_payloads.InventoryAdjustmentRequestPayload,
 ) -> stock_payloads.StockAdjustmentResultPayload:
     principal = get_current_principal(required=True)
-    target_id = str(inventory_id or "").strip()
+    target_id = str(inventory_item_id or "").strip()
     if not target_id:
-        raise ValueError("inventory_id is required")
+        raise ValueError("inventory_item_id is required")
     if not payload:
         raise ValueError("payload is required")
-    return await sync_to_async(_adjust_inventory_stock_via_view_sync, thread_sensitive=True)(
+    return await sync_to_async(_adjust_inventory_item_stock_via_view_sync, thread_sensitive=True)(
         principal=principal,
-        inventory_id=target_id,
+        inventory_item_id=target_id,
         data=_payload_to_data(payload),
     )
 
@@ -2143,7 +1991,7 @@ async def get_inventory_category_children(
 
 @mcp.tool(
     name="get_inventory_category_inventories",
-    description="Get inventories attached to an inventory category.",
+    description="Get inventory items attached to an inventory category.",
 )
 async def get_inventory_category_inventories(
     category_id: str,
@@ -2154,7 +2002,7 @@ async def get_inventory_category_inventories(
         raise ValueError("category_id is required")
     return await sync_to_async(_inventory_category_action_sync, thread_sensitive=True)(
         principal=principal,
-        action="inventories",
+        action="items",
         method="get",
         category_id=target_id,
     )
@@ -2201,17 +2049,17 @@ async def update_inventory_category(
     )
 
 @mcp.tool(
-    name="create_inventory",
-    description="Create an inventory ledger/item definition. Payload should match the backend create schema.",
+    name="create_inventory_item",
+    description="Create an inventory item definition. Payload should match the backend create schema.",
 )
-async def create_inventory(
-    payload: inventory_payloads.InventoryCreateUpdatePayload,
-) -> inventory_payloads.InventoryMutationResponsePayload:
+async def create_inventory_item(
+    payload: inventory_payloads.InventoryItemCreateUpdatePayload,
+) -> inventory_payloads.InventoryItemMutationResponsePayload:
     #  we need to properly define all payload fields and validation for this tool before we can safely expose it, as it has significant potential to cause data integrity issues if used incorrectly. For now, we'll leave this as a passthrough to the view action and require internal access until we can build out a more robust interface for inventory creation.
     principal = get_current_principal(required=True)
     if not payload:
         raise ValueError("payload is required")
-    return await sync_to_async(_inventory_crud_action_sync, thread_sensitive=True)(
+    return await sync_to_async(_inventory_item_crud_action_sync, thread_sensitive=True)(
         principal=principal,
         action="create",
         method="post",
@@ -2220,24 +2068,24 @@ async def create_inventory(
 
 
 @mcp.tool(
-    name="update_inventory",
-    description="Update an inventory ledger/item definition. Payload should match the backend partial-update schema.",
+    name="update_inventory_item",
+    description="Update an inventory item definition. Payload should match the backend partial-update schema.",
 )
-async def update_inventory(
-    inventory_id: str,
-    payload: inventory_payloads.InventoryCreateUpdatePayload,
-) -> inventory_payloads.InventoryMutationResponsePayload:
+async def update_inventory_item(
+    inventory_item_id: str,
+    payload: inventory_payloads.InventoryItemCreateUpdatePayload,
+) -> inventory_payloads.InventoryItemMutationResponsePayload:
     principal = get_current_principal(required=True)
-    target_id = str(inventory_id or "").strip()
+    target_id = str(inventory_item_id or "").strip()
     if not target_id:
-        raise ValueError("inventory_id is required")
+        raise ValueError("inventory_item_id is required")
     if not payload:
         raise ValueError("payload is required")
-    return await sync_to_async(_inventory_crud_action_sync, thread_sensitive=True)(
+    return await sync_to_async(_inventory_item_crud_action_sync, thread_sensitive=True)(
         principal=principal,
         action="partial_update",
         method="patch",
-        inventory_id=target_id,
+        inventory_item_id=target_id,
         data=_payload_to_data(payload),
     )
 
@@ -2284,17 +2132,17 @@ async def update_stock_location(
 
 
 @mcp.tool(
-    name="get_stock_item_tracking_history",
-    description="Get the full movement history for an inventory stock item.",
+    name="get_inventory_item_tracking_history",
+    description="Get the full movement history for an inventory item.",
 )
-async def get_stock_item_tracking_history(
+async def get_inventory_item_tracking_history(
     inventory_item_id: str,
-) -> stock_payloads.StockItemActionResponsePayload:
+) -> stock_payloads.InventoryItemActionResponsePayload:
     principal = get_current_principal(required=True)
     target_id = str(inventory_item_id or "").strip()
     if not target_id:
         raise ValueError("inventory_item_id is required")
-    return await sync_to_async(_stock_item_action_sync, thread_sensitive=True)(
+    return await sync_to_async(_inventory_item_action_sync, thread_sensitive=True)(
         principal=principal,
         action="tracking_history",
         method="get",
@@ -2303,20 +2151,20 @@ async def get_stock_item_tracking_history(
 
 
 @mcp.tool(
-    name="update_stock_item_status",
-    description="Update the lifecycle status of an inventory stock item.",
+    name="update_inventory_item_status",
+    description="Update the lifecycle status of an inventory item.",
 )
-async def update_stock_item_status(
+async def update_inventory_item_status(
     inventory_item_id: str,
     payload: stock_payloads.StockStatusUpdatePayload,
-) -> stock_payloads.StockItemActionResponsePayload:
+) -> stock_payloads.InventoryItemActionResponsePayload:
     principal = get_current_principal(required=True)
     target_id = str(inventory_item_id or "").strip()
     if not target_id:
         raise ValueError("inventory_item_id is required")
     if not payload:
         raise ValueError("payload is required")
-    return await sync_to_async(_stock_item_action_sync, thread_sensitive=True)(
+    return await sync_to_async(_inventory_item_action_sync, thread_sensitive=True)(
         principal=principal,
         action="update_status",
         method="post",
@@ -2326,14 +2174,14 @@ async def update_stock_item_status(
 
 
 @mcp.tool(
-    name="search_expiring_stock_items",
-    description="List stock items that are expiring soon.",
+    name="search_expiring_inventory_items",
+    description="List inventory items that are expiring soon.",
 )
-async def search_expiring_stock_items(
+async def search_expiring_inventory_items(
     days: int = 30,
-) -> stock_payloads.StockItemActionResponsePayload:
+) -> stock_payloads.InventoryItemActionResponsePayload:
     principal = get_current_principal(required=True)
-    return await sync_to_async(_stock_item_action_sync, thread_sensitive=True)(
+    return await sync_to_async(_inventory_item_action_sync, thread_sensitive=True)(
         principal=principal,
         action="expiring_soon",
         method="get",
@@ -2342,12 +2190,12 @@ async def search_expiring_stock_items(
 
 
 @mcp.tool(
-    name="search_low_stock_items",
+    name="search_low_inventory_items",
     description="List low-stock inventory items from the stock service dashboard view.",
 )
-async def search_low_stock_items() -> stock_payloads.StockItemActionResponsePayload:
+async def search_low_inventory_items() -> stock_payloads.InventoryItemActionResponsePayload:
     principal = get_current_principal(required=True)
-    return await sync_to_async(_stock_item_action_sync, thread_sensitive=True)(
+    return await sync_to_async(_inventory_item_action_sync, thread_sensitive=True)(
         principal=principal,
         action="low_stock",
         method="get",

@@ -6,11 +6,10 @@ from decimal import Decimal
 from django.db import models, transaction
 from django.utils import timezone
 
-from mainapps.inventory.models import Inventory, InventoryItem
+from mainapps.inventory.models import InventoryItem
 from mainapps.orders.models import GoodsReceipt, GoodsReceiptLine, PurchaseOrder, PurchaseOrderLineItem
 from mainapps.stock.models import (
     StockBalance,
-    StockItem,
     StockLocation,
     StockLot,
     StockSerial,
@@ -249,9 +248,8 @@ class StockDomainService:
     def transfer_stock(
         cls,
         *,
-        stock_item: StockItem | None = None,
-        inventory_item: InventoryItem | None = None,
-        from_location: StockLocation | None = None,
+        inventory_item: InventoryItem,
+        from_location: StockLocation,
         to_location: StockLocation,
         quantity,
         actor_user_id=None,
@@ -263,20 +261,10 @@ class StockDomainService:
         quantity = _to_decimal(quantity)
         if quantity <= 0:
             raise StockDomainError("Transfer quantity must be greater than zero.")
-        if stock_item is not None and from_location is None:
-            from_location = stock_item.location
-        if from_location is None:
-            raise StockDomainError("Source location is required for stock transfer.")
         if from_location.id == to_location.id:
             raise StockDomainError("Source and destination locations must be different.")
 
-        inventory_item, legacy_inventory, profile_id = cls._resolve_inventory_context(
-            inventory_item=inventory_item,
-            stock_item=stock_item,
-            actor_user_id=actor_user_id,
-        )
-        if stock_lot is None and stock_item is not None:
-            stock_lot = cls.resolve_stock_lot(stock_item=stock_item, inventory_item=inventory_item)
+        profile_id = cls._resolve_profile_id(inventory_item)
 
         if inventory_item.track_serial:
             transfer_count = _to_whole_number(quantity, label="Transfer quantity")
@@ -288,7 +276,7 @@ class StockDomainService:
                 stock_location=from_location,
                 stock_lot=stock_lot,
                 stock_serial=stock_serial,
-                serial_number=serial_number or (stock_item.serial if stock_item is not None else ""),
+                serial_number=serial_number,
                 allowed_statuses=[StockSerialStatus.AVAILABLE],
             )
             if stock_lot is None and stock_serial.stock_lot_id:
@@ -324,7 +312,6 @@ class StockDomainService:
             inventory_item=inventory_item,
             stock_location=from_location,
             stock_lot=stock_lot,
-            legacy_inventory=legacy_inventory,
             actor_user_id=actor_user_id,
         )
         source_available = _to_decimal(source_balance.quantity_available)
@@ -344,7 +331,6 @@ class StockDomainService:
             inventory_item=inventory_item,
             stock_location=to_location,
             stock_lot=stock_lot,
-            legacy_inventory=legacy_inventory,
             actor_user_id=actor_user_id,
         )
         destination_balance.quantity_on_hand = _to_decimal(destination_balance.quantity_on_hand) + quantity
@@ -389,8 +375,7 @@ class StockDomainService:
     def adjust_stock(
         cls,
         *,
-        inventory: Inventory | None = None,
-        inventory_item: InventoryItem | None = None,
+        inventory_item: InventoryItem,
         stock_location: StockLocation,
         quantity_change,
         actor_user_id=None,
@@ -400,17 +385,12 @@ class StockDomainService:
         if quantity_change == 0:
             raise StockDomainError("Quantity change cannot be zero.")
 
-        inventory_item, legacy_inventory, profile_id = cls._resolve_inventory_context(
-            inventory=inventory,
-            inventory_item=inventory_item,
-            actor_user_id=actor_user_id,
-        )
+        profile_id = cls._resolve_profile_id(inventory_item)
 
         balance = cls._get_locked_balance(
             profile_id=profile_id,
             inventory_item=inventory_item,
             stock_location=stock_location,
-            legacy_inventory=legacy_inventory,
             actor_user_id=actor_user_id,
         )
         previous_quantity = _to_decimal(balance.quantity_on_hand)
@@ -429,8 +409,8 @@ class StockDomainService:
             to_location=stock_location if quantity_change > 0 else None,
             movement_type=StockMovementType.ADJUSTMENT,
             quantity=quantity_change,
-            reference_type="inventory_item" if legacy_inventory is None else "inventory",
-            reference_id=str(inventory_item.id if legacy_inventory is None else legacy_inventory.id),
+            reference_type="inventory_item",
+            reference_id=str(inventory_item.id),
             actor_user_id=actor_user_id,
             notes=reason or "Manual stock adjustment",
             created_by_user_id=actor_user_id,
@@ -445,152 +425,18 @@ class StockDomainService:
         }
 
     @classmethod
-    def _resolve_inventory_context(
-        cls,
-        *,
-        inventory: Inventory | None = None,
-        inventory_item: InventoryItem | None = None,
-        stock_item: StockItem | None = None,
-        purchase_order_line: PurchaseOrderLineItem | None = None,
-        actor_user_id=None,
-    ) -> tuple[InventoryItem, Inventory | None, int]:
-        resolved_inventory_item = inventory_item
-        if resolved_inventory_item is None:
-            resolved_inventory_item = cls.ensure_inventory_item(
-                inventory=inventory,
-                stock_item=stock_item,
-                purchase_order_line=purchase_order_line,
-                actor_user_id=actor_user_id,
-            )
-
-        legacy_inventory = inventory or cls.resolve_legacy_inventory(resolved_inventory_item)
-        if legacy_inventory is None and stock_item is not None and stock_item.inventory_id:
-            legacy_inventory = stock_item.inventory
-        if legacy_inventory is None and purchase_order_line and purchase_order_line.stock_item_id:
-            legacy_inventory = purchase_order_line.stock_item.inventory
-
-        profile_source = resolved_inventory_item if resolved_inventory_item is not None else legacy_inventory
-        profile_id = cls._resolve_profile_id(profile_source)
-        return resolved_inventory_item, legacy_inventory, profile_id
-
-    @classmethod
     def ensure_inventory_item(
         cls,
         *,
-        inventory: Inventory | None = None,
-        stock_item: StockItem | None = None,
+        inventory_item: InventoryItem | None = None,
         purchase_order_line: PurchaseOrderLineItem | None = None,
         actor_user_id=None,
     ) -> InventoryItem:
+        if inventory_item is not None:
+            return inventory_item
         if purchase_order_line and purchase_order_line.inventory_item_id:
             return purchase_order_line.inventory_item
-
-        if inventory is None:
-            if stock_item and stock_item.inventory_id:
-                inventory = stock_item.inventory
-            elif purchase_order_line and purchase_order_line.stock_item_id and purchase_order_line.stock_item.inventory_id:
-                inventory = purchase_order_line.stock_item.inventory
-
-        if inventory is None:
-            raise StockDomainError("Unable to resolve inventory item for stock operation.")
-
-        profile_id = cls._resolve_profile_id(inventory)
-        inventory_item = (
-            InventoryItem.objects.filter(
-                metadata__legacy_inventory_id=str(inventory.id)
-            )
-            .order_by("created_at")
-            .first()
-        )
-        changed = inventory_item is None
-        if inventory_item is None:
-            inventory_item = InventoryItem(
-                profile_id=profile_id,
-                name_snapshot=inventory.name,
-                sku_snapshot="",
-                barcode_snapshot="",
-                description=inventory.description or "",
-                inventory_category=inventory.category,
-                inventory_type=inventory.inventory_type,
-                default_uom_code=inventory.unit or "",
-                stock_uom_code=inventory.unit_name or "",
-                track_stock=True,
-                track_lot=inventory.batch_tracking_enabled,
-                track_serial=inventory.trackable,
-                track_expiry=bool(inventory.expiration_threshold),
-                allow_negative_stock=False,
-                reorder_point=inventory.re_order_point,
-                reorder_quantity=inventory.re_order_quantity,
-                minimum_stock_level=inventory.minimum_stock_level,
-                safety_stock_level=inventory.safety_stock_level,
-                default_supplier=inventory.default_supplier,
-                metadata={"legacy_inventory_id": str(inventory.id)},
-                created_by_user_id=actor_user_id,
-                updated_by_user_id=actor_user_id,
-            )
-
-        metadata = dict(inventory_item.metadata or {})
-        if metadata.get("legacy_inventory_id") != str(inventory.id):
-            metadata["legacy_inventory_id"] = str(inventory.id)
-            inventory_item.metadata = metadata
-            changed = True
-        field_updates = {
-            "profile_id": profile_id,
-            "name_snapshot": inventory.name,
-            "description": inventory.description or "",
-            "inventory_category": inventory.category,
-            "inventory_type": inventory.inventory_type,
-            "default_uom_code": inventory.unit or "",
-            "stock_uom_code": inventory.unit_name or "",
-            "track_stock": True,
-            "track_lot": inventory.batch_tracking_enabled,
-            "track_serial": inventory.trackable,
-            "track_expiry": bool(inventory.expiration_threshold),
-            "allow_negative_stock": False,
-            "default_supplier": inventory.default_supplier,
-            "reorder_point": inventory.re_order_point,
-            "reorder_quantity": inventory.re_order_quantity,
-            "minimum_stock_level": inventory.minimum_stock_level,
-            "safety_stock_level": inventory.safety_stock_level,
-        }
-        for field_name, field_value in field_updates.items():
-            if getattr(inventory_item, field_name) != field_value:
-                setattr(inventory_item, field_name, field_value)
-                changed = True
-
-        catalog_variant = cls._resolve_catalog_variant_projection(
-            profile_id=profile_id,
-            inventory_item=inventory_item,
-            stock_item=stock_item,
-            purchase_order_line=purchase_order_line,
-        )
-        if catalog_variant is not None:
-            metadata = dict(inventory_item.metadata or {})
-            variant_barcode = catalog_variant.variant_barcode or metadata.get("legacy_variant_barcode", "")
-            catalog_updates = {
-                "product_template_id": catalog_variant.product_id,
-                "product_variant_id": catalog_variant.variant_id,
-                "barcode_snapshot": variant_barcode or inventory_item.barcode_snapshot,
-                "sku_snapshot": catalog_variant.variant_sku or inventory_item.sku_snapshot,
-            }
-            for field_name, field_value in catalog_updates.items():
-                if field_value and getattr(inventory_item, field_name) != field_value:
-                    setattr(inventory_item, field_name, field_value)
-                    changed = True
-            if variant_barcode and metadata.get("legacy_variant_barcode") != variant_barcode:
-                metadata["legacy_variant_barcode"] = variant_barcode
-                inventory_item.metadata = metadata
-                changed = True
-
-        if changed:
-            inventory_item.updated_by_user_id = actor_user_id
-            inventory_item.save()
-
-        if purchase_order_line and purchase_order_line.inventory_item_id != inventory_item.id:
-            purchase_order_line.inventory_item = inventory_item
-            purchase_order_line.updated_by_user_id = actor_user_id
-            purchase_order_line.save()
-        return inventory_item
+        raise StockDomainError("inventory_item is required for stock operations.")
 
     @classmethod
     def _resolve_stock_serial(
@@ -634,8 +480,7 @@ class StockDomainService:
     def reserve_stock(
         cls,
         *,
-        inventory: Inventory | None = None,
-        inventory_item: InventoryItem | None = None,
+        inventory_item: InventoryItem,
         stock_location: StockLocation,
         quantity,
         external_order_type: str,
@@ -652,11 +497,7 @@ class StockDomainService:
         if quantity <= 0:
             raise StockDomainError("Reservation quantity must be greater than zero.")
 
-        inventory_item, legacy_inventory, profile_id = cls._resolve_inventory_context(
-            inventory=inventory,
-            inventory_item=inventory_item,
-            actor_user_id=actor_user_id,
-        )
+        profile_id = cls._resolve_profile_id(inventory_item)
         if inventory_item.track_serial:
             reservation_count = _to_whole_number(quantity, label="Reservation quantity")
             if reservation_count != 1:
@@ -703,7 +544,6 @@ class StockDomainService:
             inventory_item=inventory_item,
             stock_location=stock_location,
             stock_lot=stock_lot,
-            legacy_inventory=legacy_inventory,
             actor_user_id=actor_user_id,
         )
         if _to_decimal(balance.quantity_available) < quantity and not inventory_item.allow_negative_stock:
@@ -763,9 +603,7 @@ class StockDomainService:
     def issue_stock(
         cls,
         *,
-        inventory: Inventory | None = None,
-        inventory_item: InventoryItem | None = None,
-        purchase_order_line: PurchaseOrderLineItem | None = None,
+        inventory_item: InventoryItem,
         stock_location: StockLocation,
         quantity,
         actor_user_id=None,
@@ -782,12 +620,7 @@ class StockDomainService:
         if quantity <= 0:
             raise StockDomainError("Issue quantity must be greater than zero.")
 
-        inventory_item, legacy_inventory, profile_id = cls._resolve_inventory_context(
-            inventory=inventory,
-            inventory_item=inventory_item,
-            purchase_order_line=purchase_order_line,
-            actor_user_id=actor_user_id,
-        )
+        profile_id = cls._resolve_profile_id(inventory_item)
         if inventory_item.track_serial:
             issue_count = _to_whole_number(quantity, label="Issue quantity")
             if issue_count != 1:
@@ -834,7 +667,6 @@ class StockDomainService:
             inventory_item=inventory_item,
             stock_location=stock_location,
             stock_lot=stock_lot,
-            legacy_inventory=legacy_inventory,
             actor_user_id=actor_user_id,
         )
 
@@ -916,7 +748,6 @@ class StockDomainService:
             inventory_item=reservation.inventory_item,
             stock_location=reservation.stock_location,
             stock_lot=reservation.stock_lot,
-            legacy_inventory=cls.resolve_legacy_inventory(reservation.inventory_item),
             actor_user_id=actor_user_id,
         )
         balance.quantity_reserved = max(
@@ -988,7 +819,6 @@ class StockDomainService:
             inventory_item=inventory_item,
             stock_location=reservation.stock_location,
             stock_lot=reservation.stock_lot,
-            legacy_inventory=cls.resolve_legacy_inventory(inventory_item),
             actor_user_id=actor_user_id,
         )
         if _to_decimal(balance.quantity_reserved) < fulfill_quantity:
@@ -1056,31 +886,6 @@ class StockDomainService:
         }
 
     @classmethod
-    def resolve_legacy_inventory(cls, inventory_item: InventoryItem | None):
-        if inventory_item is None:
-            return None
-        legacy_inventory_id = (inventory_item.metadata or {}).get("legacy_inventory_id")
-        if not legacy_inventory_id:
-            return None
-        return Inventory.objects.filter(id=legacy_inventory_id).first()
-
-    @classmethod
-    def resolve_stock_lot(
-        cls,
-        *,
-        stock_item: StockItem,
-        inventory_item: InventoryItem,
-    ):
-        profile_id = cls._resolve_profile_id(stock_item.inventory)
-        if not stock_item.batch:
-            return None
-        return StockLot.objects.filter(
-            profile_id=profile_id,
-            inventory_item=inventory_item,
-            lot_number=stock_item.batch,
-        ).order_by("-created_at").first()
-
-    @classmethod
     def _resolve_inventory_unit_cost(
         cls,
         *,
@@ -1123,7 +928,6 @@ class StockDomainService:
         *,
         profile_id: int,
         inventory_item: InventoryItem | None = None,
-        stock_item: StockItem | None = None,
         purchase_order_line: PurchaseOrderLineItem | None = None,
     ):
         from mainapps.projections.models import CatalogVariantProjection
@@ -1138,14 +942,7 @@ class StockDomainService:
         metadata = inventory_item.metadata if inventory_item and isinstance(inventory_item.metadata, dict) else {}
         for raw_value in [
             inventory_item.barcode_snapshot if inventory_item is not None else "",
-            metadata.get("legacy_variant_barcode", ""),
             inventory_item.sku_snapshot if inventory_item is not None else "",
-            stock_item.sku if stock_item is not None else "",
-            (
-                purchase_order_line.stock_item.sku
-                if purchase_order_line is not None and purchase_order_line.stock_item_id
-                else ""
-            ),
         ]:
             normalized = str(raw_value or "").strip()
             if normalized and normalized not in candidate_values:
@@ -1211,7 +1008,6 @@ class StockDomainService:
         inventory_item: InventoryItem,
         stock_location: StockLocation,
         stock_lot: StockLot | None = None,
-        legacy_inventory: Inventory | None = None,
         actor_user_id=None,
     ) -> StockBalance:
         balance = StockBalance.objects.select_for_update().filter(

@@ -192,14 +192,13 @@
         {% for item in line_items %}
         <tr>
             <td>{{ forloop.counter }}</td>
-            <td>{{ item.stock_item.name|default:"N/A" }}</td>
-            <td>{{ item.quantity }} {{item.stock_item.variant.product.unit.abbreviated_name}}</td>
+            <td>{{ item.inventory_item.name_snapshot|default:"N/A" }}</td>
+            <td>{{ item.quantity }} {{ item.inventory_item.stock_uom_code|default:item.inventory_item.default_uom_code }}</td>
             <td>{{ item.unit_price }}</td>
             <td>{{ item.discount }}</td>
             <td>{{ item.tax_amount }}</td>
             <td>{{ item.total_price }}</td>
-            <!-- <td>{{ item.stock_item.packaging }}</td> -->
-            <td>{{ item.stock_item.description|truncatechars:100 }}</td>
+            <td>{{ item.inventory_item.description|truncatechars:100 }}</td>
         </tr>
         {% endfor %}
     </tbody>

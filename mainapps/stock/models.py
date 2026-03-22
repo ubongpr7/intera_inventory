@@ -3,12 +3,10 @@ from django.urls import reverse
 from django.utils.translation import gettext_lazy as _
 from django.utils import timezone
 from mainapps.company.models import Company
-from mainapps.inventory.models import InventoryMixin
-from mainapps.orders.models import *
 from django.core.validators import MinValueValidator
 from django.db import models
 from mptt.models import MPTTModel, TreeForeignKey
-from mainapps.content_type_linking_models.models import TenantStampedUUIDModel, _sync_identity_fields
+from mainapps.content_type_linking_models.models import ProfileMixin, TenantStampedUUIDModel, _sync_identity_fields
 
 class StockStatus(models.TextChoices):
     OK = 'ok', _('OK')
@@ -192,260 +190,6 @@ class StockLocation(ProfileMixin, MPTTModel):
             self.code = f"{base}_{profile_id}_{sequence:03d}"
 
         super().save(*args, **kwargs)
-
-class StockItem(MPTTModel, InventoryMixin):
-
-
-    name = models.CharField(
-        max_length=200,
-        null=True,
-        blank=False,
-        verbose_name=_('Name'),
-        help_text=_('Name of the stock item'),
-    )
-    
-    inventory = models.ForeignKey('inventory.Inventory', on_delete=models.CASCADE, null=True,related_name='stock_items')
-    parent = TreeForeignKey(
-        'self',
-        verbose_name=_('Parent Stock Item'),
-        on_delete=models.DO_NOTHING,
-        blank=True,
-        null=True,
-        related_name='children',
-        help_text=_('Link to another StockItem from which this StockItem was created'),
-    )
-    
-    location = TreeForeignKey(
-        StockLocation,
-        on_delete=models.DO_NOTHING,
-        verbose_name=_('Stock Location'),
-        related_name='stock_items',
-        blank=True,
-        null=True,
-        help_text=_('Where this StockItem is located'),
-    )
-
-    packaging = models.CharField(
-        max_length=100,
-        blank=True,
-        null=True,
-        verbose_name=_('Packaging'),
-        help_text=_('Description of how the StockItem is packaged (e.g. "reel", "loose", "tape" etc)'),
-    )
-    
-    belongs_to = models.ForeignKey(
-        'self',
-        verbose_name=_('Installed In'),
-        on_delete=models.CASCADE,
-        related_name='installed_parts',
-        blank=True,
-        null=True,
-        help_text=_('Is this item installed in another item?'),
-    )
-
-    customer = models.CharField(
-        max_length=255,
-        blank=True,
-        null=True,
-        help_text=_('Customer ID'),
-        verbose_name=_('Customer ID'),
-    )
-
-    serial = models.CharField(
-        verbose_name=_('Serial Number'),
-        max_length=100,
-        blank=True,
-        null=True,
-        help_text=_('Unique serial number for this StockItem'),
-    )
-    
-    sku = models.CharField(
-        verbose_name=_('Stock keeping unit'),
-        max_length=100,
-        blank=True,
-        null=True,
-        help_text=_('Stock keeping unit for this stock item'),
-    )
-    
-    serial_int = models.IntegerField(default=0)
-    
-    link = models.URLField(
-        verbose_name=_('External Link'),
-        blank=True,
-        null=True,
-        help_text=_('Optional URL to link to an external resource'),
-    )
-
-    batch = models.CharField(
-        verbose_name=_('Batch Code'),
-        max_length=100,
-        blank=True,
-        null=True,
-        help_text=_('Batch code for this stock item'),
-    )
-
-    quantity = models.DecimalField(
-        verbose_name=_('Stock Quantity'),
-        max_digits=15,
-        decimal_places=5,
-        validators=[MinValueValidator(0)],  
-        default=1,
-    )
-
-    purchase_order = models.ForeignKey(
-        PurchaseOrder,
-        on_delete=models.SET_NULL,
-        verbose_name=_('Source Purchase Order'),
-        related_name='stock_items',
-        blank=True,
-        null=True,
-        help_text=_('Link to a PurchaseOrder (if this stock item was created from a PurchaseOrder)'),
-    )
-
-    sales_order = models.ForeignKey(
-        SalesOrder,
-        on_delete=models.SET_NULL,
-        verbose_name=_('Destination Sales Order'),
-        related_name='stock_items',
-        null=True,
-        blank=True,
-        help_text=_("Link item to a SalesOrder")
-    )
-
-    expiry_date = models.DateField(
-        blank=True,
-        null=True,
-        verbose_name=_('Expiry Date'),
-        help_text=_('Expiry date for stock item. Stock will be considered expired after this date'),
-    )
-
-    stocktake_date = models.DateField(blank=True, null=True)
-
-    stocktaker = models.CharField(
-        max_length=255,
-        blank=True,
-        null=True,
-        help_text=_('User  ID that performed the most recent stocktake'),
-    )
-    stocktaker_user_id = models.BigIntegerField(blank=True, null=True, db_index=True)
-
-    review_needed = models.BooleanField(default=False)
-
-    delete_on_deplete = models.BooleanField(
-        default=False,
-        verbose_name=_('Delete on deplete'),
-        help_text=_('Delete this Stock Item when stock is depleted'),
-    )
-
-    status = models.CharField(
-        default=StockStatus.OK,
-        choices=StockStatus.choices,
-        max_length=50,
-        verbose_name=_('Status'),
-        help_text=_('Status of this StockItem '),
-    )
-
-    purchase_price = models.DecimalField(
-        max_digits=30,
-        decimal_places=7,
-        blank=True,
-        null=True,
-        verbose_name=_('Purchase Price'),
-        help_text=_('Single unit purchase price at the time of purchase'),
-    )
-    
-    override_sales_price = models.DecimalField(
-        max_digits=10,
-        decimal_places=2,
-        null=True,
-        blank=True,
-        help_text="Temporary price override for this stock batch"
-    )    
-
-    notes = models.TextField(
-        blank=True,
-        null=True,
-        verbose_name=_('Notes'),
-        help_text=_('Extra notes field'),
-    )
-    
-    def __str__(self):
-        """Return a string representation of the StockItem."""
-        return f"{self.name} {self.serial or ''} - {self.quantity}"
-    
-    @property
-    def quantity_w_unit(self):
-        if self.inventory.unit:
-
-            if self.inventory.unit.dimension_type == 'piece':
-                return f'{int(self.quantity)} {self.inventory.get_unit}'
-            return f'{self.quantity} {self.inventory.get_unit}'
-        return f'{self.quantity}'
-
-    def save(self, *args, **kwargs):
-        _sync_identity_fields(self, canonical_field='stocktaker_user_id', legacy_field='stocktaker')
-        
-        try:
-
-            if not self.location:
-                if self.parent:
-                    if self.parent.location:
-                        self.location=self.parent.location
-                elif self.inventory.category.default_location:
-                    self.location=self.inventory.category.default_location
-                # else:
-                #     raise
-        except Exception as e:
-            print('Error occurred: ',e)
-
-
-        if not self.sku:
-            company_id = self.inventory.profile
-            inv_type = self.inventory.inventory_type[:4].upper()
-            category_code = ''.join([word[0] for word in self.inventory.category.name.split() if word])[:4].upper()
-            last_item = StockItem.objects.filter(inventory=self.inventory).order_by('created_at').last()
-            if last_item:
-                count =int(last_item.sku.split('-')[-1])
-            else:
-                count=0
-            count+=1
-
-            self.sku = f"STO-C{company_id}-{inv_type}-{category_code}-{count:04d}"
-        super().save(*args, **kwargs)
-
-    class Meta:
-        verbose_name = _('Stock Item')
-        verbose_name_plural = _('Stock Items')
-        ordering = ['name', 'serial']
-        indexes = [
-            models.Index(fields=['location']),
-            models.Index(fields=['batch', 'serial']),
-        ]
-
-
-class StockPricing(models.Model):
-    stock_item = models.ForeignKey(StockItem, on_delete=models.CASCADE, related_name='pricings')
-    selling_price = models.DecimalField(max_digits=12, decimal_places=2)
-    discount_flat = models.DecimalField(max_digits=12, decimal_places=2, default=0.00)
-    discount_rate = models.DecimalField(max_digits=5, decimal_places=2, default=0.00)  
-    tax_rate = models.DecimalField(max_digits=5, decimal_places=2, default=0.00)  
-
-    price_effective_from = models.DateTimeField(default=timezone.now)
-    price_effective_to = models.DateTimeField(null=True, blank=True)
-
-    def __str__(self):
-        return f"{self.stock_item.name} - ₦{self.selling_price}"
-
-    def get_discount_amount(self):
-        return (self.selling_price * self.discount_rate / 100) + self.discount_flat
-
-    def get_tax_amount(self):
-        price_after_discount = self.selling_price - self.get_discount_amount()
-        return price_after_discount * self.tax_rate / 100
-
-    def get_total_price(self):
-        return self.selling_price - self.get_discount_amount() + self.get_tax_amount()
-
 
 class StockLot(TenantStampedUUIDModel):
     inventory_item = models.ForeignKey(
@@ -635,68 +379,6 @@ class StockReservation(TenantStampedUUIDModel):
     def remaining_quantity(self):
         return max(self.reserved_quantity - self.fulfilled_quantity, 0)
 
-class StockItemTracking(InventoryMixin):
-    tracking_type = models.IntegerField(default=TrackingType.OTHER, choices=TrackingType.choices)
-
-    item = models.ForeignKey(
-        StockItem, on_delete=models.CASCADE, related_name='tracking_info'
-    )
-
-    date = models.DateTimeField(auto_now_add=True, editable=False)
-
-    notes = models.CharField(
-        blank=True,
-        null=True,
-        max_length=512,
-        verbose_name=_('Notes'),
-        help_text=_('Entry notes'),
-    )
-
-    user = models.CharField(
-        max_length=255,
-        blank=True,
-        null=True,
-        help_text=_('User  ID associated with this tracking info'),
-    )
-    performed_by_user_id = models.BigIntegerField(blank=True, null=True, db_index=True)
-
-    deltas = models.JSONField(null=True, blank=True)
-
-    @classmethod
-    def get_verbose_names(cls, p=None):
-        if str(p) == '0':
-            return "Stock Tracking "
-        return "Stock Tracking"
-
-    @property
-    def get_label(self):
-        return 'stockitemtracking'
-
-    @classmethod
-    def return_numbers(cls, profile):
-        try:
-            profile_value = int(str(profile).strip())
-        except (TypeError, ValueError):
-            return 0
-        return cls.objects.filter(
-            models.Q(inventory__profile_id=profile_value) | models.Q(inventory__profile=str(profile_value))
-        ).count()
-
-    class Meta:
-        indexes = [
-            models.Index(fields=['date', 'item'])
-        ]
-        constraints = [
-            models.CheckConstraint(
-                check=models.Q(tracking_type__in=TrackingType.values),
-                name='valid_tracking_type'
-            )
-        ]
-
-    def save(self, *args, **kwargs):
-        _sync_identity_fields(self, canonical_field='performed_by_user_id', legacy_field='user')
-        super().save(*args, **kwargs)
-
 class StockMovement(TenantStampedUUIDModel):
     inventory_item = models.ForeignKey(
         'inventory.InventoryItem',
@@ -792,7 +474,7 @@ class AuditMixin(models.Model):
         super().save(*args, **kwargs)
         
 class StockAdjustment(models.Model):
-    stock_item = models.ForeignKey(StockItem, related_name='adjustments', on_delete=models.CASCADE)
+    inventory_item = models.ForeignKey('inventory.InventoryItem', related_name='adjustments', on_delete=models.CASCADE)
     adjustment_type = models.CharField(max_length=50, choices=[('add', 'Add'), ('remove', 'Remove'), ('transfer', 'Transfer')])
     quantity_change = models.IntegerField()
     reason = models.TextField(blank=True, null=True)
@@ -801,9 +483,19 @@ class StockAdjustment(models.Model):
     adjusted_at = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):
-        return f"Adjustment of {self.quantity_change} for {self.stock_item}"
+        return f"Adjustment of {self.quantity_change} for {self.inventory_item}"
 
     def save(self, *args, **kwargs):
         _sync_identity_fields(self, canonical_field='adjusted_by_user_id', legacy_field='adjusted_by')
         super().save(*args, **kwargs)
-registerable_models = [StockLocationType, StockLocation, StockItemTracking, StockItem,StockAdjustment]
+
+registerable_models = [
+    StockLocationType,
+    StockLocation,
+    StockLot,
+    StockSerial,
+    StockBalance,
+    StockReservation,
+    StockMovement,
+    StockAdjustment,
+]

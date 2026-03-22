@@ -3,15 +3,13 @@ from django.db.models import Sum, Count
 from decimal import Decimal
 
 from mainapps.content_type_linking_models.serializers import UserDetailMixin
-from mainapps.inventory.models import Inventory, InventoryItem
+from mainapps.inventory.models import InventoryItem
 from subapps.services.inventory_read_model import (
     get_inventory_item_summary_map,
     get_location_stock_summary,
 )
 
-from .models import (
-     StockAdjustment, StockItem, StockLocation, StockItemTracking, StockLocationType, StockReservation, StockMovement
-)
+from .models import StockAdjustment, StockLocation, StockLocationType, StockReservation, StockMovement
 from subapps.services.catalog_projection import CatalogProjectionLookup
 
 class ProductImageMixin:
@@ -63,9 +61,7 @@ class StockLocationListSerializer(serializers.ModelSerializer):
     
     def get_stock_count(self, obj):
         active_balance_count = obj.stock_balances.filter(quantity_on_hand__gt=0).values('inventory_item').distinct().count()
-        if active_balance_count:
-            return active_balance_count
-        return obj.stock_items.count()
+        return active_balance_count
     def get_parent_name(self, obj):
         return f'{obj.parent.name} - {obj.parent.code}' if obj.parent else ''
 
@@ -140,8 +136,8 @@ class StockMovementListSerializer(UserDetailMixin, serializers.ModelSerializer):
         return self.get_user_details(obj.actor_user_id)
 
 
-class StockItemListSerializer(ProductImageMixin, InventoryItemSummaryMixin, serializers.ModelSerializer):
-    """Compatibility serializer that now exposes InventoryItem summaries."""
+class InventoryItemListSerializer(ProductImageMixin, InventoryItemSummaryMixin, serializers.ModelSerializer):
+    """List serializer for inventory items and their stock summaries."""
     name = serializers.CharField(source='name_snapshot', read_only=True)
     sku = serializers.SerializerMethodField()
     serial = serializers.SerializerMethodField()
@@ -204,27 +200,8 @@ class StockItemListSerializer(ProductImageMixin, InventoryItemSummaryMixin, seri
             or (str(obj.product_variant_id) if obj.product_variant_id else '')
         )
 
-class StockInventoryListSerializer(serializers.ModelSerializer):
-    """Lightweight serializer for inventory lists"""
-    category_name = serializers.CharField(source='category.name', read_only=True)
-    current_stock = serializers.SerializerMethodField()
-    stock_status = serializers.ReadOnlyField()
-    
-    class Meta:
-        model = Inventory
-        fields = [
-            'id', 'name', 'external_system_id', 'inventory_type',
-            'category_name', 'current_stock', 'stock_status', 'active',
-            'minimum_stock_level', 're_order_point', 'created_at'
-        ]
-      
-    def get_current_stock(self, obj):
-        return obj.current_stock_level
-  
-
-
-class StockItemDetailSerializer(ProductImageMixin, InventoryItemSummaryMixin, UserDetailMixin, serializers.ModelSerializer):
-    """Detailed stock serializer backed by InventoryItem and ledger summaries."""
+class InventoryItemDetailSerializer(ProductImageMixin, InventoryItemSummaryMixin, UserDetailMixin, serializers.ModelSerializer):
+    """Detailed serializer backed by InventoryItem and stock summaries."""
     name = serializers.CharField(source='name_snapshot', read_only=True)
     sku = serializers.SerializerMethodField()
     product_variant = serializers.SerializerMethodField()
@@ -378,51 +355,6 @@ class StockAdjustmentSerializer(serializers.ModelSerializer):
         model = StockAdjustment
         fields = '__all__'
 
-class StockItemTrackingListSerializer(UserDetailMixin, serializers.ModelSerializer):
-    """Serializer for stock tracking entries"""
-    tracking_type_display = serializers.CharField(source='get_tracking_type_display', read_only=True)
-    user_details = serializers.SerializerMethodField()
-    
-    class Meta:
-        model = StockItemTracking
-        fields = ['id', 'tracking_type', 'tracking_type_display', 'date', 'notes', 'user_details', 'deltas']
-    
-    def get_user_details(self, obj):
-        return UserDetailMixin.get_user_details(
-            self,
-            self.resolve_user_reference(obj, 'performed_by_user_id', 'user'),
-        )
-
-class LowStockItemSerializer(ProductImageMixin, serializers.ModelSerializer):
-    inventory_name = serializers.CharField(source='inventory.name', read_only=True)
-    minimum_stock_level = serializers.IntegerField(source='inventory.minimum_stock_level', read_only=True)
-    re_order_point = serializers.IntegerField(source='inventory.re_order_point', read_only=True)
-    shortfall = serializers.SerializerMethodField()
-    # display_image = serializers.SerializerMethodField() # Removed from here
-    display_image = serializers.SerializerMethodField()
-    
-    
-
-    class Meta:
-        model = StockItem
-        fields = [
-            'id',
-            'name',
-            'sku',
-            'quantity',
-            'inventory_name',
-            'minimum_stock_level',
-            're_order_point',
-            'shortfall',
-            'product_variant',
-            'display_image' # Added field
-        ]
-
-    def get_shortfall(self, obj):
-        if obj.inventory and obj.inventory.minimum_stock_level is not None and obj.quantity is not None:
-            return obj.inventory.minimum_stock_level - obj.quantity
-        return None
-
 
 class LowStockBalanceSerializer(serializers.Serializer):
     id = serializers.UUIDField()
@@ -431,7 +363,7 @@ class LowStockBalanceSerializer(serializers.Serializer):
     quantity = serializers.DecimalField(max_digits=15, decimal_places=5)
     inventory_name = serializers.CharField()
     minimum_stock_level = serializers.DecimalField(max_digits=15, decimal_places=5)
-    re_order_point = serializers.DecimalField(max_digits=15, decimal_places=5)
+    reorder_point = serializers.DecimalField(max_digits=15, decimal_places=5)
     shortfall = serializers.DecimalField(max_digits=15, decimal_places=5)
     product_variant = serializers.CharField(allow_blank=True)
     display_image = serializers.CharField(allow_null=True, allow_blank=True)
@@ -468,8 +400,7 @@ class StockReservationSerializer(serializers.ModelSerializer):
 
 
 class StockReservationCreateSerializer(serializers.Serializer):
-    inventory_id = serializers.UUIDField(required=False)
-    inventory_item_id = serializers.UUIDField(required=False)
+    inventory_item_id = serializers.UUIDField(required=True)
     location_id = serializers.UUIDField()
     quantity = serializers.DecimalField(max_digits=15, decimal_places=5)
     external_order_type = serializers.CharField(max_length=50)
@@ -480,12 +411,6 @@ class StockReservationCreateSerializer(serializers.Serializer):
     serial_number = serializers.CharField(required=False, allow_blank=True)
     expires_at = serializers.DateTimeField(required=False)
     notes = serializers.CharField(required=False, allow_blank=True)
-
-    def validate(self, attrs):
-        if not attrs.get('inventory_id') and not attrs.get('inventory_item_id'):
-            raise serializers.ValidationError("Either inventory_id or inventory_item_id is required.")
-        return attrs
-
 
 class StockReservationMutationSerializer(serializers.Serializer):
     quantity = serializers.DecimalField(max_digits=15, decimal_places=5, required=False)

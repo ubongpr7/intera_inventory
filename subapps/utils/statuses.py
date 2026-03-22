@@ -256,10 +256,10 @@ class StockHistoryCode(StatusCode):
 
     LEGACY = 0, _('Legacy stock tracking entry')
 
-    CREATED = 1, _('Stock item created')
+    CREATED = 1, _('Inventory item created')
 
     # Manual editing operations
-    EDITED = 5, _('Edited stock item')
+    EDITED = 5, _('Edited inventory item')
     ASSIGNED_SERIAL = 6, _('Assigned serial number')
 
     # Manual stock operations
@@ -283,9 +283,9 @@ class StockHistoryCode(StatusCode):
     SPLIT_CHILD_ITEM = 42, _('Split child item')
 
     # Stock merging operations
-    MERGED_STOCK_ITEMS = 45, _('Merged stock items')
+    MERGED_STOCK_ITEMS = 45, _('Merged inventory items')
 
-    # Convert stock item to variant
+    # Convert inventory item to variant
     CONVERTED_TO_VARIANT = 48, _('Converted to variant')
 
     # Build order codes

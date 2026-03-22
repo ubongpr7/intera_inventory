@@ -31,7 +31,6 @@ from mainapps.orders.serializers import (
     SalesOrderShipmentSerializer,
 )
 from mainapps.stock.models import (
-    StockItem,
     StockLocation,
     StockLot,
     StockMovementType,
@@ -43,7 +42,7 @@ from mainapps.stock.models import (
 from subapps.permissions.constants import PURCHASE_ORDER_PERMISSIONS, UNIFIED_PERMISSION_DICT
 from subapps.permissions.microservice_permissions import BaseCachePermissionViewset, HasModelRequestPermission, PermissionRequiredMixin
 from subapps.services.emails.email_services import EmailService
-from subapps.services.pdf.pdf_service import PDFService
+from subapps.services.pdf.pdf_service import PDFService, PDFServiceUnavailableError
 from subapps.services.identity_directory import IdentityDirectory
 from subapps.services.stock_domain import StockDomainError, StockDomainService
 from subapps.utils.request_context import (
@@ -1035,6 +1034,12 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
             
             return response
             
+        except PDFServiceUnavailableError as e:
+            logger.warning(f"PDF service unavailable for PO {purchase_order.reference}: {str(e)}")
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE
+            )
         except Exception as e:
             logger.error(f"Failed to generate PDF for PO {purchase_order.reference}: {str(e)}")
             return Response(
@@ -1073,6 +1078,12 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
             
             return response
             
+        except PDFServiceUnavailableError as e:
+            logger.warning(f"PDF service unavailable for bulk PDF generation: {str(e)}")
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE
+            )
         except Exception as e:
             logger.error(f"Failed to generate bulk PDF: {str(e)}")
             return Response(
@@ -1118,6 +1129,12 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
             return Response(
                 {'error': 'Purchase order not found'},
                 status=status.HTTP_404_NOT_FOUND
+            )
+        except PDFServiceUnavailableError as e:
+            logger.warning(f"PDF service unavailable while resending PO email: {str(e)}")
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE
             )
         except Exception as e:
             logger.error(f"Failed to resend email: {str(e)}")
@@ -1291,7 +1308,7 @@ class SalesOrderViewSet(BaseCachePermissionViewset):
             with transaction.atomic():
                 reservations = []
                 for item in payload['reservation_items']:
-                    line_item = sales_order.line_items.select_related('inventory').get(id=item['line_item_id'])
+                    line_item = sales_order.line_items.select_related('inventory_item').get(id=item['line_item_id'])
                     default_reserve_quantity = (
                         Decimal('1')
                         if item.get('stock_serial_id') or item.get('serial_number')
@@ -1329,7 +1346,6 @@ class SalesOrderViewSet(BaseCachePermissionViewset):
                             raise ValueError(f"Stock serial {stock_serial_id} not found")
 
                     reservation_result = StockDomainService.reserve_stock(
-                        inventory=line_item.inventory,
                         inventory_item=line_item.inventory_item,
                         stock_location=stock_location,
                         quantity=reserve_quantity,
@@ -1467,7 +1483,6 @@ class SalesOrderViewSet(BaseCachePermissionViewset):
         try:
             with transaction.atomic():
                 shipment_items_payload = payload['shipment_items']
-                first_inventory = None
                 for item in shipment_items_payload:
                     if 'reservation_id' in item:
                         reservation = StockReservation.objects.filter(
@@ -1478,17 +1493,14 @@ class SalesOrderViewSet(BaseCachePermissionViewset):
                         ).first()
                         if reservation is None:
                             raise ValueError(f"Reservation {item['reservation_id']} not found")
-                        line_item = sales_order.line_items.select_related('inventory').get(
+                        line_item = sales_order.line_items.select_related('inventory_item').get(
                             id=reservation.external_order_line_id
                         )
                     else:
-                        line_item = sales_order.line_items.select_related('inventory').get(id=item['line_item_id'])
-                    if first_inventory is None:
-                        first_inventory = line_item.inventory
+                        line_item = sales_order.line_items.select_related('inventory_item').get(id=item['line_item_id'])
 
                 shipment = SalesOrderShipment.objects.create(
                     order=sales_order,
-                    inventory=first_inventory,
                     shipment_date=payload.get('shipment_date') or timezone.now().date(),
                     delivery_date=payload.get('delivery_date'),
                     tracking_number=payload.get('tracking_number', ''),
@@ -1522,7 +1534,7 @@ class SalesOrderViewSet(BaseCachePermissionViewset):
                         if reservation is None:
                             raise ValueError(f"Reservation {item['reservation_id']} not found")
 
-                        line_item = sales_order.line_items.select_related('inventory').get(
+                        line_item = sales_order.line_items.select_related('inventory_item').get(
                             id=reservation.external_order_line_id
                         )
                         ship_quantity = Decimal(str(item.get('quantity', reservation.remaining_quantity)))
@@ -1547,7 +1559,7 @@ class SalesOrderViewSet(BaseCachePermissionViewset):
                         stock_lot = reservation.stock_lot
                         stock_serial = reservation.stock_serial
                     else:
-                        line_item = sales_order.line_items.select_related('inventory').get(id=item['line_item_id'])
+                        line_item = sales_order.line_items.select_related('inventory_item').get(id=item['line_item_id'])
                         if Decimal(str(line_item.reserved_quantity)) > 0:
                             raise ValueError(
                                 f"Line item {line_item.id} still has reserved stock. Fulfill or release reservations before direct shipping."
@@ -1587,7 +1599,6 @@ class SalesOrderViewSet(BaseCachePermissionViewset):
                                 raise ValueError(f"Stock serial {stock_serial_id} not found")
 
                         StockDomainService.issue_stock(
-                            inventory=line_item.inventory,
                             inventory_item=line_item.inventory_item,
                             stock_location=stock_location,
                             quantity=ship_quantity,
@@ -1753,7 +1764,6 @@ class ReturnOrderViewSet(BaseCachePermissionViewset):
         'line_items',
         'line_items__original_line_item',
         'line_items__original_line_item__inventory_item',
-        'line_items__original_line_item__stock_item',
     )
     filterset_fields = ['status', 'purchase_order']
     search_fields = ['reference', 'purchase_order__reference']
@@ -1813,7 +1823,6 @@ class ReturnOrderViewSet(BaseCachePermissionViewset):
                         return_line = return_order.line_items.select_related(
                             'original_line_item',
                             'original_line_item__inventory_item',
-                            'original_line_item__stock_item',
                         ).get(id=item['return_line_item_id'])
                     except ReturnOrderLineItem.DoesNotExist:
                         raise ValueError(f"Return line item {item['return_line_item_id']} not found")
@@ -1856,13 +1865,7 @@ class ReturnOrderViewSet(BaseCachePermissionViewset):
 
                     original_line = return_line.original_line_item
                     StockDomainService.issue_stock(
-                        inventory=(
-                            original_line.stock_item.inventory
-                            if original_line.stock_item_id and original_line.stock_item.inventory_id
-                            else None
-                        ),
                         inventory_item=original_line.inventory_item,
-                        purchase_order_line=original_line,
                         stock_location=stock_location,
                         quantity=issue_quantity,
                         actor_user_id=current_user_id,

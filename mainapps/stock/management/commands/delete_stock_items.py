@@ -1,14 +1,12 @@
 from django.core.management.base import BaseCommand
-from ...models import StockItem
+
+from mainapps.inventory.models import InventoryItem
+
 
 class Command(BaseCommand):
-    help = 'Delete all product categories'
+    help = 'Delete all inventory items'
 
     def handle(self, *args, **options):
-        # Count the number of categories before deletion
-        count = StockItem.objects.count()
-        
-        # Delete all product categories
-        StockItem.objects.all().delete()
-        
-        self.stdout.write(self.style.SUCCESS(f'Deleted {count} Variant Stocks.'))
+        count = InventoryItem.objects.count()
+        InventoryItem.objects.all().delete()
+        self.stdout.write(self.style.SUCCESS(f'Deleted {count} inventory items.'))

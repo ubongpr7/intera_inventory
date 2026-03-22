@@ -4,38 +4,11 @@ import uuid
 from datetime import date, datetime
 from typing import Optional, Literal, Dict, Any, List
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field
 
 # ------------------------------------------------------------------------------
 # Reusable enumerations (mirror Django choices)
 # ------------------------------------------------------------------------------
-
-class ReorderStrategies(str, Enum):
-    FIXED_QUANTITY = "FQ"
-    FIXED_INTERVAL = "FI"
-    DYNAMIC = "DY"
-
-class ExpirePolicies(str, Enum):
-    REMOVE = "0"
-    RETURN_MANUFACTURER = "1"
-
-class RecallPolicies(str, Enum):
-    REMOVE = "0"
-    NOTIFY_CUSTOMERS = "1"
-    REPLACE_PRODUCT = "3"
-    DESTROY = "4"
-    REPAIR = "5"
-
-class NearExpiryActions(str, Enum):
-    DISCOUNT = "DISCOUNT"
-    DONATE = "DONATE"
-    DESTROY = "DESTROY"
-    RETURN = "RETURN"
-
-class ForecastMethods(str, Enum):
-    SIMPLE_AVERAGE = "SA"
-    MOVING_AVERAGE = "MA"
-    EXP_SMOOTHING = "ES"
 
 class InventoryType(str, Enum):
     RAW_MATERIAL = "raw_material"
@@ -51,19 +24,6 @@ class InventoryItemStatus(str, Enum):
     ACTIVE = "active"
     ARCHIVED = "archived"
     DISCONTINUED = "discontinued"
-
-class SyncStatus(str, Enum):
-    SYNCED = "SYNCED"
-    PENDING = "PENDING"
-    ERROR = "ERROR"
-
-class TransactionType(str, Enum):
-    PO_RECEIVE = "PO_RECEIVE"
-    PO_COMPLETE = "PO_COMPLETE"
-    ADJUSTMENT = "ADJUSTMENT"
-    SALE = "SALE"
-    RETURN = "RETURN"
-    LOSS = "LOSS"
 
 # ------------------------------------------------------------------------------
 # Address
@@ -121,95 +81,6 @@ class InventoryItemCreateUpdatePayload(BaseModel):
     status: InventoryItemStatus = Field(InventoryItemStatus.ACTIVE, description="Item status")
     metadata: Dict[str, Any] = Field(default_factory=dict, description="Extra metadata")
 
-# ------------------------------------------------------------------------------
-# Inventory (central inventory model)
-# ------------------------------------------------------------------------------
-class InventoryCreateUpdatePayload(BaseModel):
-    """Payload for creating/updating an Inventory record."""
-    name: str = Field(..., description="Unique inventory name")
-    description: Optional[str] = Field(None, description="Detailed description")
-    category_id: Optional[uuid.UUID] = Field(None, description="UUID of InventoryCategory")
-    inventory_type: InventoryType = Field(InventoryType.RAW_MATERIAL, description="Type of inventory")
-    default_supplier_id: Optional[uuid.UUID] = Field(None, description="UUID of default supplier (Company)")
-    is_active: bool = Field(True, description="Active status")  # from InventoryProperty
-    # InventoryPolicy fields
-    unit: Optional[str] = Field(None, max_length=23, description="Unit abbreviation")
-    unit_name: Optional[str] = Field(None, max_length=23, description="Unit name")
-    re_order_point: int = Field(10, description="Reorder point (units)")
-    re_order_quantity: int = Field(200, description="Reorder quantity")
-    safety_stock_level: int = Field(0, description="Safety stock level")
-    minimum_stock_level: int = Field(0, description="Minimum stock level")
-    supplier_lead_time: int = Field(0, description="Supplier lead time (days)")
-    internal_processing_time: int = Field(1, description="Internal processing time (days)")
-    reorder_strategy: ReorderStrategies = Field(ReorderStrategies.FIXED_QUANTITY, description="Replenishment strategy")
-    expiration_threshold: int = Field(30, description="Days before expiry to alert")
-    expiration_policy: ExpirePolicies = Field(ExpirePolicies.REMOVE, description="Expiration handling policy")
-    recall_policy: RecallPolicies = Field(RecallPolicies.REMOVE, description="Recall procedure")
-    near_expiry_policy: NearExpiryActions = Field(NearExpiryActions.DISCOUNT, description="Near-expiry action")
-    forecast_method: ForecastMethods = Field(ForecastMethods.SIMPLE_AVERAGE, description="Demand forecasting method")
-    supplier_reliability_score: Decimal = Field(Decimal("100.0"), max_digits=5, decimal_places=2, description="Supplier score (0-100)")
-    alert_threshold: int = Field(10, description="Percentage variance for stock alerts")
-    external_system_id: Optional[str] = Field(None, max_length=200, description="External ERP/WMS identifier")
-    auto_archive_days: int = Field(365, description="Days of inactivity before archiving")
-    # InventoryProperty fields
-    assembly: bool = Field(False, description="Can be built from other inventory?")
-    batch_tracking_enabled: bool = Field(False, description="Enable batch/lot tracking")
-    automate_reorder: bool = Field(False, description="Auto-generate purchase orders")
-    component: bool = Field(False, description="Can be used to build other inventory?")
-    trackable: bool = Field(True, description="Enable unique item tracking?")
-    testable: bool = Field(False, description="Can have test results recorded?")
-    purchaseable: bool = Field(True, description="Can be purchased?")
-    salable: bool = Field(True, description="Can be sold?")
-    locked: bool = Field(False, description="Locked for editing?")
-    virtual: bool = Field(False, description="Virtual inventory (e.g., software)?")
-    # Inventory specific fields
-    sync_status: SyncStatus = Field(SyncStatus.PENDING, description="Sync status with external system")
-    last_sync_timestamp: Optional[datetime] = Field(None, description="Last sync timestamp")
-    sync_error_message: Optional[str] = Field(None, description="Error message if sync failed")
-    external_references: Dict[str, Any] = Field(default_factory=dict, description="External system references")
-    officer_in_charge: Optional[str] = Field(None, max_length=400, description="Officer in charge identifier")
-    officer_in_charge_user_id: Optional[int] = Field(None, description="User ID of officer in charge")
-
-    @field_validator("minimum_stock_level", "re_order_point", "re_order_quantity", "safety_stock_level")
-    def non_negative(cls, v):
-        if v < 0:
-            raise ValueError("Value cannot be negative")
-        return v
-
-    @field_validator("expiration_threshold", "supplier_lead_time", "internal_processing_time", "auto_archive_days")
-    def positive(cls, v):
-        if v < 0:
-            raise ValueError("Value must be non-negative")
-        return v
-
-# ------------------------------------------------------------------------------
-# InventoryBatch
-# ------------------------------------------------------------------------------
-class InventoryBatchCreateUpdatePayload(BaseModel):
-    """Payload for creating/updating an InventoryBatch."""
-    inventory_id: uuid.UUID = Field(..., description="UUID of the Inventory")
-    batch_number: str = Field(..., max_length=100, description="Batch/lot number")
-    manufacture_date: date = Field(..., description="Manufacture date")
-    expiry_date: date = Field(..., description="Expiry date")
-    quantity_received: Decimal = Field(..., max_digits=15, decimal_places=5, description="Quantity initially received")
-    remaining_quantity: Decimal = Field(..., max_digits=15, decimal_places=5, description="Remaining quantity in stock")
-    location_id: Optional[uuid.UUID] = Field(None, description="UUID of StockLocation where batch resides")
-
-# ------------------------------------------------------------------------------
-# InventoryTransaction
-# ------------------------------------------------------------------------------
-class InventoryTransactionCreateUpdatePayload(BaseModel):
-    """Payload for creating/updating an InventoryTransaction."""
-    item_id: uuid.UUID = Field(..., description="UUID of StockItem involved")
-    quantity: int = Field(..., description="Positive for additions, negative for deductions")
-    unit_price: Optional[Decimal] = Field(None, max_digits=15, decimal_places=2, description="Unit price at transaction time")
-    transaction_type: TransactionType = Field(..., description="Type of transaction")
-    reference: str = Field(..., max_length=64, description="Associated document number (PO, SO, etc.)")
-    user: Optional[str] = Field(None, max_length=100, description="Username who performed the transaction")
-    performed_by_user_id: Optional[int] = Field(None, description="User ID who performed the transaction")
-    notes: Optional[str] = Field(None, description="Additional notes")
-
-
 class McpPayloadModel(BaseModel):
     """Shared MCP contract model that preserves known schema while tolerating backend extras."""
 
@@ -225,43 +96,11 @@ class InventoryLocationBreakdownPayload(McpPayloadModel):
 
 
 class InventoryLotSnapshotPayload(McpPayloadModel):
-    id: Optional[str] = Field(None, description="Inventory lot identifier")
+    id: Optional[str] = Field(None, description="Stock lot identifier")
     lot_number: Optional[str] = Field(None, description="Lot number")
     expiry_date: Optional[str] = Field(None, description="ISO-8601 expiry date")
     remaining_quantity: Optional[float] = Field(None, description="Remaining quantity in the lot")
     status: Optional[str] = Field(None, description="Lot lifecycle status")
-
-
-class InventoryResponsePayload(McpPayloadModel):
-    id: str = Field(..., description="Inventory identifier")
-    name: str = Field(..., description="Inventory name")
-    external_system_id: Optional[str] = Field(None, description="External ERP/WMS identifier")
-    description: str = Field("", description="Inventory description")
-    inventory_type: Optional[str] = Field(None, description="Inventory type code")
-    category: Optional[str] = Field(None, description="Inventory category display name")
-    unit_name: Optional[str] = Field(None, description="Inventory unit name")
-    active: Optional[bool] = Field(None, description="Whether the inventory is active")
-    trackable: Optional[bool] = Field(None, description="Whether the inventory is trackable")
-    batch_tracking_enabled: Optional[bool] = Field(None, description="Whether lot tracking is enabled")
-    automate_reorder: Optional[bool] = Field(None, description="Whether reorder automation is enabled")
-    minimum_stock_level: Optional[float] = Field(None, description="Minimum stock threshold")
-    re_order_point: Optional[float] = Field(None, description="Reorder point threshold")
-    re_order_quantity: Optional[float] = Field(None, description="Recommended reorder quantity")
-    current_stock_level: Optional[float] = Field(None, description="Current stock level")
-    quantity_reserved: Optional[float] = Field(None, description="Reserved stock quantity")
-    quantity_available: Optional[float] = Field(None, description="Available stock quantity")
-    total_stock_value: Optional[float] = Field(None, description="Total stock value")
-    stock_status: Optional[str] = Field(None, description="Computed stock posture")
-    total_locations: int = Field(0, description="Number of locations holding this inventory")
-    expiring_soon_count: int = Field(0, description="Number of expiring lots")
-    location_breakdown: List[InventoryLocationBreakdownPayload] = Field(
-        default_factory=list,
-        description="Per-location stock posture",
-    )
-    expiring_lots: List[InventoryLotSnapshotPayload] = Field(
-        default_factory=list,
-        description="Expiring lot snapshots",
-    )
 
 
 class InventoryItemResponsePayload(McpPayloadModel):
@@ -318,21 +157,6 @@ class InventoryCategoryPagePayload(McpPayloadModel):
     results: List[InventoryCategoryResponsePayload] = Field(default_factory=list, description="Category results")
 
 
-class InventoryCollectionResponsePayload(McpPayloadModel):
-    profile_id: int = Field(..., description="Workspace profile identifier")
-    company_code: Optional[str] = Field(None, description="Workspace company code")
-    query: Optional[str] = Field(None, description="Applied search query")
-    count: int = Field(0, description="Number of returned records")
-    limit: Optional[int] = Field(None, description="Applied result limit")
-    results: List[InventoryResponsePayload] = Field(default_factory=list, description="Inventory results")
-
-
-class InventoryDetailResponsePayload(McpPayloadModel):
-    profile_id: int = Field(..., description="Workspace profile identifier")
-    company_code: Optional[str] = Field(None, description="Workspace company code")
-    inventory: InventoryResponsePayload = Field(..., description="Inventory payload")
-
-
 class InventoryItemCollectionResponsePayload(McpPayloadModel):
     profile_id: int = Field(..., description="Workspace profile identifier")
     company_code: Optional[str] = Field(None, description="Workspace company code")
@@ -347,9 +171,9 @@ class InventoryItemCollectionResponsePayload(McpPayloadModel):
 
 class InventoryCategoryCollectionResponsePayload(McpPayloadModel):
     profile_id: int = Field(..., description="Workspace profile identifier")
-    category: InventoryCategoryPagePayload | List[InventoryCategoryResponsePayload] | List[InventoryResponsePayload] = Field(
+    category: InventoryCategoryPagePayload | List[InventoryCategoryResponsePayload] | List[InventoryItemResponsePayload] = Field(
         ...,
-        description="Category list/tree payload or category inventory results",
+        description="Category list/tree payload or category inventory-item results",
     )
 
 
@@ -361,10 +185,10 @@ class InventoryCategoryDetailResponsePayload(McpPayloadModel):
 class InventoryAlertsResponsePayload(McpPayloadModel):
     profile_id: int = Field(..., description="Workspace profile identifier")
     expiring_days: int = Field(..., description="Expiry lookahead window in days")
-    low_stock: List[InventoryResponsePayload] = Field(default_factory=list, description="Low-stock ledgers")
-    needs_reorder: List[InventoryResponsePayload] = Field(default_factory=list, description="Reorder queues")
-    out_of_stock: List[InventoryResponsePayload] = Field(default_factory=list, description="Out-of-stock ledgers")
-    expiring_soon: List[InventoryResponsePayload] = Field(default_factory=list, description="Expiring ledgers")
+    low_stock: List[InventoryItemResponsePayload] = Field(default_factory=list, description="Low-stock inventory items")
+    needs_reorder: List[InventoryItemResponsePayload] = Field(default_factory=list, description="Reorder queues")
+    out_of_stock: List[InventoryItemResponsePayload] = Field(default_factory=list, description="Out-of-stock inventory items")
+    expiring_soon: List[InventoryItemResponsePayload] = Field(default_factory=list, description="Expiring inventory items")
 
 
 class InventoryAnalyticsCategoryBreakdownPayload(McpPayloadModel):
@@ -401,7 +225,7 @@ class InventoryAnalyticsPayload(McpPayloadModel):
         default_factory=InventoryAnalyticsStockStatusDistributionPayload,
         description="Stock status distribution",
     )
-    top_value_items: List[InventoryResponsePayload] = Field(default_factory=list, description="Top-value inventory ledgers")
+    top_value_items: List[InventoryItemResponsePayload] = Field(default_factory=list, description="Top-value inventory items")
     expiring_soon: List[InventoryAnalyticsExpiringSoonPayload] = Field(
         default_factory=list,
         description="Expiring inventory lots",
@@ -414,9 +238,15 @@ class InventoryAnalyticsResponsePayload(McpPayloadModel):
     analytics: InventoryAnalyticsPayload = Field(..., description="Workspace stock analytics payload")
 
 
-class InventoryMutationResponsePayload(McpPayloadModel):
+class InventoryItemSummaryResponsePayload(McpPayloadModel):
     profile_id: int = Field(..., description="Workspace profile identifier")
-    inventory: InventoryResponsePayload = Field(..., description="Inventory create/update result")
+    company_code: Optional[str] = Field(None, description="Workspace company code")
+    inventory_item: InventoryItemResponsePayload = Field(..., description="Inventory item payload")
+
+
+class InventoryItemMutationResponsePayload(McpPayloadModel):
+    profile_id: int = Field(..., description="Workspace profile identifier")
+    inventory_item: InventoryItemResponsePayload = Field(..., description="Inventory-item create/update result")
 
 
 class InventoryCategoryMutationResponsePayload(McpPayloadModel):
@@ -437,6 +267,9 @@ class InventoryStockAdjustmentResultPayload(McpPayloadModel):
     change: Optional[float] = Field(None, description="Applied quantity change")
 
 
-class InventoryActionResultPayload(McpPayloadModel):
+class InventoryItemActionResultPayload(McpPayloadModel):
     profile_id: int = Field(..., description="Workspace profile identifier")
-    inventory: InventoryStockAdjustmentResultPayload = Field(..., description="Backend inventory action response")
+    inventory_item: InventoryStockAdjustmentResultPayload = Field(
+        ...,
+        description="Backend inventory-item action response",
+    )

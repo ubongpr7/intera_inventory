@@ -6,17 +6,17 @@ class CombinedPermissions:
     Mirrors the permissions from the user microservice
     """
     
-    # Inventory Permissions
-    CREATE_INVENTORY = 'create_inventory'
-    READ_INVENTORY = 'read_inventory'
-    UPDATE_INVENTORY = 'update_inventory'
-    DELETE_INVENTORY = 'delete_inventory'
-    APPROVE_INVENTORY = 'approve_inventory'
-    REJECT_INVENTORY = 'reject_inventory'
-    ARCHIVE_INVENTORY = 'archive_inventory'
-    RESTORE_INVENTORY = 'restore_inventory'
-    MANAGE_INVENTORY_SETTINGS = 'manage_inventory_settings'
-    VIEW_INVENTORY_REPORTS = 'view_inventory_reports'
+    # Inventory Item Permissions
+    CREATE_INVENTORY_ITEM = 'create_inventory_item'
+    READ_INVENTORY_ITEM = 'read_inventory_item'
+    UPDATE_INVENTORY_ITEM = 'update_inventory_item'
+    DELETE_INVENTORY_ITEM = 'delete_inventory_item'
+    APPROVE_INVENTORY_ITEM = 'approve_inventory_item'
+    REJECT_INVENTORY_ITEM = 'reject_inventory_item'
+    ARCHIVE_INVENTORY_ITEM = 'archive_inventory_item'
+    RESTORE_INVENTORY_ITEM = 'restore_inventory_item'
+    MANAGE_INVENTORY_ITEM_SETTINGS = 'manage_inventory_item_settings'
+    VIEW_INVENTORY_ITEM_REPORTS = 'view_inventory_item_reports'
     VIEW_DASHBOARD_REPORTS = 'can_view_dashboard'
     
     # Inventory Category Permissions
@@ -43,14 +43,10 @@ class CombinedPermissions:
     UPDATE_PURCHASE_ORDER_LINE_ITEM = 'update_purchase_order_line_item'
     DELETE_PURCHASE_ORDER_LINE_ITEM = 'delete_purchase_order_line_item'
     
-    # Stock Item Permissions
-    CREATE_STOCK_ITEM = 'create_stock_item'
-    READ_STOCK_ITEM = 'read_stock_item'
-    UPDATE_STOCK_ITEM = 'update_stock_item'
-    DELETE_STOCK_ITEM = 'delete_stock_item'
-    TRANSFER_STOCK_ITEM = 'transfer_stock_item'
-    ADJUST_STOCK_ITEM_QUANTITY = 'adjust_stock_item_quantity'
-    VIEW_STOCK_ITEM_HISTORY = 'view_stock_item_history'
+    # Inventory Item Stock Operation Permissions
+    TRANSFER_INVENTORY_ITEM = 'transfer_inventory_item'
+    ADJUST_INVENTORY_ITEM_QUANTITY = 'adjust_inventory_item_quantity'
+    VIEW_INVENTORY_ITEM_HISTORY = 'view_inventory_item_history'
     
     # Stock Location Permissions
     CREATE_STOCK_LOCATION = 'create_stock_location'
@@ -74,17 +70,23 @@ class CombinedPermissions:
     APPROVE_SALES_ORDER = 'approve_sales_order'
     FULFILL_SALES_ORDER = 'fulfill_sales_order'
 
-INVENTORY_PERMISSIONS = {
-    'list': CombinedPermissions.READ_INVENTORY,
-    'retrieve': CombinedPermissions.READ_INVENTORY,
-    'create': CombinedPermissions.CREATE_INVENTORY,
-    'update': CombinedPermissions.UPDATE_INVENTORY,
-    'partial_update': CombinedPermissions.UPDATE_INVENTORY,
-    'destroy': CombinedPermissions.DELETE_INVENTORY,
-    'low_stock': CombinedPermissions.READ_INVENTORY,
-    'needs_reorder': CombinedPermissions.READ_INVENTORY,
-    'analytics': CombinedPermissions.VIEW_INVENTORY_REPORTS,
-    'adjust_stock': CombinedPermissions.ADJUST_STOCK_ITEM_QUANTITY,
+INVENTORY_ITEM_PERMISSIONS = {
+    'list': CombinedPermissions.READ_INVENTORY_ITEM,
+    'retrieve': CombinedPermissions.READ_INVENTORY_ITEM,
+    'create': CombinedPermissions.CREATE_INVENTORY_ITEM,
+    'update': CombinedPermissions.UPDATE_INVENTORY_ITEM,
+    'partial_update': CombinedPermissions.UPDATE_INVENTORY_ITEM,
+    'destroy': CombinedPermissions.DELETE_INVENTORY_ITEM,
+    'low_stock': CombinedPermissions.READ_INVENTORY_ITEM,
+    'needs_reorder': CombinedPermissions.READ_INVENTORY_ITEM,
+    'analytics': CombinedPermissions.VIEW_INVENTORY_ITEM_REPORTS,
+    'adjust_stock': CombinedPermissions.ADJUST_INVENTORY_ITEM_QUANTITY,
+    'minimal_item': CombinedPermissions.READ_INVENTORY_ITEM,
+    'stock_summary': CombinedPermissions.READ_INVENTORY_ITEM,
+    'update_status': CombinedPermissions.UPDATE_INVENTORY_ITEM,
+    'tracking_history': CombinedPermissions.VIEW_INVENTORY_ITEM_HISTORY,
+    'expiring_soon': CombinedPermissions.READ_INVENTORY_ITEM,
+    'create_for_variants': CombinedPermissions.CREATE_INVENTORY_ITEM,
 }
 
 INVENTORY_CATEGORY_PERMISSIONS = {
@@ -96,19 +98,7 @@ INVENTORY_CATEGORY_PERMISSIONS = {
     'destroy': CombinedPermissions.DELETE_INVENTORY_CATEGORY,
     'tree': CombinedPermissions.READ_INVENTORY_CATEGORY,
     'children': CombinedPermissions.READ_INVENTORY_CATEGORY,
-    'inventories': CombinedPermissions.READ_INVENTORY,
-}
-
-STOCK_ITEM_PERMISSIONS = {
-    'list': CombinedPermissions.READ_STOCK_ITEM,
-    'retrieve': CombinedPermissions.READ_STOCK_ITEM,
-    'create': CombinedPermissions.CREATE_STOCK_ITEM,
-    'update': CombinedPermissions.UPDATE_STOCK_ITEM,
-    'partial_update': CombinedPermissions.UPDATE_STOCK_ITEM,
-    'destroy': CombinedPermissions.DELETE_STOCK_ITEM,
-    'update_status': CombinedPermissions.UPDATE_STOCK_ITEM,
-    'tracking_history': CombinedPermissions.VIEW_STOCK_ITEM_HISTORY,
-    'analytics': CombinedPermissions.VIEW_INVENTORY_REPORTS,
+    'items': CombinedPermissions.READ_INVENTORY_ITEM,
 }
 
 STOCK_LOCATION_PERMISSIONS = {
@@ -118,16 +108,16 @@ STOCK_LOCATION_PERMISSIONS = {
     'update': CombinedPermissions.UPDATE_STOCK_LOCATION,
     'partial_update': CombinedPermissions.UPDATE_STOCK_LOCATION,
     'destroy': CombinedPermissions.DELETE_STOCK_LOCATION,
-    'stock_items': CombinedPermissions.READ_STOCK_ITEM,
-    'transfer_stock': CombinedPermissions.TRANSFER_STOCK_ITEM,
+    'inventory_items': CombinedPermissions.READ_INVENTORY_ITEM,
+    'transfer_stock': CombinedPermissions.TRANSFER_INVENTORY_ITEM,
 }
 
 STOCK_RESERVATION_PERMISSIONS = {
-    'list': CombinedPermissions.READ_STOCK_ITEM,
-    'retrieve': CombinedPermissions.READ_STOCK_ITEM,
-    'create': CombinedPermissions.UPDATE_STOCK_ITEM,
-    'release': CombinedPermissions.UPDATE_STOCK_ITEM,
-    'fulfill': CombinedPermissions.UPDATE_STOCK_ITEM,
+    'list': CombinedPermissions.READ_INVENTORY_ITEM,
+    'retrieve': CombinedPermissions.READ_INVENTORY_ITEM,
+    'create': CombinedPermissions.UPDATE_INVENTORY_ITEM,
+    'release': CombinedPermissions.UPDATE_INVENTORY_ITEM,
+    'fulfill': CombinedPermissions.UPDATE_INVENTORY_ITEM,
 }
 
 PURCHASE_ORDER_PERMISSIONS = {
@@ -140,7 +130,7 @@ PURCHASE_ORDER_PERMISSIONS = {
     'approve': CombinedPermissions.APPROVE_PURCHASE_ORDER,
     'receive_items': CombinedPermissions.RECEIVE_PURCHASE_ORDER,
     'add_line_item': CombinedPermissions.CREATE_PURCHASE_ORDER_LINE_ITEM,
-    'analytics': CombinedPermissions.VIEW_INVENTORY_REPORTS,
+    'analytics': CombinedPermissions.VIEW_INVENTORY_ITEM_REPORTS,
     
 }
 
@@ -173,9 +163,8 @@ SALES_ORDER_PERMISSIONS = {
 }
 
 UNIFIED_PERMISSION_DICT= {
-    'inventory':INVENTORY_PERMISSIONS,
+    'inventory_item':INVENTORY_ITEM_PERMISSIONS,
     'inventory_category':INVENTORY_CATEGORY_PERMISSIONS,
-    'stock_item':STOCK_ITEM_PERMISSIONS,
     'stock_location':STOCK_LOCATION_PERMISSIONS,
     'stock_reservation':STOCK_RESERVATION_PERMISSIONS,
     'purchase_order':PURCHASE_ORDER_PERMISSIONS,

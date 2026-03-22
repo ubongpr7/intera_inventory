@@ -7,18 +7,17 @@ from unittest.mock import patch
 from django.test import SimpleTestCase
 from starlette.testclient import TestClient
 
-from mainapps.inventory.models import Inventory, InventoryItem
+from mainapps.inventory.models import InventoryItem
 from mcp_server.server import (
     InventoryMcpPrincipal,
     _build_principal_from_token,
     _build_transport_security_settings,
     _extract_bearer_token,
     _inventory_item_payload,
-    _inventory_payload,
     _invoke_view_action_sync,
     _principal_var,
     app as inventory_mcp_app,
-    search_inventories,
+    search_inventory_items,
 )
 
 
@@ -34,7 +33,7 @@ class InventoryMcpAuthTests(SimpleTestCase):
             "user_id": 42,
             "profile_id": 9,
             "company_code": "ACME",
-            "permissions": ["read_inventory"],
+            "permissions": ["read_inventory_item"],
         }
 
         principal = _build_principal_from_token("jwt-token")
@@ -42,7 +41,7 @@ class InventoryMcpAuthTests(SimpleTestCase):
         self.assertEqual(principal.user_id, "42")
         self.assertEqual(principal.profile_id, 9)
         self.assertEqual(principal.company_code, "ACME")
-        self.assertEqual(principal.permissions, {"read_inventory"})
+        self.assertEqual(principal.permissions, {"read_inventory_item"})
 
     @patch.dict(
         os.environ,
@@ -61,36 +60,34 @@ class InventoryMcpAuthTests(SimpleTestCase):
 
 
 class InventoryMcpSerializationTests(SimpleTestCase):
-    def test_inventory_payload_includes_summary_fields(self):
-        inventory = Inventory(
-            name="Main Warehouse",
+    def test_inventory_item_payload_includes_summary_fields(self):
+        inventory_item = InventoryItem(
+            name_snapshot="Main Warehouse",
             profile="1",
             profile_id=1,
             inventory_type="raw_material",
-            active=True,
-            trackable=True,
-            batch_tracking_enabled=True,
-            automate_reorder=False,
+            track_stock=True,
+            track_lot=True,
+            reorder_point=10,
+            reorder_quantity=25,
             minimum_stock_level=5,
-            re_order_point=10,
-            re_order_quantity=25,
         )
 
-        payload = _inventory_payload(
-            inventory,
+        payload = _inventory_item_payload(
+            inventory_item,
             summary={
-                "current_stock_level": Decimal("12"),
+                "quantity": Decimal("12"),
                 "quantity_reserved": Decimal("2"),
                 "quantity_available": Decimal("10"),
                 "total_stock_value": Decimal("250"),
-                "stock_status": "IN_STOCK",
-                "expiring_soon_count": 1,
+                "status": "ACTIVE",
                 "location_breakdown": [{"location_name": "Rack A", "quantity": Decimal("12")}],
             },
         )
 
         self.assertEqual(payload["name"], "Main Warehouse")
-        self.assertEqual(payload["stock_status"], "IN_STOCK")
+        self.assertEqual(payload["status"], "ACTIVE")
+        self.assertEqual(payload["quantity"], 12.0)
         self.assertEqual(payload["location_breakdown"][0]["location_name"], "Rack A")
 
     def test_inventory_item_payload_includes_tracking_summary(self):
@@ -125,11 +122,11 @@ class InventoryMcpSerializationTests(SimpleTestCase):
 
 
 class InventoryMcpToolTests(SimpleTestCase):
-    def test_search_inventories_requires_authenticated_context(self):
+    def test_search_inventory_items_requires_authenticated_context(self):
         token = _principal_var.set(None)
         try:
             with self.assertRaises(RuntimeError):
-                asyncio.run(search_inventories(query="warehouse"))
+                asyncio.run(search_inventory_items(query="warehouse"))
         finally:
             _principal_var.reset(token)
 

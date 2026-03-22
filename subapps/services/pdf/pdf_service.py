@@ -1,10 +1,25 @@
 from django.template.loader import render_to_string
-from weasyprint import HTML, CSS
 from io import BytesIO
 from django.conf import settings
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+class PDFServiceUnavailableError(RuntimeError):
+    """Raised when PDF generation dependencies are unavailable on the host."""
+
+
+def _load_weasyprint():
+    """Import WeasyPrint lazily so missing native libs do not break app startup."""
+    try:
+        from weasyprint import HTML, CSS
+        return HTML, CSS
+    except Exception as exc:
+        logger.error("WeasyPrint is unavailable: %s", exc)
+        raise PDFServiceUnavailableError(
+            "PDF generation is unavailable because WeasyPrint native dependencies are not installed."
+        ) from exc
 
 class PDFService:
     """Enhanced PDF service using WeasyPrint matching your implementation"""
@@ -19,6 +34,8 @@ class PDFService:
             BytesIO: PDF file content
         """
         try:
+            HTML, CSS = _load_weasyprint()
+
             # Calculate totals (matching your template logic)
             tax = sum(line_item.tax_amount for line_item in purchase_order.line_items.all())
             discount = sum(line_item.discount for line_item in purchase_order.line_items.all())
@@ -61,6 +78,8 @@ class PDFService:
             BytesIO: PDF file content
         """
         try:
+            HTML, CSS = _load_weasyprint()
+
             # Prepare template context
             context = {
                 'return_order': return_order,
@@ -99,6 +118,8 @@ class PDFService:
             BytesIO: PDF file content
         """
         try:
+            HTML, CSS = _load_weasyprint()
+
             # Calculate summary data
             total_orders = purchase_orders.count()
             total_value = sum(po.total_price for po in purchase_orders)
@@ -149,6 +170,8 @@ class PDFService:
             BytesIO: PDF file content
         """
         try:
+            HTML, CSS = _load_weasyprint()
+
             # Calculate supplier metrics
             total_orders = purchase_orders.count()
             total_value = sum(po.total_price for po in purchase_orders)

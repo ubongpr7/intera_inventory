@@ -4,8 +4,7 @@ from rest_framework import serializers
 from django.db.models import Count, Sum, Avg, F
 from decimal import Decimal
 from mainapps.content_type_linking_models.serializers import UserDetailMixin
-from mainapps.stock.models import StockItem
-from mainapps.inventory.models import Inventory, InventoryItem
+from mainapps.inventory.models import InventoryItem
 from mainapps.orders.models import (
     PurchaseOrder,
     PurchaseOrderLineItem,
@@ -16,28 +15,6 @@ from mainapps.orders.models import (
     SalesOrderShipment,
     SalesOrderShipmentLine,
 )
-
-
-class InventoryStockItemListSerializer(UserDetailMixin, serializers.ModelSerializer):
-    """Lightweight serializer for stock item lists"""
-    inventory_name = serializers.CharField(source='inventory.name', read_only=True)
-    location_name = serializers.CharField(source='location.name', read_only=True)
-    days_to_expiry = serializers.SerializerMethodField()
-
-    class Meta:
-        model = StockItem
-        fields = [
-            'id', 'name', 'sku', 'serial', 'quantity', 'status',
-            'inventory_name', 'location_name', 'expiry_date', 'days_to_expiry',
-            'purchase_price', 'created_at'
-        ]
-
-    def get_days_to_expiry(self, obj):
-        if obj.expiry_date:
-            from django.utils import timezone
-            return (obj.expiry_date - timezone.now().date()).days
-        return None
-
 
 class InventoryItemReferenceSerializer(serializers.ModelSerializer):
     name = serializers.CharField(source='name_snapshot', read_only=True)
@@ -70,7 +47,7 @@ class InventoryItemReferenceSerializer(serializers.ModelSerializer):
 
 
 class SalesOrderShipmentLineSerializer(serializers.ModelSerializer):
-    inventory_name = serializers.CharField(source='sales_order_line.inventory.name', read_only=True)
+    inventory_name = serializers.CharField(source='sales_order_line.inventory_item.name_snapshot', read_only=True)
     location_name = serializers.CharField(source='stock_location.name', read_only=True)
     lot_number = serializers.CharField(source='stock_lot.lot_number', read_only=True)
     serial_number = serializers.CharField(source='stock_serial.serial_number', read_only=True)
@@ -104,7 +81,6 @@ class SalesOrderShipmentSerializer(UserDetailMixin, serializers.ModelSerializer)
         fields = [
             'id',
             'order',
-            'inventory',
             'reference',
             'shipment_date',
             'delivery_date',
@@ -125,7 +101,7 @@ class SalesOrderShipmentSerializer(UserDetailMixin, serializers.ModelSerializer)
 
 
 class SalesOrderLineItemSerializer(serializers.ModelSerializer):
-    inventory_name = serializers.CharField(source='inventory.name', read_only=True)
+    inventory_name = serializers.CharField(source='inventory_item.name_snapshot', read_only=True)
     remaining_quantity = serializers.DecimalField(max_digits=15, decimal_places=5, read_only=True)
     reservable_quantity = serializers.DecimalField(max_digits=15, decimal_places=5, read_only=True)
     total_price = serializers.DecimalField(max_digits=18, decimal_places=2, read_only=True)
@@ -135,7 +111,6 @@ class SalesOrderLineItemSerializer(serializers.ModelSerializer):
         fields = [
             'id',
             'sales_order',
-            'inventory',
             'inventory_item',
             'inventory_name',
             'quantity',
@@ -279,24 +254,18 @@ class PurchaseOrderLineItemSerializer(UserDetailMixin, serializers.ModelSerializ
     """Serializer for purchase order line items"""
     inventory_item_name = serializers.CharField(source='inventory_item.name_snapshot', read_only=True)
     inventory_item_details = InventoryItemReferenceSerializer(source='inventory_item', read_only=True)
-    stock_item_details = InventoryStockItemListSerializer(source='stock_item', read_only=True)
     quantity_w_unit = serializers.SerializerMethodField()
     tax_amount = serializers.DecimalField(max_digits=18, decimal_places=2, read_only=True)
     total_price = serializers.DecimalField(max_digits=18, decimal_places=2, read_only=True)
 
     def get_quantity_w_unit(self, obj):
-        unit = ''
-        if obj.inventory_item:
-            unit = obj.inventory_item.stock_uom_code or obj.inventory_item.default_uom_code or ''
-        elif obj.stock_item and obj.stock_item.inventory:
-            unit = obj.stock_item.inventory.unit or ''
+        unit = obj.inventory_item.stock_uom_code or obj.inventory_item.default_uom_code or ''
         return f"{obj.quantity} {unit}"
 
     class Meta:
         model = PurchaseOrderLineItem
         fields = [
             'id', 'purchase_order', 'inventory_item', 'inventory_item_name', 'inventory_item_details',
-            'stock_item', 'stock_item_details',
             'quantity', 'quantity_w_unit', 'unit_price',
             'discount_rate', 'tax_rate', 'description',
             'batch_number', 'expiry_date', 'manufactured_date', 'quantity_received',
@@ -489,8 +458,6 @@ class ReturnOrderLineItemSerializer(UserDetailMixin, serializers.ModelSerializer
     def get_inventory_item_name(self, obj):
         if obj.original_line_item.inventory_item:
             return obj.original_line_item.inventory_item.name_snapshot
-        if obj.original_line_item.stock_item:
-            return obj.original_line_item.stock_item.name
         return ""
 
 

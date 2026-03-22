@@ -51,8 +51,7 @@ class WorkflowState(str, Enum):
 class PurchaseOrderLineItemCreateUpdatePayload(BaseModel):
     """Payload for creating/updating a PurchaseOrderLineItem."""
     purchase_order_id: uuid.UUID = Field(..., description="UUID of the PurchaseOrder")
-    inventory_item_id: Optional[uuid.UUID] = Field(None, description="UUID of InventoryItem (if stock item not used)")
-    stock_item_id: Optional[uuid.UUID] = Field(None, description="UUID of StockItem (if inventory item not used)")
+    inventory_item_id: uuid.UUID = Field(..., description="UUID of InventoryItem")
     quantity: int = Field(..., gt=0, description="Ordered quantity")
     quantity_received: Decimal = Field(Decimal("0"), description="Cumulative quantity received so far")
     unit_price: Decimal = Field(..., gt=0, description="Unit price")
@@ -68,12 +67,6 @@ class PurchaseOrderLineItemCreateUpdatePayload(BaseModel):
         if v < 0:
             raise ValueError("Quantity received cannot be negative")
         return v
-
-    @model_validator(mode="after")
-    def validate_item_choice(self):
-        if not self.inventory_item_id and not self.stock_item_id:
-            raise ValueError("Either inventory_item_id or stock_item_id must be provided.")
-        return self
 
     @model_validator(mode="after")
     def validate_quantity_received(self):
@@ -176,8 +169,7 @@ class SalesOrderCreateUpdatePayload(BaseModel):
 class SalesOrderLineItemCreateUpdatePayload(BaseModel):
     """Payload for creating/updating a SalesOrderLineItem."""
     sales_order_id: uuid.UUID = Field(..., description="UUID of SalesOrder")
-    inventory_id: uuid.UUID = Field(..., description="UUID of Inventory")
-    inventory_item_id: Optional[uuid.UUID] = Field(None, description="UUID of InventoryItem (if variant-specific)")
+    inventory_item_id: uuid.UUID = Field(..., description="UUID of InventoryItem")
     quantity: Decimal = Field(..., gt=0, description="Ordered quantity")
     reserved_quantity: Decimal = Field(Decimal("0"), ge=0, description="Quantity currently reserved")
     shipped_quantity: Decimal = Field(Decimal("0"), ge=0, description="Quantity already shipped")
@@ -211,9 +203,6 @@ class SalesOrderShipmentCreateUpdatePayload(BaseModel):
     invoice_number: Optional[str] = Field(None, max_length=100, description="Invoice number")
     link: Optional[str] = Field(None, description="External link")
     notes: Optional[str] = Field(None, description="Shipment notes")
-    # InventoryMixin fields (inventory FK)
-    inventory_id: Optional[uuid.UUID] = Field(None, description="UUID of Inventory (if applicable)")
-
     @model_validator(mode="after")
     def validate_reference_uniqueness(self):
         # We can't easily validate uniqueness here; it's left to the database.
@@ -299,8 +288,6 @@ class McpPayloadModel(BaseModel):
 class OrderLineItemResponsePayload(McpPayloadModel):
     id: Optional[str] = Field(None, description="Order line identifier")
     inventory_item_id: Optional[str] = Field(None, description="Inventory item identifier")
-    stock_item_id: Optional[str] = Field(None, description="Stock item identifier")
-    inventory_id: Optional[str] = Field(None, description="Inventory identifier")
     quantity: Optional[float] = Field(None, description="Ordered quantity")
     quantity_received: Optional[float] = Field(None, description="Received quantity")
     reserved_quantity: Optional[float] = Field(None, description="Reserved quantity")
@@ -405,7 +392,6 @@ class SalesOrderShipmentLineResponsePayload(McpPayloadModel):
 class SalesOrderShipmentResponsePayload(McpPayloadModel):
     id: str = Field(..., description="Shipment identifier")
     order: Optional[str] = Field(None, description="Sales-order identifier")
-    inventory: Optional[str] = Field(None, description="Inventory identifier")
     reference: str = Field("", description="Shipment reference")
     shipment_date: Optional[str] = Field(None, description="Shipment date")
     delivery_date: Optional[str] = Field(None, description="Delivery date")
@@ -608,7 +594,6 @@ class OrderActionPayload(McpPayloadModel):
 class PurchaseOrderReceiveItemPayload(McpPayloadModel):
     line_item_id: Optional[uuid.UUID] = Field(None, description="Purchase-order line-item identifier")
     inventory_item_id: Optional[uuid.UUID] = Field(None, description="Inventory item identifier")
-    stock_item_id: Optional[uuid.UUID] = Field(None, description="Stock item identifier")
     quantity_received: Optional[Decimal] = Field(None, description="Quantity received")
     unit_cost: Optional[Decimal] = Field(None, description="Unit cost")
     stock_location_id: Optional[uuid.UUID] = Field(None, description="Stock location identifier")
@@ -626,7 +611,6 @@ class PurchaseOrderReceiveItemsPayload(McpPayloadModel):
 class PurchaseOrderLineItemActionPayload(McpPayloadModel):
     line_item_id: Optional[uuid.UUID] = Field(None, description="Purchase-order line-item identifier")
     inventory_item_id: Optional[uuid.UUID] = Field(None, description="Inventory item identifier")
-    stock_item_id: Optional[uuid.UUID] = Field(None, description="Stock item identifier")
     quantity: Optional[Decimal] = Field(None, description="Ordered quantity")
     quantity_received: Optional[Decimal] = Field(None, description="Received quantity")
     unit_price: Optional[Decimal] = Field(None, description="Unit price")
@@ -640,7 +624,6 @@ class PurchaseOrderLineItemActionPayload(McpPayloadModel):
 
 class SalesOrderLineItemActionPayload(McpPayloadModel):
     line_item_id: Optional[uuid.UUID] = Field(None, description="Sales-order line-item identifier")
-    inventory_id: Optional[uuid.UUID] = Field(None, description="Inventory identifier")
     inventory_item_id: Optional[uuid.UUID] = Field(None, description="Inventory item identifier")
     quantity: Optional[Decimal] = Field(None, description="Ordered quantity")
     reserved_quantity: Optional[Decimal] = Field(None, description="Reserved quantity")

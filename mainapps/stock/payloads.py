@@ -103,55 +103,6 @@ class StockLocationCreateUpdatePayload(BaseModel):
     physical_address: Optional[str] = Field(None, max_length=255, description="Physical address")
 
 # ------------------------------------------------------------------------------
-# StockItem
-# ------------------------------------------------------------------------------
-class StockItemCreateUpdatePayload(BaseModel):
-    """Payload for creating/updating a StockItem."""
-    name: str = Field(..., max_length=200, description="Name of the stock item")
-    inventory_id: Optional[uuid.UUID] = Field(None, description="UUID of Inventory (required if not using inventory from parent?)")
-    parent_id: Optional[uuid.UUID] = Field(None, description="UUID of parent StockItem")
-    location_id: Optional[uuid.UUID] = Field(None, description="UUID of StockLocation")
-    packaging: Optional[str] = Field(None, max_length=100, description="Packaging description")
-    belongs_to_id: Optional[uuid.UUID] = Field(None, description="UUID of parent StockItem it's installed in")
-    customer: Optional[str] = Field(None, max_length=255, description="Customer ID")
-    serial: Optional[str] = Field(None, max_length=100, description="Unique serial number")
-    sku: Optional[str] = Field(None, max_length=100, description="Stock keeping unit")
-    link: Optional[str] = Field(None, description="External URL")
-    batch: Optional[str] = Field(None, max_length=100, description="Batch code")
-    quantity: Decimal = Field(Decimal("1"), ge=0, description="Stock quantity")
-    purchase_order_id: Optional[uuid.UUID] = Field(None, description="UUID of PurchaseOrder source")
-    sales_order_id: Optional[uuid.UUID] = Field(None, description="UUID of SalesOrder destination")
-    expiry_date: Optional[date] = Field(None, description="Expiry date")
-    stocktake_date: Optional[date] = Field(None, description="Date of last stocktake")
-    stocktaker: Optional[str] = Field(None, max_length=255, description="User ID of stocktaker")
-    stocktaker_user_id: Optional[int] = Field(None, description="User ID of stocktaker")
-    review_needed: bool = Field(False, description="Flag for review needed")
-    delete_on_deplete: bool = Field(False, description="Delete when stock depletes")
-    status: StockStatus = Field(StockStatus.OK, description="Stock status")
-    purchase_price: Optional[Decimal] = Field(None, max_digits=30, decimal_places=7, description="Purchase price per unit")
-    override_sales_price: Optional[Decimal] = Field(None, max_digits=10, decimal_places=2, description="Temporary price override")
-    notes: Optional[str] = Field(None, description="Extra notes")
-
-    @model_validator(mode="after")
-    def check_inventory_or_parent(self):
-        if not self.inventory_id and not self.parent_id:
-            raise ValueError("Either inventory_id or parent_id must be provided.")
-        return self
-
-# ------------------------------------------------------------------------------
-# StockPricing
-# ------------------------------------------------------------------------------
-class StockPricingCreateUpdatePayload(BaseModel):
-    """Payload for creating/updating a StockPricing."""
-    stock_item_id: uuid.UUID = Field(..., description="UUID of StockItem")
-    selling_price: Decimal = Field(..., gt=0, description="Selling price")
-    discount_flat: Decimal = Field(Decimal("0"), ge=0, description="Flat discount amount")
-    discount_rate: Decimal = Field(Decimal("0"), ge=0, le=100, description="Discount percentage")
-    tax_rate: Decimal = Field(Decimal("0"), ge=0, le=100, description="Tax percentage")
-    price_effective_from: Optional[datetime] = Field(None, description="Effective start datetime")
-    price_effective_to: Optional[datetime] = Field(None, description="Effective end datetime")
-
-# ------------------------------------------------------------------------------
 # StockLot
 # ------------------------------------------------------------------------------
 class StockLotCreateUpdatePayload(BaseModel):
@@ -229,19 +180,6 @@ class StockReservationCreateUpdatePayload(BaseModel):
         return self
 
 # ------------------------------------------------------------------------------
-# StockItemTracking
-# ------------------------------------------------------------------------------
-class StockItemTrackingCreateUpdatePayload(BaseModel):
-    """Payload for creating/updating a StockItemTracking entry."""
-    inventory_id: Optional[uuid.UUID] = Field(None, description="UUID of Inventory (from InventoryMixin)")
-    tracking_type: TrackingType = Field(TrackingType.OTHER, description="Type of tracking event")
-    item_id: uuid.UUID = Field(..., description="UUID of StockItem")
-    notes: Optional[str] = Field(None, max_length=512, description="Entry notes")
-    user: Optional[str] = Field(None, max_length=255, description="Username associated with tracking")
-    performed_by_user_id: Optional[int] = Field(None, description="User ID who performed action")
-    deltas: Optional[Dict[str, Any]] = Field(None, description="JSON field for value changes")
-
-# ------------------------------------------------------------------------------
 # StockMovement
 # ------------------------------------------------------------------------------
 class StockMovementCreateUpdatePayload(BaseModel):
@@ -279,7 +217,7 @@ class StockMovementCreateUpdatePayload(BaseModel):
 # ------------------------------------------------------------------------------
 class StockAdjustmentCreateUpdatePayload(BaseModel):
     """Payload for creating/updating a StockAdjustment."""
-    stock_item_id: uuid.UUID = Field(..., description="UUID of StockItem")
+    inventory_item_id: uuid.UUID = Field(..., description="UUID of InventoryItem")
     adjustment_type: AdjustmentType = Field(..., description="Adjustment type")
     quantity_change: int = Field(..., description="Change in quantity (positive for add, negative for remove, can be any for transfer)")
     reason: Optional[str] = Field(None, description="Reason for adjustment")
@@ -522,19 +460,19 @@ class InventoryItemDetailResponsePayload(McpPayloadModel):
     )
 
 
-class StockItemStatusResultPayload(McpPayloadModel):
+class InventoryItemStatusResultPayload(McpPayloadModel):
     message: str = Field("", description="Status update result message")
     old_status: Optional[str] = Field(None, description="Previous inventory-item status")
     new_status: Optional[str] = Field(None, description="Updated inventory-item status")
 
 
-class StockItemActionResponsePayload(McpPayloadModel):
+class InventoryItemActionResponsePayload(McpPayloadModel):
     profile_id: int = Field(..., description="Workspace profile identifier")
     inventory_item: (
         InventoryItemResponsePayload
         | List[InventoryItemResponsePayload]
         | List[StockMovementResponsePayload]
-        | StockItemStatusResultPayload
+        | InventoryItemStatusResultPayload
     ) = Field(
         ...,
         description="Inventory-item action result",

@@ -18,7 +18,6 @@ from mptt.models import TreeForeignKey
 
 from django.utils import timezone
 from mainapps.company.models import  Company, CompanyAddress, Contact 
-from mainapps.inventory.models import InventoryMixin 
 from subapps.utils.statuses import *
 from decimal import Decimal, ROUND_HALF_UP
 
@@ -31,16 +30,7 @@ class PurchaseOrderLineItem(UUIDBaseModel):
     inventory_item = models.ForeignKey(
         'inventory.InventoryItem',
         related_name='purchase_order_lines',
-        on_delete=models.SET_NULL,
-        null=True,
-        blank=True,
-    )
-    stock_item = models.ForeignKey(
-        'stock.StockItem',
-        related_name='po_line_items',
-        on_delete=models.CASCADE,
-        null=True,
-        blank=True,
+        on_delete=models.PROTECT,
     )
     quantity = models.PositiveIntegerField(
         validators=[MinValueValidator(1)]
@@ -81,8 +71,8 @@ class PurchaseOrderLineItem(UUIDBaseModel):
         super().save(*args, **kwargs)
 
     def clean(self):
-        if not self.inventory_item_id and not self.stock_item_id:
-            raise ValidationError("Either inventory_item or stock_item must be provided.")
+        if not self.inventory_item_id:
+            raise ValidationError("inventory_item must be provided.")
         if self.quantity <= 0:
             raise ValidationError("Quantity must be greater than zero.")
         if self.unit_price < 0:
@@ -108,8 +98,7 @@ class PurchaseOrderLineItem(UUIDBaseModel):
         )
 
     def __str__(self):
-        line_item = self.inventory_item or self.stock_item
-        return f"{self.quantity} x {line_item} @ {self.unit_price}"
+        return f"{self.quantity} x {self.inventory_item} @ {self.unit_price}"
 
     @property
     def remaining_quantity(self):
@@ -531,16 +520,9 @@ class SalesOrderLineItem(UUIDBaseModel):
         on_delete=models.CASCADE,
         related_name='line_items',
     )
-    inventory = models.ForeignKey(
-        'inventory.Inventory',
-        on_delete=models.PROTECT,
-        related_name='sales_order_lines',
-    )
     inventory_item = models.ForeignKey(
         'inventory.InventoryItem',
-        on_delete=models.SET_NULL,
-        null=True,
-        blank=True,
+        on_delete=models.PROTECT,
         related_name='sales_order_lines',
     )
     quantity = models.DecimalField(max_digits=15, decimal_places=5, validators=[MinValueValidator(1)])
@@ -598,16 +580,17 @@ class SalesOrderLineItem(UUIDBaseModel):
         )
 
     def __str__(self):
-        return f"{self.quantity} x {self.inventory.name} @ {self.unit_price}"
+        item_name = self.inventory_item.name_snapshot if self.inventory_item_id else "Unknown Item"
+        return f"{self.quantity} x {item_name} @ {self.unit_price}"
 
 
 
-class SalesOrderShipment(InventoryMixin):
+class SalesOrderShipment(ProfileMixin):
     """The SalesOrderShipment model represents a physical shipment made against a SalesOrder.
 
     - Points to a single SalesOrder object
     - Multiple SalesOrderAllocation objects point to a particular SalesOrderShipment
-    - When a given SalesOrderShipment is "shipped", stock items are removed from stock
+    - When a given SalesOrderShipment is "shipped", inventory items are removed from stock
 
     Attributes:
         order: SalesOrder reference
@@ -692,6 +675,8 @@ class SalesOrderShipment(InventoryMixin):
 
     def save(self, *args, **kwargs):
         _sync_identity_fields(self, canonical_field='checked_by_user_id', legacy_field='checked_by')
+        if self.order_id:
+            self.profile_id = self.order.profile_id
         if self.order_id and not self.reference:
             shipment_count = (
                 SalesOrderShipment.objects.filter(order=self.order)
