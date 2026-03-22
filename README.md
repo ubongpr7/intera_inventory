@@ -36,6 +36,9 @@ Current tools:
 - `get_inventory_details`: inspect a single inventory ledger with current stock posture
 - `search_inventory_items`: search inventory item records with current stock status
 - `get_inventory_item_details`: inspect lots, serials, reservations, and movements for one inventory item
+- `search_stock_balances`: inspect location-level on-hand, reserved, and available balances
+- `search_stock_lots`: inspect lot posture by item, lot number, and status
+- `search_stock_serials`: inspect serial-tracked units by item, serial number, lot, or location
 - `get_inventory_alerts`: surface low-stock, reorder, out-of-stock, and expiring inventory queues
 - `search_stock_locations`: search stock locations with summarized quantity and value posture
 - `get_stock_location_summary`: inspect one location's stock concentration and expiry posture
@@ -92,6 +95,9 @@ Recommended K-A2A config for this MCP server:
     "get_inventory_details",
     "search_inventory_items",
     "get_inventory_item_details",
+    "search_stock_balances",
+    "search_stock_lots",
+    "search_stock_serials",
     "get_inventory_alerts",
     "search_stock_locations",
     "get_stock_location_summary",

@@ -206,9 +206,18 @@ class InventoryItemViewSet(BaseInventoryViewSetMixin):
     def get_serializer_context(self):
         context = super().get_serializer_context()
         context['request'] = self.request
-        if self.action in {'list', 'retrieve', 'expiring_soon'}:
+        if self.action in {'list', 'expiring_soon'}:
             try:
                 context['inventory_item_summary_map'] = get_inventory_item_summary_map(list(self.get_queryset()))
+            except Exception:
+                context['inventory_item_summary_map'] = {}
+        elif self.action == 'retrieve':
+            try:
+                target_id = self.kwargs.get(self.lookup_field or 'pk')
+                target_item = self.get_queryset().filter(pk=target_id).first() if target_id else None
+                context['inventory_item_summary_map'] = (
+                    get_inventory_item_summary_map([target_item]) if target_item is not None else {}
+                )
             except Exception:
                 context['inventory_item_summary_map'] = {}
         return context

@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from django.db.models import Sum, Count
+from django.db.models import Count, Q, Sum
 from decimal import Decimal
 
 from mainapps.content_type_linking_models.serializers import UserDetailMixin
@@ -9,7 +9,16 @@ from subapps.services.inventory_read_model import (
     get_location_stock_summary,
 )
 
-from .models import StockAdjustment, StockLocation, StockLocationType, StockReservation, StockMovement
+from .models import (
+    StockAdjustment,
+    StockBalance,
+    StockLocation,
+    StockLocationType,
+    StockLot,
+    StockMovement,
+    StockReservation,
+    StockSerial,
+)
 from subapps.services.catalog_projection import CatalogProjectionLookup
 
 class ProductImageMixin:
@@ -136,6 +145,64 @@ class StockMovementListSerializer(UserDetailMixin, serializers.ModelSerializer):
         return self.get_user_details(obj.actor_user_id)
 
 
+class StockBalanceDetailSerializer(serializers.ModelSerializer):
+    stock_location_name = serializers.CharField(source='stock_location.name', read_only=True)
+    stock_lot_id = serializers.UUIDField(read_only=True, allow_null=True)
+    lot_number = serializers.CharField(source='stock_lot.lot_number', read_only=True, allow_null=True)
+
+    class Meta:
+        model = StockBalance
+        fields = [
+            'id',
+            'stock_location_id',
+            'stock_location_name',
+            'stock_lot_id',
+            'lot_number',
+            'quantity_on_hand',
+            'quantity_reserved',
+            'quantity_available',
+        ]
+
+
+class StockLotDetailSerializer(serializers.ModelSerializer):
+    supplier_name = serializers.CharField(source='supplier.name', read_only=True, allow_null=True)
+
+    class Meta:
+        model = StockLot
+        fields = [
+            'id',
+            'lot_number',
+            'expiry_date',
+            'unit_cost',
+            'currency_code',
+            'received_quantity',
+            'remaining_quantity',
+            'status',
+            'supplier_name',
+            'created_at',
+        ]
+
+
+class StockSerialDetailSerializer(serializers.ModelSerializer):
+    stock_location_id = serializers.UUIDField(read_only=True, allow_null=True)
+    stock_location_name = serializers.CharField(source='stock_location.name', read_only=True, allow_null=True)
+    stock_lot_id = serializers.UUIDField(read_only=True, allow_null=True)
+    lot_number = serializers.CharField(source='stock_lot.lot_number', read_only=True, allow_null=True)
+
+    class Meta:
+        model = StockSerial
+        fields = [
+            'id',
+            'serial_number',
+            'status',
+            'stock_location_id',
+            'stock_location_name',
+            'stock_lot_id',
+            'lot_number',
+            'created_at',
+        ]
+
+
 class InventoryItemListSerializer(ProductImageMixin, InventoryItemSummaryMixin, serializers.ModelSerializer):
     """List serializer for inventory items and their stock summaries."""
     name = serializers.CharField(source='name_snapshot', read_only=True)
@@ -223,6 +290,10 @@ class InventoryItemDetailSerializer(ProductImageMixin, InventoryItemSummaryMixin
     updated_by_details = serializers.SerializerMethodField()
     display_image = serializers.SerializerMethodField()
     current_pricing = serializers.SerializerMethodField()
+    balances = serializers.SerializerMethodField()
+    lots = serializers.SerializerMethodField()
+    serials = serializers.SerializerMethodField()
+    active_reservations = serializers.SerializerMethodField()
     recent_movements = serializers.SerializerMethodField()
 
     class Meta:
@@ -263,6 +334,10 @@ class InventoryItemDetailSerializer(ProductImageMixin, InventoryItemSummaryMixin
             'metadata',
             'display_image',
             'current_pricing',
+            'balances',
+            'lots',
+            'serials',
+            'active_reservations',
             'recent_movements',
             'created_by_user_id',
             'updated_by_user_id',
@@ -340,6 +415,38 @@ class InventoryItemDetailSerializer(ProductImageMixin, InventoryItemSummaryMixin
             }
         return None
 
+    def get_balances(self, obj):
+        balances = obj.stock_balances.select_related(
+            'stock_location',
+            'stock_lot',
+        ).filter(
+            Q(quantity_on_hand__gt=0) | Q(quantity_reserved__gt=0),
+        ).order_by(
+            'stock_location__name',
+            'stock_lot__expiry_date',
+            'stock_lot__lot_number',
+        )
+        return StockBalanceDetailSerializer(balances, many=True, context=self.context).data
+
+    def get_lots(self, obj):
+        lots = obj.stock_lots.select_related('supplier').order_by('expiry_date', '-created_at')
+        return StockLotDetailSerializer(lots, many=True, context=self.context).data
+
+    def get_serials(self, obj):
+        serials = obj.stock_serials.select_related('stock_location', 'stock_lot').order_by('serial_number')
+        return StockSerialDetailSerializer(serials, many=True, context=self.context).data
+
+    def get_active_reservations(self, obj):
+        reservations = obj.stock_reservations.select_related(
+            'inventory_item',
+            'stock_location',
+            'stock_lot',
+            'stock_serial',
+        ).exclude(
+            status__in=['released', 'fulfilled'],
+        ).order_by('-created_at')
+        return StockReservationSerializer(reservations, many=True, context=self.context).data
+
     def get_recent_movements(self, obj):
         recent = obj.stock_movements.select_related(
             'from_location',
@@ -374,6 +481,7 @@ class StockReservationSerializer(serializers.ModelSerializer):
     inventory_item_name = serializers.CharField(source='inventory_item.name_snapshot', read_only=True)
     lot_number = serializers.CharField(source='stock_lot.lot_number', read_only=True)
     serial_number = serializers.CharField(source='stock_serial.serial_number', read_only=True)
+    remaining_quantity = serializers.SerializerMethodField()
 
     class Meta:
         model = StockReservation
@@ -392,11 +500,15 @@ class StockReservationSerializer(serializers.ModelSerializer):
             'external_order_line_id',
             'reserved_quantity',
             'fulfilled_quantity',
+            'remaining_quantity',
             'status',
             'expires_at',
             'created_at',
             'updated_at',
         ]
+
+    def get_remaining_quantity(self, obj):
+        return obj.remaining_quantity
 
 
 class StockReservationCreateSerializer(serializers.Serializer):

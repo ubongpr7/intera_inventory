@@ -38,7 +38,7 @@ from mainapps.inventory.views import (
     InventoryCategoryViewSet,
     InventoryItemViewSet as InventoryCatalogItemViewSet,
 )
-from mainapps.stock.models import StockLocation, StockMovement, StockReservation, StockSerial, StockLot
+from mainapps.stock.models import StockBalance, StockLocation, StockLot, StockMovement, StockReservation, StockSerial
 from mainapps.stock.views import (
     InventoryItemViewSet as InventoryOperationsItemViewSet,
     StockLocationViewSet,
@@ -286,6 +286,49 @@ def _reservation_payload(reservation: StockReservation) -> dict[str, Any]:
     }
 
 
+def _lot_payload(lot: StockLot) -> dict[str, Any]:
+    return {
+        "id": str(lot.id),
+        "inventory_item_id": str(lot.inventory_item_id),
+        "inventory_item_name": lot.inventory_item.name_snapshot,
+        "lot_number": lot.lot_number,
+        "expiry_date": _to_json_compatible(lot.expiry_date),
+        "unit_cost": _decimal_to_float(lot.unit_cost),
+        "received_quantity": _decimal_to_float(lot.received_quantity),
+        "remaining_quantity": _decimal_to_float(lot.remaining_quantity),
+        "status": lot.status,
+    }
+
+
+def _serial_payload(serial: StockSerial) -> dict[str, Any]:
+    return {
+        "id": str(serial.id),
+        "inventory_item_id": str(serial.inventory_item_id),
+        "inventory_item_name": serial.inventory_item.name_snapshot,
+        "stock_lot_id": str(serial.stock_lot_id) if serial.stock_lot_id else None,
+        "lot_number": serial.stock_lot.lot_number if serial.stock_lot_id and serial.stock_lot else None,
+        "serial_number": serial.serial_number,
+        "status": serial.status,
+        "stock_location_id": str(serial.stock_location_id) if serial.stock_location_id else None,
+        "stock_location_name": serial.stock_location.name if serial.stock_location_id and serial.stock_location else None,
+    }
+
+
+def _balance_payload(balance: StockBalance) -> dict[str, Any]:
+    return {
+        "id": str(balance.id),
+        "inventory_item_id": str(balance.inventory_item_id),
+        "inventory_item_name": balance.inventory_item.name_snapshot,
+        "stock_location_id": str(balance.stock_location_id),
+        "stock_location_name": balance.stock_location.name,
+        "stock_lot_id": str(balance.stock_lot_id) if balance.stock_lot_id else None,
+        "lot_number": balance.stock_lot.lot_number if balance.stock_lot_id and balance.stock_lot else None,
+        "quantity_on_hand": _decimal_to_float(balance.quantity_on_hand),
+        "quantity_reserved": _decimal_to_float(balance.quantity_reserved),
+        "quantity_available": _decimal_to_float(balance.quantity_available),
+    }
+
+
 def _movement_payload(movement: StockMovement) -> dict[str, Any]:
     return {
         "id": str(movement.id),
@@ -331,6 +374,38 @@ def _inventory_item_queryset(*, principal: InventoryMcpPrincipal) -> QuerySet[In
 def _stock_location_queryset(*, principal: InventoryMcpPrincipal) -> QuerySet[StockLocation]:
     return scope_queryset_by_identity(
         StockLocation.objects.select_related("location_type", "parent").order_by("name", "id"),
+        canonical_field="profile_id",
+        legacy_field="profile",
+        value=principal.profile_id,
+    )
+
+
+def _stock_lot_queryset(*, principal: InventoryMcpPrincipal) -> QuerySet[StockLot]:
+    return scope_queryset_by_identity(
+        StockLot.objects.select_related("inventory_item").order_by("expiry_date", "-created_at"),
+        canonical_field="profile_id",
+        legacy_field="profile",
+        value=principal.profile_id,
+    )
+
+
+def _stock_serial_queryset(*, principal: InventoryMcpPrincipal) -> QuerySet[StockSerial]:
+    return scope_queryset_by_identity(
+        StockSerial.objects.select_related("inventory_item", "stock_location", "stock_lot").order_by("serial_number", "id"),
+        canonical_field="profile_id",
+        legacy_field="profile",
+        value=principal.profile_id,
+    )
+
+
+def _stock_balance_queryset(*, principal: InventoryMcpPrincipal) -> QuerySet[StockBalance]:
+    return scope_queryset_by_identity(
+        StockBalance.objects.select_related("inventory_item", "stock_location", "stock_lot").order_by(
+            "stock_location__name",
+            "inventory_item__name_snapshot",
+            "stock_lot__expiry_date",
+            "stock_lot__lot_number",
+        ),
         canonical_field="profile_id",
         legacy_field="profile",
         value=principal.profile_id,
@@ -431,21 +506,16 @@ def _get_inventory_item_details_sync(
     if inventory_item is None:
         raise ValueError("Inventory item not found.")
     summary = get_inventory_item_summary_map([inventory_item]).get(inventory_item.id, {})
-    lots = list(
-        scope_queryset_by_identity(
-            StockLot.objects.filter(inventory_item_id=inventory_item.id).order_by("expiry_date", "-created_at"),
-            canonical_field="profile_id",
-            legacy_field="profile",
-            value=principal.profile_id,
+    balances = list(
+        _stock_balance_queryset(principal=principal).filter(
+            inventory_item_id=inventory_item.id,
         )[:history_limit]
     )
+    lots = list(
+        _stock_lot_queryset(principal=principal).filter(inventory_item_id=inventory_item.id)[:history_limit]
+    )
     serials = list(
-        scope_queryset_by_identity(
-            StockSerial.objects.filter(inventory_item_id=inventory_item.id).order_by("serial_number"),
-            canonical_field="profile_id",
-            legacy_field="profile",
-            value=principal.profile_id,
-        )[:history_limit]
+        _stock_serial_queryset(principal=principal).filter(inventory_item_id=inventory_item.id)[:history_limit]
     )
     reservations = list(
         _stock_reservation_queryset(principal=principal).filter(inventory_item_id=inventory_item.id)[:history_limit]
@@ -456,28 +526,9 @@ def _get_inventory_item_details_sync(
     return {
         "profile_id": principal.profile_id,
         "inventory_item": _inventory_item_payload(inventory_item, summary=summary),
-        "lots": [
-            {
-                "id": str(lot.id),
-                "lot_number": lot.lot_number,
-                "expiry_date": _to_json_compatible(lot.expiry_date),
-                "unit_cost": _decimal_to_float(lot.unit_cost),
-                "received_quantity": _decimal_to_float(lot.received_quantity),
-                "remaining_quantity": _decimal_to_float(lot.remaining_quantity),
-                "status": lot.status,
-            }
-            for lot in lots
-        ],
-        "serials": [
-            {
-                "id": str(serial.id),
-                "serial_number": serial.serial_number,
-                "status": serial.status,
-                "stock_location_id": str(serial.stock_location_id) if serial.stock_location_id else None,
-                "stock_location_name": serial.stock_location.name if serial.stock_location_id and serial.stock_location else None,
-            }
-            for serial in serials
-        ],
+        "balances": [_balance_payload(balance) for balance in balances],
+        "lots": [_lot_payload(lot) for lot in lots],
+        "serials": [_serial_payload(serial) for serial in serials],
         "active_reservations": [_reservation_payload(reservation) for reservation in reservations],
         "recent_movements": [_movement_payload(movement) for movement in movements],
     }
@@ -613,6 +664,104 @@ def _search_stock_reservations_sync(
         "limit": limit,
         "profile_id": principal.profile_id,
         "results": [_reservation_payload(reservation) for reservation in reservations],
+    }
+
+
+def _search_stock_lots_sync(
+    *,
+    principal: InventoryMcpPrincipal,
+    query: str | None,
+    limit: int,
+    inventory_item_id: str | None,
+    status: str | None,
+) -> dict[str, Any]:
+    queryset = _stock_lot_queryset(principal=principal)
+    if inventory_item_id:
+        queryset = queryset.filter(inventory_item_id=inventory_item_id)
+    if status:
+        queryset = queryset.filter(status=status)
+
+    search_term = str(query or "").strip()
+    if search_term:
+        queryset = queryset.filter(
+            Q(lot_number__icontains=search_term)
+            | Q(inventory_item__name_snapshot__icontains=search_term)
+        )
+
+    lots = list(queryset[:limit])
+    return {
+        "query": search_term or None,
+        "count": len(lots),
+        "limit": limit,
+        "profile_id": principal.profile_id,
+        "results": [_lot_payload(lot) for lot in lots],
+    }
+
+
+def _search_stock_serials_sync(
+    *,
+    principal: InventoryMcpPrincipal,
+    query: str | None,
+    limit: int,
+    inventory_item_id: str | None,
+    status: str | None,
+) -> dict[str, Any]:
+    queryset = _stock_serial_queryset(principal=principal)
+    if inventory_item_id:
+        queryset = queryset.filter(inventory_item_id=inventory_item_id)
+    if status:
+        queryset = queryset.filter(status=status)
+
+    search_term = str(query or "").strip()
+    if search_term:
+        queryset = queryset.filter(
+            Q(serial_number__icontains=search_term)
+            | Q(inventory_item__name_snapshot__icontains=search_term)
+            | Q(stock_location__name__icontains=search_term)
+            | Q(stock_lot__lot_number__icontains=search_term)
+        )
+
+    serials = list(queryset[:limit])
+    return {
+        "query": search_term or None,
+        "count": len(serials),
+        "limit": limit,
+        "profile_id": principal.profile_id,
+        "results": [_serial_payload(serial) for serial in serials],
+    }
+
+
+def _search_stock_balances_sync(
+    *,
+    principal: InventoryMcpPrincipal,
+    query: str | None,
+    limit: int,
+    inventory_item_id: str | None,
+    location_id: str | None,
+) -> dict[str, Any]:
+    queryset = _stock_balance_queryset(principal=principal).filter(
+        Q(quantity_on_hand__gt=0) | Q(quantity_reserved__gt=0)
+    )
+    if inventory_item_id:
+        queryset = queryset.filter(inventory_item_id=inventory_item_id)
+    if location_id:
+        queryset = queryset.filter(stock_location_id=location_id)
+
+    search_term = str(query or "").strip()
+    if search_term:
+        queryset = queryset.filter(
+            Q(inventory_item__name_snapshot__icontains=search_term)
+            | Q(stock_location__name__icontains=search_term)
+            | Q(stock_lot__lot_number__icontains=search_term)
+        )
+
+    balances = list(queryset[:limit])
+    return {
+        "query": search_term or None,
+        "count": len(balances),
+        "limit": limit,
+        "profile_id": principal.profile_id,
+        "results": [_balance_payload(balance) for balance in balances],
     }
 
 
@@ -1380,6 +1529,69 @@ async def search_stock_reservations(
         status=status,
         external_order_type=external_order_type,
         inventory_item_id=str(inventory_item_id).strip() if inventory_item_id else None,
+    )
+
+
+@mcp.tool(
+    name="search_stock_lots",
+    description="Search stock lots by lot number, inventory item, or lifecycle status.",
+)
+async def search_stock_lots(
+    query: str | None = None,
+    limit: int = 10,
+    inventory_item_id: str | None = None,
+    status: str | None = None,
+) -> stock_payloads.StockLotCollectionResponsePayload:
+    principal = get_current_principal(required=True)
+    limit_value = max(1, min(int(limit), 25))
+    return await sync_to_async(_search_stock_lots_sync, thread_sensitive=True)(
+        principal=principal,
+        query=query,
+        limit=limit_value,
+        inventory_item_id=str(inventory_item_id).strip() if inventory_item_id else None,
+        status=status,
+    )
+
+
+@mcp.tool(
+    name="search_stock_serials",
+    description="Search stock serials by serial number, item, lot, location, or lifecycle status.",
+)
+async def search_stock_serials(
+    query: str | None = None,
+    limit: int = 10,
+    inventory_item_id: str | None = None,
+    status: str | None = None,
+) -> stock_payloads.StockSerialCollectionResponsePayload:
+    principal = get_current_principal(required=True)
+    limit_value = max(1, min(int(limit), 25))
+    return await sync_to_async(_search_stock_serials_sync, thread_sensitive=True)(
+        principal=principal,
+        query=query,
+        limit=limit_value,
+        inventory_item_id=str(inventory_item_id).strip() if inventory_item_id else None,
+        status=status,
+    )
+
+
+@mcp.tool(
+    name="search_stock_balances",
+    description="Search location-level stock balances by inventory item, location, or lot.",
+)
+async def search_stock_balances(
+    query: str | None = None,
+    limit: int = 10,
+    inventory_item_id: str | None = None,
+    location_id: str | None = None,
+) -> stock_payloads.StockBalanceCollectionResponsePayload:
+    principal = get_current_principal(required=True)
+    limit_value = max(1, min(int(limit), 25))
+    return await sync_to_async(_search_stock_balances_sync, thread_sensitive=True)(
+        principal=principal,
+        query=query,
+        limit=limit_value,
+        inventory_item_id=str(inventory_item_id).strip() if inventory_item_id else None,
+        location_id=str(location_id).strip() if location_id else None,
     )
 
 

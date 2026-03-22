@@ -276,6 +276,8 @@ class StockLocationResponsePayload(McpPayloadModel):
 
 class StockLotResponsePayload(McpPayloadModel):
     id: str = Field(..., description="Stock lot identifier")
+    inventory_item_id: Optional[str] = Field(None, description="Inventory item identifier")
+    inventory_item_name: Optional[str] = Field(None, description="Inventory item name")
     lot_number: str = Field(..., description="Lot number")
     expiry_date: Optional[str] = Field(None, description="ISO-8601 expiry date")
     unit_cost: Optional[float] = Field(None, description="Unit cost")
@@ -286,10 +288,27 @@ class StockLotResponsePayload(McpPayloadModel):
 
 class StockSerialResponsePayload(McpPayloadModel):
     id: str = Field(..., description="Stock serial identifier")
+    inventory_item_id: Optional[str] = Field(None, description="Inventory item identifier")
+    inventory_item_name: Optional[str] = Field(None, description="Inventory item name")
+    stock_lot_id: Optional[str] = Field(None, description="Stock lot identifier")
+    lot_number: Optional[str] = Field(None, description="Lot number")
     serial_number: str = Field(..., description="Serial number")
     status: Optional[str] = Field(None, description="Serial lifecycle status")
     stock_location_id: Optional[str] = Field(None, description="Location identifier")
     stock_location_name: Optional[str] = Field(None, description="Location display name")
+
+
+class StockBalanceResponsePayload(McpPayloadModel):
+    id: str = Field(..., description="Stock balance identifier")
+    inventory_item_id: str = Field(..., description="Inventory item identifier")
+    inventory_item_name: str = Field(..., description="Inventory item name")
+    stock_location_id: str = Field(..., description="Stock location identifier")
+    stock_location_name: str = Field(..., description="Stock location name")
+    stock_lot_id: Optional[str] = Field(None, description="Stock lot identifier")
+    lot_number: Optional[str] = Field(None, description="Lot number")
+    quantity_on_hand: Optional[float] = Field(None, description="Quantity currently on hand")
+    quantity_reserved: Optional[float] = Field(None, description="Quantity currently reserved")
+    quantity_available: Optional[float] = Field(None, description="Quantity currently available")
 
 
 class StockReservationResponsePayload(McpPayloadModel):
@@ -354,6 +373,30 @@ class StockReservationCollectionResponsePayload(McpPayloadModel):
     count: int = Field(0, description="Number of returned reservations")
     limit: Optional[int] = Field(None, description="Applied result limit")
     results: List[StockReservationResponsePayload] = Field(default_factory=list, description="Reservation results")
+
+
+class StockLotCollectionResponsePayload(McpPayloadModel):
+    profile_id: int = Field(..., description="Workspace profile identifier")
+    query: Optional[str] = Field(None, description="Applied search query")
+    count: int = Field(0, description="Number of returned lots")
+    limit: Optional[int] = Field(None, description="Applied result limit")
+    results: List[StockLotResponsePayload] = Field(default_factory=list, description="Stock lot results")
+
+
+class StockSerialCollectionResponsePayload(McpPayloadModel):
+    profile_id: int = Field(..., description="Workspace profile identifier")
+    query: Optional[str] = Field(None, description="Applied search query")
+    count: int = Field(0, description="Number of returned serials")
+    limit: Optional[int] = Field(None, description="Applied result limit")
+    results: List[StockSerialResponsePayload] = Field(default_factory=list, description="Stock serial results")
+
+
+class StockBalanceCollectionResponsePayload(McpPayloadModel):
+    profile_id: int = Field(..., description="Workspace profile identifier")
+    query: Optional[str] = Field(None, description="Applied search query")
+    count: int = Field(0, description="Number of returned balance rows")
+    limit: Optional[int] = Field(None, description="Applied result limit")
+    results: List[StockBalanceResponsePayload] = Field(default_factory=list, description="Stock balance results")
 
 
 class StockMovementCollectionResponsePayload(McpPayloadModel):
@@ -448,6 +491,7 @@ class StockTransferResultPayload(McpPayloadModel):
 class InventoryItemDetailResponsePayload(McpPayloadModel):
     profile_id: int = Field(..., description="Workspace profile identifier")
     inventory_item: InventoryItemResponsePayload = Field(..., description="Inventory item payload")
+    balances: List[StockBalanceResponsePayload] = Field(default_factory=list, description="Location-level stock balances")
     lots: List[StockLotResponsePayload] = Field(default_factory=list, description="Related stock lots")
     serials: List[StockSerialResponsePayload] = Field(default_factory=list, description="Related stock serials")
     active_reservations: List[StockReservationResponsePayload] = Field(
