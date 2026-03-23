@@ -115,6 +115,7 @@ class InventoryItemSummaryMixin:
 
 
 class StockMovementListSerializer(UserDetailMixin, serializers.ModelSerializer):
+    inventory_item_name = serializers.CharField(source='inventory_item.name_snapshot', read_only=True)
     movement_type_display = serializers.CharField(source='get_movement_type_display', read_only=True)
     from_location_name = serializers.CharField(source='from_location.name', read_only=True)
     to_location_name = serializers.CharField(source='to_location.name', read_only=True)
@@ -126,6 +127,8 @@ class StockMovementListSerializer(UserDetailMixin, serializers.ModelSerializer):
         model = StockMovement
         fields = [
             'id',
+            'inventory_item',
+            'inventory_item_name',
             'movement_type',
             'movement_type_display',
             'quantity',
@@ -146,6 +149,8 @@ class StockMovementListSerializer(UserDetailMixin, serializers.ModelSerializer):
 
 
 class StockBalanceDetailSerializer(serializers.ModelSerializer):
+    inventory_item_id = serializers.UUIDField(read_only=True)
+    inventory_item_name = serializers.CharField(source='inventory_item.name_snapshot', read_only=True)
     stock_location_name = serializers.CharField(source='stock_location.name', read_only=True)
     stock_lot_id = serializers.UUIDField(read_only=True, allow_null=True)
     lot_number = serializers.CharField(source='stock_lot.lot_number', read_only=True, allow_null=True)
@@ -154,6 +159,8 @@ class StockBalanceDetailSerializer(serializers.ModelSerializer):
         model = StockBalance
         fields = [
             'id',
+            'inventory_item_id',
+            'inventory_item_name',
             'stock_location_id',
             'stock_location_name',
             'stock_lot_id',
@@ -165,12 +172,16 @@ class StockBalanceDetailSerializer(serializers.ModelSerializer):
 
 
 class StockLotDetailSerializer(serializers.ModelSerializer):
+    inventory_item_id = serializers.UUIDField(read_only=True)
+    inventory_item_name = serializers.CharField(source='inventory_item.name_snapshot', read_only=True)
     supplier_name = serializers.CharField(source='supplier.name', read_only=True, allow_null=True)
 
     class Meta:
         model = StockLot
         fields = [
             'id',
+            'inventory_item_id',
+            'inventory_item_name',
             'lot_number',
             'expiry_date',
             'unit_cost',
@@ -184,6 +195,8 @@ class StockLotDetailSerializer(serializers.ModelSerializer):
 
 
 class StockSerialDetailSerializer(serializers.ModelSerializer):
+    inventory_item_id = serializers.UUIDField(read_only=True)
+    inventory_item_name = serializers.CharField(source='inventory_item.name_snapshot', read_only=True)
     stock_location_id = serializers.UUIDField(read_only=True, allow_null=True)
     stock_location_name = serializers.CharField(source='stock_location.name', read_only=True, allow_null=True)
     stock_lot_id = serializers.UUIDField(read_only=True, allow_null=True)
@@ -193,6 +206,8 @@ class StockSerialDetailSerializer(serializers.ModelSerializer):
         model = StockSerial
         fields = [
             'id',
+            'inventory_item_id',
+            'inventory_item_name',
             'serial_number',
             'status',
             'stock_location_id',

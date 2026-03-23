@@ -14,6 +14,7 @@ from mainapps.inventory.serializers import StockAnalyticsSerializer
 from mainapps.inventory.views import BaseInventoryViewSet
 from mainapps.projections.models import CatalogVariantProjection
 from mainapps.stock.models import (
+    StockBalance,
     StockLocation,
     StockLocationType,
     StockLot,
@@ -25,13 +26,16 @@ from mainapps.stock.serializers import (
     InventoryItemDetailSerializer,
     InventoryItemListSerializer,
     LowStockBalanceSerializer,
+    StockBalanceDetailSerializer,
     StockLocationDetailSerializer,
     StockLocationListSerializer,
     StockLocationTypeSerializer,
+    StockLotDetailSerializer,
     StockMovementListSerializer,
     StockReservationCreateSerializer,
     StockReservationMutationSerializer,
     StockReservationSerializer,
+    StockSerialDetailSerializer,
 )
 from subapps.permissions.constants import UNIFIED_PERMISSION_DICT
 from subapps.permissions.microservice_permissions import BaseCachePermissionViewset, CachingMixin, PermissionRequiredMixin
@@ -189,6 +193,24 @@ class BaseInventoryViewSetMixin(CachingMixin, PermissionRequiredMixin, viewsets.
         return queryset
 
 
+class BaseInventoryReadOnlyViewSetMixin(CachingMixin, PermissionRequiredMixin, viewsets.ReadOnlyModelViewSet):
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    profile_scope_field = 'profile_id'
+    legacy_profile_scope_field = 'profile'
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        profile_id = get_request_profile_id(self.request, as_str=False)
+        if profile_id:
+            queryset = scope_queryset_by_identity(
+                queryset,
+                canonical_field=self.profile_scope_field,
+                legacy_field=self.legacy_profile_scope_field,
+                value=profile_id,
+            )
+        return queryset
+
+
 class InventoryItemViewSet(BaseInventoryViewSetMixin):
     required_permission = UNIFIED_PERMISSION_DICT.get('inventory_item')
     queryset = InventoryItem.objects.select_related('inventory_category', 'default_supplier')
@@ -266,7 +288,6 @@ class InventoryItemViewSet(BaseInventoryViewSetMixin):
             queryset = queryset.filter(id__in=matching_ids) if matching_ids else queryset.none()
 
         return queryset
-
     @action(detail=False, methods=['get'])
     def expiring_soon(self, request):
         days = int(request.query_params.get('days', 30))
@@ -408,6 +429,55 @@ class InventoryItemViewSet(BaseInventoryViewSetMixin):
             return self.get_paginated_response(serializer.data)
         serializer = LowStockBalanceSerializer(rows, many=True, context={'request': request})
         return Response(serializer.data)
+
+
+class StockBalanceViewSet(BaseInventoryReadOnlyViewSetMixin):
+    required_permission = UNIFIED_PERMISSION_DICT.get('inventory_item')
+    queryset = StockBalance.objects.select_related('inventory_item', 'stock_location', 'stock_lot')
+    serializer_class = StockBalanceDetailSerializer
+    filterset_fields = ['inventory_item', 'stock_location', 'stock_lot']
+    search_fields = ['inventory_item__name_snapshot', 'stock_location__name', 'stock_lot__lot_number']
+    ordering_fields = ['quantity_on_hand', 'quantity_reserved', 'quantity_available', 'created_at', 'stock_location__name']
+    ordering = ['stock_location__name', 'inventory_item__name_snapshot']
+
+
+class StockLotViewSet(BaseInventoryReadOnlyViewSetMixin):
+    required_permission = UNIFIED_PERMISSION_DICT.get('inventory_item')
+    queryset = StockLot.objects.select_related('inventory_item', 'supplier')
+    serializer_class = StockLotDetailSerializer
+    filterset_fields = ['inventory_item', 'supplier', 'status']
+    search_fields = ['lot_number', 'inventory_item__name_snapshot', 'supplier__name']
+    ordering_fields = ['expiry_date', 'remaining_quantity', 'received_quantity', 'created_at']
+    ordering = ['expiry_date', '-created_at']
+
+
+class StockSerialViewSet(BaseInventoryReadOnlyViewSetMixin):
+    required_permission = UNIFIED_PERMISSION_DICT.get('inventory_item')
+    queryset = StockSerial.objects.select_related('inventory_item', 'stock_location', 'stock_lot')
+    serializer_class = StockSerialDetailSerializer
+    filterset_fields = ['inventory_item', 'stock_location', 'stock_lot', 'status']
+    search_fields = ['serial_number', 'inventory_item__name_snapshot', 'stock_location__name', 'stock_lot__lot_number']
+    ordering_fields = ['serial_number', 'created_at', 'stock_location__name']
+    ordering = ['serial_number']
+
+
+class StockMovementViewSet(BaseInventoryReadOnlyViewSetMixin):
+    required_permission = UNIFIED_PERMISSION_DICT.get('inventory_item')
+    queryset = StockMovement.objects.select_related('inventory_item', 'from_location', 'to_location', 'stock_lot', 'stock_serial')
+    serializer_class = StockMovementListSerializer
+    filterset_fields = ['inventory_item', 'movement_type', 'reference_type', 'reference_id', 'from_location', 'to_location', 'stock_lot', 'stock_serial']
+    search_fields = [
+        'inventory_item__name_snapshot',
+        'reference_type',
+        'reference_id',
+        'from_location__name',
+        'to_location__name',
+        'stock_lot__lot_number',
+        'stock_serial__serial_number',
+        'notes',
+    ]
+    ordering_fields = ['occurred_at', 'created_at', 'quantity', 'movement_type']
+    ordering = ['-occurred_at', '-created_at']
 
 
 class StockReservationViewSet(BaseCachePermissionViewset):
