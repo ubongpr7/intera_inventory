@@ -6,6 +6,8 @@ from decimal import Decimal
 from mainapps.content_type_linking_models.serializers import UserDetailMixin
 from mainapps.inventory.models import InventoryItem
 from mainapps.orders.models import (
+    GoodsReceipt,
+    GoodsReceiptLine,
     PurchaseOrder,
     PurchaseOrderLineItem,
     ReturnOrder,
@@ -100,6 +102,79 @@ class SalesOrderShipmentSerializer(UserDetailMixin, serializers.ModelSerializer)
         return self.get_user_details(self.resolve_user_reference(obj, 'checked_by_user_id', 'checked_by'))
 
 
+class SalesOrderShipmentListSerializer(UserDetailMixin, serializers.ModelSerializer):
+    order_reference = serializers.CharField(source='order.reference', read_only=True)
+    customer_name = serializers.CharField(source='order.customer.name', read_only=True)
+    order_status = serializers.CharField(source='order.status', read_only=True)
+    checked_by_details = serializers.SerializerMethodField()
+    line_count = serializers.SerializerMethodField()
+    total_quantity = serializers.SerializerMethodField()
+    location_count = serializers.SerializerMethodField()
+    inventory_preview = serializers.SerializerMethodField()
+    location_preview = serializers.SerializerMethodField()
+
+    class Meta:
+        model = SalesOrderShipment
+        fields = [
+            'id',
+            'order',
+            'order_reference',
+            'customer_name',
+            'order_status',
+            'reference',
+            'shipment_date',
+            'delivery_date',
+            'checked_by',
+            'checked_by_user_id',
+            'checked_by_details',
+            'tracking_number',
+            'invoice_number',
+            'link',
+            'notes',
+            'line_count',
+            'total_quantity',
+            'location_count',
+            'inventory_preview',
+            'location_preview',
+            'created_at',
+            'updated_at',
+        ]
+
+    def get_checked_by_details(self, obj):
+        return self.get_user_details(self.resolve_user_reference(obj, 'checked_by_user_id', 'checked_by'))
+
+    def get_line_count(self, obj):
+        return obj.lines.count()
+
+    def get_total_quantity(self, obj):
+        total = sum((line.quantity_shipped for line in obj.lines.all()), Decimal('0'))
+        return str(total)
+
+    def get_location_count(self, obj):
+        return obj.lines.values('stock_location_id').distinct().count()
+
+    def get_inventory_preview(self, obj):
+        return list(
+            obj.lines.select_related('sales_order_line__inventory_item')
+            .values_list('sales_order_line__inventory_item__name_snapshot', flat=True)
+            .distinct()[:3]
+        )
+
+    def get_location_preview(self, obj):
+        return list(
+            obj.lines.select_related('stock_location')
+            .values_list('stock_location__name', flat=True)
+            .distinct()[:3]
+        )
+
+
+class SalesOrderShipmentDetailSerializer(SalesOrderShipmentListSerializer):
+    lines = SalesOrderShipmentLineSerializer(many=True, read_only=True)
+
+    class Meta(SalesOrderShipmentListSerializer.Meta):
+        fields = SalesOrderShipmentListSerializer.Meta.fields + ['lines']
+
+
 class SalesOrderLineItemSerializer(serializers.ModelSerializer):
     inventory_name = serializers.CharField(source='inventory_item.name_snapshot', read_only=True)
     remaining_quantity = serializers.DecimalField(max_digits=15, decimal_places=5, read_only=True)
@@ -126,6 +201,98 @@ class SalesOrderLineItemSerializer(serializers.ModelSerializer):
             'created_at',
             'updated_at',
         ]
+
+
+class GoodsReceiptLineSerializer(serializers.ModelSerializer):
+    purchase_order_line_id = serializers.UUIDField(source='purchase_order_line.id', read_only=True, allow_null=True)
+    inventory_item_name = serializers.CharField(source='inventory_item.name_snapshot', read_only=True)
+    location_name = serializers.CharField(source='stock_location.name', read_only=True)
+
+    class Meta:
+        model = GoodsReceiptLine
+        fields = [
+            'id',
+            'goods_receipt',
+            'purchase_order_line',
+            'purchase_order_line_id',
+            'inventory_item',
+            'inventory_item_name',
+            'stock_location',
+            'location_name',
+            'received_quantity',
+            'unit_cost',
+            'lot_number',
+            'manufactured_date',
+            'expiry_date',
+            'created_at',
+        ]
+
+
+class GoodsReceiptListSerializer(UserDetailMixin, serializers.ModelSerializer):
+    purchase_order_reference = serializers.CharField(source='purchase_order.reference', read_only=True)
+    supplier_name = serializers.CharField(source='supplier.name', read_only=True)
+    received_by_details = serializers.SerializerMethodField()
+    line_count = serializers.SerializerMethodField()
+    total_quantity = serializers.SerializerMethodField()
+    location_count = serializers.SerializerMethodField()
+    inventory_preview = serializers.SerializerMethodField()
+    location_preview = serializers.SerializerMethodField()
+
+    class Meta:
+        model = GoodsReceipt
+        fields = [
+            'id',
+            'reference',
+            'purchase_order',
+            'purchase_order_reference',
+            'supplier',
+            'supplier_name',
+            'received_at',
+            'received_by_user_id',
+            'received_by_details',
+            'line_count',
+            'total_quantity',
+            'location_count',
+            'inventory_preview',
+            'location_preview',
+            'notes',
+            'created_at',
+            'updated_at',
+        ]
+
+    def get_received_by_details(self, obj):
+        return self.get_user_details(obj.received_by_user_id)
+
+    def get_line_count(self, obj):
+        return obj.lines.count()
+
+    def get_total_quantity(self, obj):
+        total = sum((line.received_quantity for line in obj.lines.all()), Decimal('0'))
+        return str(total)
+
+    def get_location_count(self, obj):
+        return obj.lines.values('stock_location_id').distinct().count()
+
+    def get_inventory_preview(self, obj):
+        return list(
+            obj.lines.select_related('inventory_item')
+            .values_list('inventory_item__name_snapshot', flat=True)
+            .distinct()[:3]
+        )
+
+    def get_location_preview(self, obj):
+        return list(
+            obj.lines.select_related('stock_location')
+            .values_list('stock_location__name', flat=True)
+            .distinct()[:3]
+        )
+
+
+class GoodsReceiptDetailSerializer(GoodsReceiptListSerializer):
+    lines = GoodsReceiptLineSerializer(many=True, read_only=True)
+
+    class Meta(GoodsReceiptListSerializer.Meta):
+        fields = GoodsReceiptListSerializer.Meta.fields + ['lines']
 
 
 class SalesOrderListSerializer(UserDetailMixin, serializers.ModelSerializer):

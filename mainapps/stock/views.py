@@ -479,6 +479,15 @@ class StockMovementViewSet(BaseInventoryReadOnlyViewSetMixin):
     ordering_fields = ['occurred_at', 'created_at', 'quantity', 'movement_type']
     ordering = ['-occurred_at', '-created_at']
 
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        stock_location_id = self.request.query_params.get('stock_location')
+        if stock_location_id:
+            queryset = queryset.filter(
+                Q(from_location_id=stock_location_id) | Q(to_location_id=stock_location_id)
+            )
+        return queryset
+
 
 class StockReservationViewSet(BaseCachePermissionViewset):
     required_permission = UNIFIED_PERMISSION_DICT.get('stock_reservation')

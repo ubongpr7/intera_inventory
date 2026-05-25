@@ -2,6 +2,7 @@ from __future__ import annotations
 from django.urls import reverse
 from django.utils.translation import gettext_lazy as _
 from django.utils import timezone
+from django.utils.text import slugify
 from mainapps.company.models import Company
 from django.core.validators import MinValueValidator
 from django.db import models
@@ -168,15 +169,17 @@ class StockLocation(ProfileMixin, MPTTModel):
         _sync_identity_fields(self, canonical_field='official_user_id', legacy_field='official')
         if self.parent and not self.physical_address:
             self.physical_address =self.parent.physical_address
-            
-        if  self.location_type and (self.profile_id is not None or self.profile) and not self.code:
-            
-            base = self.location_type.name.upper().replace(' ', '_')
+
+        if (self.profile_id is not None or self.profile) and not self.code:
+            if self.location_type and self.location_type.name:
+                base = self.location_type.name.upper().replace(' ', '_')
+            else:
+                normalized_name = slugify(self.name or "", allow_unicode=False).replace("-", "_").upper()
+                base = normalized_name[:24] if normalized_name else "LOCATION"
             profile_id = self.profile_id if self.profile_id is not None else self.profile
-            
+
             last_code = StockLocation.objects.filter(
                 models.Q(profile_id=profile_id) | models.Q(profile=str(profile_id)),
-                location_type=self.location_type,
                 code__startswith=f"{base}_{profile_id}_"
             ).order_by('-code').values_list('code', flat=True).first()
 

@@ -7,6 +7,7 @@ from django.test import SimpleTestCase, TestCase
 from mainapps.inventory.models import InventoryCategory, InventoryItem
 from subapps.kafka.producers.inventory import _resolve_catalog_variant
 from subapps.services.inventory_read_model import get_inventory_item_summary_map, get_low_stock_rows
+from subapps.utils.request_context import scope_queryset_by_identity
 
 
 class InventoryCategoryConstraintTests(TestCase):
@@ -25,6 +26,63 @@ class InventoryCategoryConstraintTests(TestCase):
         with self.assertRaises(IntegrityError):
             with transaction.atomic():
                 InventoryCategory.objects.create(name="Consumables", profile_id=1)
+
+
+class IdentityScopeTests(TestCase):
+    def test_scope_queryset_ignores_missing_legacy_field_for_profile_id_only_models(self):
+        matching_item = InventoryItem.objects.create(
+            profile_id=1,
+            name_snapshot="Copper Wire",
+        )
+        InventoryItem.objects.create(
+            profile_id=2,
+            name_snapshot="Steel Rod",
+        )
+
+        scoped = scope_queryset_by_identity(
+            InventoryItem.objects.order_by("name_snapshot"),
+            canonical_field="profile_id",
+            legacy_field="profile",
+            value=1,
+        )
+
+        self.assertEqual(list(scoped.values_list("id", flat=True)), [matching_item.id])
+
+    def test_scope_queryset_keeps_legacy_lookup_when_model_still_has_profile_field(self):
+        matching_category = InventoryCategory.objects.create(name="Consumables", profile_id=1)
+        InventoryCategory.objects.create(name="Electronics", profile_id=2)
+
+        scoped = scope_queryset_by_identity(
+            InventoryCategory.objects.order_by("name"),
+            canonical_field="profile_id",
+            legacy_field="profile",
+            value=1,
+        )
+
+        self.assertEqual(list(scoped.values_list("id", flat=True)), [matching_category.id])
+
+    def test_scope_queryset_supports_nested_identity_paths(self):
+        matching_category = InventoryCategory.objects.create(name="Consumables", profile_id=1)
+        other_category = InventoryCategory.objects.create(name="Electronics", profile_id=2)
+        matching_item = InventoryItem.objects.create(
+            profile_id=1,
+            name_snapshot="Copper Wire",
+            inventory_category=matching_category,
+        )
+        InventoryItem.objects.create(
+            profile_id=2,
+            name_snapshot="Steel Rod",
+            inventory_category=other_category,
+        )
+
+        scoped = scope_queryset_by_identity(
+            InventoryItem.objects.order_by("name_snapshot"),
+            canonical_field="inventory_category__profile_id",
+            legacy_field="inventory_category__profile",
+            value=1,
+        )
+
+        self.assertEqual(list(scoped.values_list("id", flat=True)), [matching_item.id])
 
 
 class InventoryItemSummaryTests(SimpleTestCase):

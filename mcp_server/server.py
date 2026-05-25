@@ -247,7 +247,9 @@ def _location_payload(location: StockLocation, *, summary: dict[str, Any] | None
         "id": str(location.id),
         "name": location.name,
         "code": location.code,
+        "location_type_id": str(location.location_type_id) if location.location_type_id else None,
         "location_type": location.location_type.name if location.location_type_id and location.location_type else None,
+        "parent_id": str(location.parent_id) if location.parent_id else None,
         "parent_name": location.parent.name if location.parent_id and location.parent else None,
         "structural": location.structural,
         "external": location.external,
@@ -258,6 +260,14 @@ def _location_payload(location: StockLocation, *, summary: dict[str, Any] | None
         "total_value": _decimal_to_float(resolved_summary.get("total_value", Decimal("0"))),
         "expiring_soon_count": resolved_summary.get("expiring_soon_count", 0),
         "top_inventory_types": _to_json_compatible(resolved_summary.get("top_inventory_types", [])),
+    }
+
+
+def _location_type_payload(location_type: StockLocationType) -> dict[str, Any]:
+    return {
+        "id": str(location_type.id),
+        "name": location_type.name,
+        "description": location_type.description or "",
     }
 
 
@@ -378,6 +388,10 @@ def _stock_location_queryset(*, principal: InventoryMcpPrincipal) -> QuerySet[St
         legacy_field="profile",
         value=principal.profile_id,
     )
+
+
+def _stock_location_type_queryset() -> QuerySet[StockLocationType]:
+    return StockLocationType.objects.order_by("name", "id")
 
 
 def _stock_lot_queryset(*, principal: InventoryMcpPrincipal) -> QuerySet[StockLot]:
@@ -612,6 +626,112 @@ def _search_stock_locations_sync(
             for location in locations
         ],
     }
+
+
+def _list_stock_location_types_sync(
+    *,
+    query: str | None,
+    limit: int,
+) -> dict[str, Any]:
+    queryset = _stock_location_type_queryset()
+    search_term = str(query or "").strip()
+    if search_term:
+        queryset = queryset.filter(Q(name__icontains=search_term) | Q(description__icontains=search_term))
+    location_types = list(queryset[:limit])
+    return {
+        "query": search_term or None,
+        "count": len(location_types),
+        "results": [_location_type_payload(item) for item in location_types],
+    }
+
+
+_STOCK_LOCATION_TYPE_ALIAS_MAP: dict[str, tuple[str, ...]] = {
+    "warehouse": ("warehouse", "main warehouse", "central warehouse", "storage facility"),
+    "showroom": ("showroom", "front store", "store", "retail floor", "sales floor"),
+    "backroom": ("backroom", "back room", "stock room", "storage room"),
+    "returns area": ("returns area", "returns shelf", "returns rack", "returns processing"),
+    "overflow": ("overflow", "overflow room"),
+    "shelf": ("shelf",),
+    "rack": ("rack",),
+    "bin": ("bin",),
+    "wardrobe": ("wardrobe",),
+}
+
+
+def _normalize_stock_location_type_token(value: str | None) -> str:
+    return " ".join(str(value or "").strip().lower().replace("-", " ").replace("_", " ").split())
+
+
+def _match_stock_location_type_name(
+    location_types: list[StockLocationType],
+    *,
+    requested_name: str | None,
+    location_name: str | None,
+    structural: bool,
+    parent_id: str | None,
+) -> str | None:
+    normalized_requested = _normalize_stock_location_type_token(requested_name)
+    normalized_location_name = _normalize_stock_location_type_token(location_name)
+
+    alias_to_canonical: dict[str, str] = {}
+    for canonical, aliases in _STOCK_LOCATION_TYPE_ALIAS_MAP.items():
+        alias_to_canonical[canonical] = canonical
+        for alias in aliases:
+            alias_to_canonical[_normalize_stock_location_type_token(alias)] = canonical
+
+    if normalized_requested:
+        canonical = alias_to_canonical.get(normalized_requested, normalized_requested)
+        for item in location_types:
+            if _normalize_stock_location_type_token(item.name) == canonical:
+                return item.name
+
+    if normalized_location_name:
+        for alias, canonical in alias_to_canonical.items():
+            if alias and alias in normalized_location_name:
+                for item in location_types:
+                    if _normalize_stock_location_type_token(item.name) == canonical:
+                        return item.name
+
+    fallback_names = ["warehouse"] if structural and not parent_id else ["backroom", "shelf", "showroom", "warehouse"]
+    for fallback in fallback_names:
+        for item in location_types:
+            if _normalize_stock_location_type_token(item.name) == fallback:
+                return item.name
+    return None
+
+
+def _prepare_stock_location_payload_data(
+    *,
+    data: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if not isinstance(data, dict):
+        return data
+
+    payload = dict(data)
+    location_types = list(_stock_location_type_queryset())
+    requested_type_name = payload.pop("location_type_name", None)
+    structural = bool(payload.get("structural"))
+    parent_id = str(payload.get("parent_id") or "").strip() or None
+    matched_type_name = _match_stock_location_type_name(
+        location_types,
+        requested_name=str(requested_type_name or "").strip() or None,
+        location_name=str(payload.get("name") or "").strip() or None,
+        structural=structural,
+        parent_id=parent_id,
+    )
+    if matched_type_name and not payload.get("location_type_id"):
+        match = next(
+            (
+                item
+                for item in location_types
+                if _normalize_stock_location_type_token(item.name)
+                == _normalize_stock_location_type_token(matched_type_name)
+            ),
+            None,
+        )
+        if match is not None:
+            payload["location_type_id"] = str(match.id)
+    return payload
 
 
 def _get_stock_location_summary_sync(
@@ -1248,13 +1368,14 @@ def _stock_location_action_sync(
     data: dict[str, Any] | None = None,
     query_params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    prepared_data = _prepare_stock_location_payload_data(data=data)
     payload = _invoke_view_action_sync(
         principal=principal,
         viewset_cls=StockLocationViewSet,
         action=action,
         method=method,
         pk=location_id,
-        data=data,
+        data=prepared_data,
         query_params=query_params,
     )
     return {
@@ -1489,6 +1610,41 @@ async def search_stock_locations(
         limit=limit_value,
         structural_only=structural_only,
         external_only=external_only,
+    )
+
+
+@mcp.tool(
+    name="list_stock_locations",
+    description="List stock locations for the current tenant so the agent can present deterministic selectable options.",
+)
+async def list_stock_locations(
+    limit: int = 25,
+    structural_only: bool | None = None,
+    external_only: bool | None = None,
+) -> stock_payloads.StockLocationCollectionResponsePayload:
+    principal = get_current_principal(required=True)
+    limit_value = max(1, min(int(limit), 50))
+    return await sync_to_async(_search_stock_locations_sync, thread_sensitive=True)(
+        principal=principal,
+        query=None,
+        limit=limit_value,
+        structural_only=structural_only,
+        external_only=external_only,
+    )
+
+
+@mcp.tool(
+    name="list_stock_location_types",
+    description="List available stock location types so the agent can resolve human labels to backend IDs.",
+)
+async def list_stock_location_types(
+    query: str | None = None,
+    limit: int = 25,
+) -> stock_payloads.StockLocationTypeCollectionResponsePayload:
+    limit_value = max(1, min(int(limit), 50))
+    return await sync_to_async(_list_stock_location_types_sync, thread_sensitive=True)(
+        query=query,
+        limit=limit_value,
     )
 
 

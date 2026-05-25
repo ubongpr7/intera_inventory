@@ -1,10 +1,13 @@
 import uuid
 from decimal import Decimal
+from io import StringIO
 from unittest.mock import MagicMock, patch
 
-from django.test import SimpleTestCase
+from django.core.management import call_command
+from django.test import SimpleTestCase, TestCase
 
 from mainapps.inventory.models import InventoryItem
+from mainapps.stock.models import StockLocation, StockLocationType
 from mainapps.stock.views import (
     filter_inventory_items_for_location,
     filter_inventory_items_for_purchase_order,
@@ -176,3 +179,44 @@ class StockDomainTests(SimpleTestCase):
             created_by_user_id=7,
             updated_by_user_id=7,
         )
+
+
+class StockLocationRepairCommandTests(TestCase):
+    def setUp(self):
+        self.warehouse_type = StockLocationType.objects.create(name="Warehouse", description="Large storage facility")
+        self.showroom_type = StockLocationType.objects.create(name="Showroom", description="Customer-facing display area")
+        self.backroom_type = StockLocationType.objects.create(name="Backroom", description="Staff-only storage")
+        self.returns_type = StockLocationType.objects.create(name="Returns Area", description="Return handling")
+
+    def test_repair_stock_location_defaults_assigns_type_parent_and_code(self):
+        root = StockLocation.objects.create(
+            profile_id=1,
+            name="Main Fashion Warehouse",
+            structural=True,
+        )
+        child = StockLocation.objects.create(
+            profile_id=1,
+            name="Retail Floor",
+            structural=False,
+        )
+        returns = StockLocation.objects.create(
+            profile_id=1,
+            name="Returns Rack",
+            structural=False,
+        )
+
+        output = StringIO()
+        call_command("repair_stock_location_defaults", profile_id=1, apply=True, stdout=output)
+
+        root.refresh_from_db()
+        child.refresh_from_db()
+        returns.refresh_from_db()
+
+        self.assertEqual(root.location_type, self.warehouse_type)
+        self.assertTrue(root.code)
+        self.assertEqual(child.parent_id, root.id)
+        self.assertEqual(child.location_type, self.showroom_type)
+        self.assertTrue(child.code)
+        self.assertEqual(returns.parent_id, root.id)
+        self.assertEqual(returns.location_type, self.returns_type)
+        self.assertIn("Applied 3 stock location repair(s).", output.getvalue())

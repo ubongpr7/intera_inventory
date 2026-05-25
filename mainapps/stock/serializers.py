@@ -117,7 +117,9 @@ class InventoryItemSummaryMixin:
 class StockMovementListSerializer(UserDetailMixin, serializers.ModelSerializer):
     inventory_item_name = serializers.CharField(source='inventory_item.name_snapshot', read_only=True)
     movement_type_display = serializers.CharField(source='get_movement_type_display', read_only=True)
+    from_location_id = serializers.UUIDField(read_only=True, allow_null=True)
     from_location_name = serializers.CharField(source='from_location.name', read_only=True)
+    to_location_id = serializers.UUIDField(read_only=True, allow_null=True)
     to_location_name = serializers.CharField(source='to_location.name', read_only=True)
     lot_number = serializers.CharField(source='stock_lot.lot_number', read_only=True)
     serial_number = serializers.CharField(source='stock_serial.serial_number', read_only=True)
@@ -136,7 +138,9 @@ class StockMovementListSerializer(UserDetailMixin, serializers.ModelSerializer):
             'reference_type',
             'reference_id',
             'occurred_at',
+            'from_location_id',
             'from_location_name',
+            'to_location_id',
             'to_location_name',
             'lot_number',
             'serial_number',

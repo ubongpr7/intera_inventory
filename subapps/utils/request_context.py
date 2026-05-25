@@ -1,3 +1,4 @@
+from django.core.exceptions import FieldDoesNotExist
 from django.db.models import Q
 from rest_framework.exceptions import AuthenticationFailed
 from rest_framework_simplejwt.tokens import UntypedToken
@@ -107,16 +108,37 @@ def coerce_identity_id(value):
         return None
 
 
-def build_identity_lookup(*, canonical_field, legacy_field=None, value=None):
+def _lookup_path_exists(model, lookup_path):
+    if model is None or not lookup_path:
+        return False
+
+    current_model = model
+    for index, part in enumerate(lookup_path.split("__")):
+        try:
+            field = current_model._meta.get_field(part)
+        except FieldDoesNotExist:
+            return False
+
+        if index == len(lookup_path.split("__")) - 1:
+            return True
+
+        current_model = getattr(getattr(field, "remote_field", None), "model", None)
+        if current_model is None:
+            return False
+
+    return True
+
+
+def build_identity_lookup(*, canonical_field, legacy_field=None, value=None, model=None):
     lookup = Q()
     normalized_value = coerce_identity_id(value)
     legacy_value = None if value in (None, "") else str(value).strip()
 
-    if normalized_value is not None:
+    if normalized_value is not None and _lookup_path_exists(model, canonical_field):
         lookup |= Q(**{canonical_field: normalized_value})
         legacy_value = str(normalized_value)
 
-    if legacy_field and legacy_value not in (None, ""):
+    if legacy_field and legacy_value not in (None, "") and _lookup_path_exists(model, legacy_field):
         lookup |= Q(**{legacy_field: legacy_value})
 
     return lookup
@@ -127,6 +149,7 @@ def scope_queryset_by_identity(queryset, *, canonical_field, legacy_field=None, 
         canonical_field=canonical_field,
         legacy_field=legacy_field,
         value=value,
+        model=queryset.model,
     )
     if not lookup.children:
         return queryset

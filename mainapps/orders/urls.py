@@ -4,6 +4,8 @@ from .views import *
 
 router = DefaultRouter()
 
+router.register(r'goods-receipts', GoodsReceiptViewSet, basename='goods-receipt')
+router.register(r'sales-order-shipments', SalesOrderShipmentViewSet, basename='sales-order-shipment')
 router.register(r'purchase-orders', PurchaseOrderViewSet, basename='purchase-order')
 router.register(r'sales-orders', SalesOrderViewSet, basename='sales-order')
 router.register(r'return-orders', ReturnOrderViewSet, basename='return-order')

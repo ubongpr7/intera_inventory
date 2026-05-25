@@ -99,6 +99,11 @@ class StockLocationCreateUpdatePayload(BaseModel):
     parent_id: Optional[uuid.UUID] = Field(None, description="UUID of parent StockLocation")
     external: bool = Field(False, description="External location flag")
     location_type_id: Optional[uuid.UUID] = Field(None, description="UUID of StockLocationType")
+    location_type_name: Optional[str] = Field(
+        None,
+        max_length=100,
+        description="Human-readable stock location type name. The MCP layer resolves this to location_type_id.",
+    )
     description: Optional[str] = Field(None, description="Longer form description")
     physical_address: Optional[str] = Field(None, max_length=255, description="Physical address")
 
@@ -258,7 +263,9 @@ class StockLocationResponsePayload(McpPayloadModel):
     id: str = Field(..., description="Stock location identifier")
     name: str = Field(..., description="Stock location name")
     code: Optional[str] = Field(None, description="Stock location code")
+    location_type_id: Optional[str] = Field(None, description="Stock location type identifier")
     location_type: Optional[str] = Field(None, description="Stock location type display name")
+    parent_id: Optional[str] = Field(None, description="Parent location identifier")
     parent_name: Optional[str] = Field(None, description="Parent location display name")
     structural: Optional[bool] = Field(None, description="Whether the location is structural only")
     external: Optional[bool] = Field(None, description="Whether the location is external")
@@ -360,6 +367,21 @@ class StockLocationCollectionResponsePayload(McpPayloadModel):
     count: int = Field(0, description="Number of returned locations")
     limit: Optional[int] = Field(None, description="Applied result limit")
     results: List[StockLocationResponsePayload] = Field(default_factory=list, description="Location results")
+
+
+class StockLocationTypeResponsePayload(McpPayloadModel):
+    id: str = Field(..., description="Stock location type identifier")
+    name: str = Field(..., description="Stock location type name")
+    description: str = Field("", description="Stock location type description")
+
+
+class StockLocationTypeCollectionResponsePayload(McpPayloadModel):
+    count: int = Field(0, description="Number of returned location types")
+    query: Optional[str] = Field(None, description="Applied search query")
+    results: List[StockLocationTypeResponsePayload] = Field(
+        default_factory=list,
+        description="Stock location type results",
+    )
 
 
 class StockLocationSummaryResponsePayload(McpPayloadModel):

@@ -12,6 +12,8 @@ from decimal import Decimal
 import logging
 
 from mainapps.orders.serializers import (
+    GoodsReceiptDetailSerializer,
+    GoodsReceiptListSerializer,
     PurchaseOrderDetailSerializer,
     PurchaseOrderAnalyticsSerializer,
     PurchaseOrderLineItemSerializer,
@@ -28,6 +30,8 @@ from mainapps.orders.serializers import (
     SalesOrderReleaseSerializer,
     SalesOrderReserveSerializer,
     SalesOrderShipSerializer,
+    SalesOrderShipmentDetailSerializer,
+    SalesOrderShipmentListSerializer,
     SalesOrderShipmentSerializer,
 )
 from mainapps.stock.models import (
@@ -52,11 +56,142 @@ from subapps.utils.request_context import (
 )
 
 from .models import (
+    GoodsReceipt,
     PurchaseOrder, PurchaseOrderLineItem, PurchaseOrderStatus,
     ReturnOrder, ReturnOrderLineItem, ReturnOrderStatus,
     SalesOrder, SalesOrderLineItem, SalesOrderShipment, SalesOrderStatus,
 )
 logger = logging.getLogger(__name__)
+
+
+class GoodsReceiptViewSet(BaseCachePermissionViewset):
+    required_permission = UNIFIED_PERMISSION_DICT.get('purchase_order')
+    queryset = GoodsReceipt.objects.select_related('purchase_order', 'supplier').prefetch_related(
+        'lines',
+        'lines__inventory_item',
+        'lines__stock_location',
+    )
+    filterset_fields = ['purchase_order', 'supplier']
+    search_fields = [
+        'reference',
+        'purchase_order__reference',
+        'supplier__name',
+        'notes',
+        'lines__inventory_item__name_snapshot',
+        'lines__stock_location__name',
+        'lines__lot_number',
+    ]
+    ordering_fields = ['received_at', 'created_at', 'reference']
+    ordering = ['-received_at', '-created_at']
+    http_method_names = ['get', 'head', 'options']
+
+    def get_serializer_class(self):
+        if self.action == 'list':
+            return GoodsReceiptListSerializer
+        return GoodsReceiptDetailSerializer
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        profile_id = get_request_profile_id(self.request, as_str=False)
+        if profile_id:
+            queryset = scope_queryset_by_identity(
+                queryset,
+                canonical_field='profile_id',
+                legacy_field='profile',
+                value=profile_id,
+            )
+
+        stock_location_id = self.request.query_params.get('stock_location')
+        if stock_location_id:
+            queryset = queryset.filter(lines__stock_location_id=stock_location_id)
+
+        inventory_item_id = self.request.query_params.get('inventory_item')
+        if inventory_item_id:
+            queryset = queryset.filter(lines__inventory_item_id=inventory_item_id)
+
+        date_from = self.request.query_params.get('date_from')
+        if date_from:
+            queryset = queryset.filter(received_at__date__gte=date_from)
+
+        date_to = self.request.query_params.get('date_to')
+        if date_to:
+            queryset = queryset.filter(received_at__date__lte=date_to)
+
+        return queryset.distinct()
+
+
+class SalesOrderShipmentViewSet(BaseCachePermissionViewset):
+    required_permission = UNIFIED_PERMISSION_DICT.get('sales_order')
+    queryset = SalesOrderShipment.objects.select_related(
+        'order',
+        'order__customer',
+    ).prefetch_related(
+        'lines',
+        'lines__sales_order_line',
+        'lines__sales_order_line__inventory_item',
+        'lines__stock_location',
+        'lines__stock_lot',
+        'lines__stock_serial',
+        'lines__reservation',
+    )
+    filterset_fields = ['order', 'order__customer', 'shipment_date', 'delivery_date']
+    search_fields = [
+        'reference',
+        'order__reference',
+        'order__customer__name',
+        'tracking_number',
+        'invoice_number',
+        'notes',
+        'lines__sales_order_line__inventory_item__name_snapshot',
+        'lines__stock_location__name',
+        'lines__stock_lot__lot_number',
+        'lines__stock_serial__serial_number',
+    ]
+    ordering_fields = ['shipment_date', 'delivery_date', 'created_at', 'reference']
+    ordering = ['-shipment_date', '-created_at']
+    http_method_names = ['get', 'head', 'options']
+
+    def get_serializer_class(self):
+        if self.action == 'list':
+            return SalesOrderShipmentListSerializer
+        return SalesOrderShipmentDetailSerializer
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        profile_id = get_request_profile_id(self.request, as_str=False)
+        if profile_id:
+            queryset = scope_queryset_by_identity(
+                queryset,
+                canonical_field='profile_id',
+                legacy_field='profile',
+                value=profile_id,
+            )
+
+        order_id = self.request.query_params.get('order')
+        if order_id:
+            queryset = queryset.filter(order_id=order_id)
+
+        customer_id = self.request.query_params.get('customer')
+        if customer_id:
+            queryset = queryset.filter(order__customer_id=customer_id)
+
+        stock_location_id = self.request.query_params.get('stock_location')
+        if stock_location_id:
+            queryset = queryset.filter(lines__stock_location_id=stock_location_id)
+
+        inventory_item_id = self.request.query_params.get('inventory_item')
+        if inventory_item_id:
+            queryset = queryset.filter(lines__sales_order_line__inventory_item_id=inventory_item_id)
+
+        date_from = self.request.query_params.get('date_from')
+        if date_from:
+            queryset = queryset.filter(shipment_date__gte=date_from)
+
+        date_to = self.request.query_params.get('date_to')
+        if date_to:
+            queryset = queryset.filter(shipment_date__lte=date_to)
+
+        return queryset.distinct()
 
 class PurchaseOrderViewSet(BaseCachePermissionViewset):
     """
@@ -1786,7 +1921,7 @@ class ReturnOrderViewSet(BaseCachePermissionViewset):
     def get_serializer_class(self):
         if self.action == 'list':
             return ReturnOrderListSerializer
-        if self.action == 'dispatch':
+        if self.action == 'dispatch_return_order':
             return ReturnOrderProcessSerializer
         return ReturnOrderDetailSerializer
 
@@ -1796,8 +1931,8 @@ class ReturnOrderViewSet(BaseCachePermissionViewset):
             status=status.HTTP_405_METHOD_NOT_ALLOWED
         )
 
-    @action(detail=True, methods=['post'])
-    def dispatch(self, request, pk=None):
+    @action(detail=True, methods=['post'], url_path='dispatch', url_name='dispatch')
+    def dispatch_return_order(self, request, pk=None):
         return_order = self.get_object()
         if return_order.status not in [
             ReturnOrderStatus.PENDING,

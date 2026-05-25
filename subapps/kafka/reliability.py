@@ -6,12 +6,17 @@ import uuid
 from datetime import timedelta
 from typing import Any, Iterable
 
-from django.db import DatabaseError, transaction
+from django.db import DatabaseError, close_old_connections, connections, transaction
 from django.utils import timezone
 
 from subapps.kafka.config import get_kafka_settings
 
 logger = logging.getLogger(__name__)
+
+
+def _reset_database_connections() -> None:
+    close_old_connections()
+    connections.close_all()
 
 
 def _load_models():
@@ -81,6 +86,7 @@ def enqueue_outbox_event(
 
 
 def publish_outbox_batch(*, batch_size: int | None = None) -> dict[str, int]:
+    close_old_connections()
     settings = get_kafka_settings()
     models = _load_models()
     KafkaOutboxEvent = models["KafkaOutboxEvent"]
@@ -104,6 +110,7 @@ def publish_outbox_batch(*, batch_size: int | None = None) -> dict[str, int]:
                 event.publish_attempts += 1
                 event.save(update_fields=["status", "publish_attempts", "updated_at"])
     except DatabaseError:
+        _reset_database_connections()
         logger.exception("Failed to load Kafka outbox batch.")
         return stats
 
@@ -148,6 +155,7 @@ def run_outbox_publisher(
     interval = poll_interval if poll_interval is not None else settings.outbox_poll_interval_seconds
 
     while True:
+        close_old_connections()
         publish_outbox_batch(batch_size=batch_size)
         if run_once:
             return
