@@ -980,7 +980,8 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
 
             # delivery time calculation
             if order.delivery_date and order.issue_date:
-                d["avg_delivery_time"].append(order.delivery_date - order.issue_date)
+                issue_date = order.issue_date.date() if hasattr(order.issue_date, "date") else order.issue_date
+                d["avg_delivery_time"].append(order.delivery_date - issue_date)
 
             # on-time deliveries
             if order.received_date and order.delivery_date and order.received_date <= order.delivery_date:
@@ -1058,7 +1059,10 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
 
         # Average delivery time (from issue to delivery)
         delivery_deltas = [
-            (o.received_date - o.issue_date)
+            (
+                o.received_date
+                - (o.issue_date.date() if hasattr(o.issue_date, "date") else o.issue_date)
+            )
             for o in completed_orders
             if o.received_date and o.issue_date
         ]

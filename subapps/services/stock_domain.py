@@ -7,7 +7,13 @@ from django.db import models, transaction
 from django.utils import timezone
 
 from mainapps.inventory.models import InventoryItem
-from mainapps.orders.models import GoodsReceipt, GoodsReceiptLine, PurchaseOrder, PurchaseOrderLineItem
+from mainapps.orders.models import (
+    GoodsReceipt,
+    GoodsReceiptLine,
+    PurchaseOrder,
+    PurchaseOrderLineItem,
+    _validate_inventory_dates,
+)
 from mainapps.stock.models import (
     StockBalance,
     StockLocation,
@@ -129,6 +135,13 @@ class StockDomainService:
         line_manufactured_date = manufactured_date or line_item.manufactured_date
         line_expiry_date = expiry_date or line_item.expiry_date
         received_serial_numbers = _normalize_serial_numbers(serial_numbers)
+        try:
+            _validate_inventory_dates(
+                manufactured_date=line_manufactured_date,
+                expiry_date=line_expiry_date,
+            )
+        except Exception as exc:
+            raise StockDomainError(str(exc)) from exc
 
         if inventory_item.track_serial:
             serial_count = _to_whole_number(quantity_received, label="Received quantity")
@@ -236,6 +249,7 @@ class StockDomainService:
             )
 
         cls._publish_inventory_availability_on_commit(inventory_item.id)
+        cls._publish_inventory_purchase_price_on_commit(goods_receipt_line.id)
         return {
             "goods_receipt_line": goods_receipt_line,
             "stock_lot": stock_lot,
@@ -982,6 +996,14 @@ class StockDomainService:
 
         transaction.on_commit(
             lambda record_id=reservation_id: publish_inventory_reservation_upserted(reservation_id=record_id)
+        )
+
+    @classmethod
+    def _publish_inventory_purchase_price_on_commit(cls, goods_receipt_line_id) -> None:
+        from subapps.kafka.producers.inventory import publish_inventory_purchase_price_recorded
+
+        transaction.on_commit(
+            lambda line_id=goods_receipt_line_id: publish_inventory_purchase_price_recorded(goods_receipt_line_id=line_id)
         )
 
     @classmethod

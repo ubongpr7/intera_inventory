@@ -81,6 +81,7 @@ INVENTORY_ITEM_PERMISSIONS = {
     'needs_reorder': CombinedPermissions.READ_INVENTORY_ITEM,
     'analytics': CombinedPermissions.VIEW_INVENTORY_ITEM_REPORTS,
     'adjust_stock': CombinedPermissions.ADJUST_INVENTORY_ITEM_QUANTITY,
+    'bulk_update_controls': CombinedPermissions.MANAGE_INVENTORY_ITEM_SETTINGS,
     'minimal_item': CombinedPermissions.READ_INVENTORY_ITEM,
     'stock_summary': CombinedPermissions.READ_INVENTORY_ITEM,
     'update_status': CombinedPermissions.UPDATE_INVENTORY_ITEM,

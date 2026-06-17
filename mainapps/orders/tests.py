@@ -1,4 +1,5 @@
 import uuid
+from datetime import date, timedelta
 from decimal import Decimal
 
 from django.core.exceptions import ValidationError
@@ -50,3 +51,41 @@ class OrderLineItemInventoryItemTests(SimpleTestCase):
         line_item.clean()
 
         self.assertEqual(line_item.inventory_item_id, self.inventory_item.id)
+
+    def test_purchase_line_rejects_quantity_below_inventory_reorder_quantity(self):
+        self.inventory_item.reorder_quantity = Decimal("5")
+        line_item = PurchaseOrderLineItem(
+            purchase_order=self.purchase_order,
+            inventory_item=self.inventory_item,
+            quantity=3,
+            unit_price=Decimal("9.00"),
+        )
+
+        with self.assertRaises(ValidationError):
+            line_item.clean()
+
+    def test_purchase_line_rejects_future_manufactured_date(self):
+        self.inventory_item.reorder_quantity = Decimal("0")
+        line_item = PurchaseOrderLineItem(
+            purchase_order=self.purchase_order,
+            inventory_item=self.inventory_item,
+            quantity=3,
+            unit_price=Decimal("9.00"),
+            manufactured_date=date.today() + timedelta(days=1),
+        )
+
+        with self.assertRaises(ValidationError):
+            line_item.clean()
+
+    def test_purchase_line_rejects_non_future_expiry_date(self):
+        self.inventory_item.reorder_quantity = Decimal("0")
+        line_item = PurchaseOrderLineItem(
+            purchase_order=self.purchase_order,
+            inventory_item=self.inventory_item,
+            quantity=3,
+            unit_price=Decimal("9.00"),
+            expiry_date=date.today(),
+        )
+
+        with self.assertRaises(ValidationError):
+            line_item.clean()

@@ -63,7 +63,6 @@ class InventoryMcpSerializationTests(SimpleTestCase):
     def test_inventory_item_payload_includes_summary_fields(self):
         inventory_item = InventoryItem(
             name_snapshot="Main Warehouse",
-            profile="1",
             profile_id=1,
             inventory_type="raw_material",
             track_stock=True,

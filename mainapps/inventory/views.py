@@ -1,6 +1,7 @@
 from decimal import Decimal
 
 from django_filters.rest_framework import DjangoFilterBackend
+from django.db import transaction
 from rest_framework import filters, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -8,7 +9,11 @@ from rest_framework.response import Response
 from mainapps.stock.models import StockLocation
 from subapps.permissions.constants import UNIFIED_PERMISSION_DICT
 from subapps.permissions.microservice_permissions import BaseCachePermissionViewset
-from subapps.services.inventory_read_model import get_inventory_item_summary_map
+from subapps.services.inventory_read_model import (
+    get_inventory_item_summary_map,
+    get_low_stock_rows,
+    get_profile_stock_analytics,
+)
 from subapps.services.stock_domain import StockDomainError, StockDomainService
 from subapps.utils.request_context import (
     get_request_profile_id,
@@ -21,8 +26,77 @@ from .serializers import (
     InventoryCategoryDetailSerializer,
     InventoryCategoryListSerializer,
     InventoryDetailSerializer,
+    InventorySetupSummarySerializer,
     InventoryListSerializer,
 )
+
+
+def get_inventory_setup_summary(*, profile_id):
+    category_queryset = scope_queryset_by_identity(
+        InventoryCategory.objects.all(),
+        canonical_field='profile_id',
+        legacy_field='profile',
+        value=profile_id,
+    )
+    location_queryset = scope_queryset_by_identity(
+        StockLocation.objects.all(),
+        canonical_field='profile_id',
+        legacy_field='profile',
+        value=profile_id,
+    )
+    inventory_queryset = scope_queryset_by_identity(
+        InventoryItem.objects.all(),
+        canonical_field='profile_id',
+        legacy_field='profile',
+        value=profile_id,
+    )
+    stock_analytics = get_profile_stock_analytics(profile_id=profile_id)
+
+    return {
+        'total_locations': location_queryset.count(),
+        'total_categories': category_queryset.count(),
+        'total_inventory_items': inventory_queryset.count(),
+        'total_stock_value': stock_analytics.get('total_stock_value', Decimal('0')),
+        'low_stock_count': len(get_low_stock_rows(inventory_queryset)),
+    }
+
+
+_CONTROL_FIELDS = (
+    'minimum_stock_level',
+    'safety_stock_level',
+    'reorder_point',
+    'reorder_quantity',
+    'track_lot',
+    'track_serial',
+    'track_expiry',
+    'allow_negative_stock',
+)
+
+
+def _all_replenishment_thresholds_zero(inventory_item):
+    return all(
+        Decimal(str(getattr(inventory_item, field, 0) or 0)) == Decimal('0')
+        for field in ('minimum_stock_level', 'safety_stock_level', 'reorder_point', 'reorder_quantity')
+    )
+
+
+def _bulk_control_result(*, inventory_item, updated_fields=None, skipped=False, skip_reason=None):
+    return {
+        'inventory_item_id': str(inventory_item.id),
+        'name': inventory_item.name_snapshot,
+        'inventory_type': inventory_item.inventory_type,
+        'updated_fields': updated_fields or [],
+        'skipped': skipped,
+        'skip_reason': skip_reason,
+        'minimum_stock_level': inventory_item.minimum_stock_level,
+        'safety_stock_level': inventory_item.safety_stock_level,
+        'reorder_point': inventory_item.reorder_point,
+        'reorder_quantity': inventory_item.reorder_quantity,
+        'track_lot': inventory_item.track_lot,
+        'track_serial': inventory_item.track_serial,
+        'track_expiry': inventory_item.track_expiry,
+        'allow_negative_stock': inventory_item.allow_negative_stock,
+    }
 
 
 class BaseInventoryViewSet(BaseCachePermissionViewset):
@@ -141,6 +215,111 @@ class InventoryItemViewSet(BaseInventoryViewSet):
     def needs_reorder(self, request):
         serializer = self.get_serializer(self.get_queryset(), many=True)
         return Response(serializer.data)
+
+    @action(detail=False, methods=['get'])
+    def summary(self, request):
+        profile_id = get_request_profile_id(request, required=True, as_str=False)
+        serializer = InventorySetupSummarySerializer(
+            get_inventory_setup_summary(profile_id=profile_id),
+            context=self.get_serializer_context(),
+        )
+        return Response(serializer.data)
+
+    @action(detail=False, methods=['post'])
+    def bulk_update_controls(self, request):
+        updates = request.data.get('updates')
+        if not isinstance(updates, list) or not updates:
+            return Response({'error': 'updates must be a non-empty list'}, status=status.HTTP_400_BAD_REQUEST)
+
+        base_queryset = self.get_queryset()
+        actor_user_id = get_request_user_id(request, as_str=False)
+        seen_item_ids = set()
+        updated_count = 0
+        skipped_count = 0
+        results = []
+
+        for index, raw_update in enumerate(updates):
+            if not isinstance(raw_update, dict):
+                return Response(
+                    {'error': f'updates[{index}] must be an object'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            controls = {
+                field: raw_update[field]
+                for field in _CONTROL_FIELDS
+                if field in raw_update and raw_update[field] is not None
+            }
+            if not controls:
+                return Response(
+                    {'error': f'updates[{index}] must include at least one control field'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if controls.get('allow_negative_stock') is True:
+                return Response(
+                    {'error': 'allow_negative_stock cannot be enabled through bulk_update_controls'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            queryset = base_queryset
+            raw_ids = raw_update.get('inventory_item_ids') or []
+            if raw_ids:
+                queryset = queryset.filter(id__in=raw_ids)
+            inventory_type = raw_update.get('inventory_type')
+            if inventory_type:
+                queryset = queryset.filter(inventory_type=inventory_type)
+            if not raw_ids and not inventory_type:
+                return Response(
+                    {'error': f'updates[{index}] must target inventory_item_ids or inventory_type'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            only_if_all_thresholds_zero = bool(raw_update.get('only_if_all_thresholds_zero'))
+            reason = str(raw_update.get('reason') or '').strip()
+
+            with transaction.atomic():
+                for inventory_item in queryset.order_by('name_snapshot', 'id'):
+                    if inventory_item.id in seen_item_ids:
+                        continue
+                    seen_item_ids.add(inventory_item.id)
+
+                    if only_if_all_thresholds_zero and not _all_replenishment_thresholds_zero(inventory_item):
+                        skipped_count += 1
+                        results.append(
+                            _bulk_control_result(
+                                inventory_item=inventory_item,
+                                skipped=True,
+                                skip_reason='Replenishment thresholds are already set.',
+                            )
+                        )
+                        continue
+
+                    for field, value in controls.items():
+                        setattr(inventory_item, field, value)
+                    metadata = dict(inventory_item.metadata or {})
+                    metadata['bulk_inventory_control_update'] = {
+                        'reason': reason or None,
+                        'source': 'inventory.items.bulk_update_controls',
+                    }
+                    inventory_item.metadata = metadata
+                    inventory_item.updated_by_user_id = actor_user_id
+                    save_fields = list(controls.keys()) + ['metadata', 'updated_by_user_id', 'updated_at']
+                    inventory_item.save(update_fields=save_fields)
+                    updated_count += 1
+                    results.append(
+                        _bulk_control_result(
+                            inventory_item=inventory_item,
+                            updated_fields=list(controls.keys()),
+                        )
+                    )
+
+        return Response(
+            {
+                'updated_count': updated_count,
+                'skipped_count': skipped_count,
+                'results': results,
+            }
+        )
 
     @action(detail=True, methods=['get'])
     def stock_summary(self, request, pk=None):

@@ -38,6 +38,13 @@ class ProductImageMixin:
         return str(product_variant_id) if product_variant_id else ''
 
     def get_display_image(self, obj):
+        stored_image = None
+        if isinstance(obj, dict):
+            stored_image = obj.get('product_variant_image_url') or obj.get('display_image')
+        else:
+            stored_image = getattr(obj, 'product_variant_image_url', '') or ''
+        if stored_image:
+            return stored_image
         request = self.context.get('request')
         variant_lookup = self._resolve_variant_lookup_value(obj)
         if not request or not variant_lookup:
@@ -244,7 +251,8 @@ class InventoryItemListSerializer(ProductImageMixin, InventoryItemSummaryMixin, 
             'id', 'name', 'sku', 'serial', 'quantity', 'status',
             'inventory_name', 'location_name', 'expiry_date', 'days_to_expiry',
             'purchase_price', 'created_at','quantity_w_unit','product_variant',
-            'display_image'
+            'display_image', 'product_variant_id', 'product_variant_image_url',
+            'minimum_stock_level', 'reorder_point', 'reorder_quantity',
         ]
 
     def get_sku(self, obj):
@@ -325,6 +333,7 @@ class InventoryItemDetailSerializer(ProductImageMixin, InventoryItemSummaryMixin
             'product_variant',
             'product_template_id',
             'product_variant_id',
+            'product_variant_image_url',
             'inventory_type',
             'inventory_category',
             'default_supplier',

@@ -16,6 +16,7 @@ os.environ.setdefault("DJANGO_SETTINGS_MODULE", "core.settings")
 
 import django
 from django.apps import apps
+from django.db import close_old_connections
 from asgiref.sync import sync_to_async
 
 if not apps.ready:
@@ -33,12 +34,20 @@ from starlette.responses import JSONResponse
 from starlette.routing import Mount, Route
 import uvicorn
 
-from mainapps.inventory.models import InventoryItem
+from mainapps.inventory.models import InventoryCategory, InventoryItem
 from mainapps.inventory.views import (
     InventoryCategoryViewSet,
     InventoryItemViewSet as InventoryCatalogItemViewSet,
 )
-from mainapps.stock.models import StockBalance, StockLocation, StockLot, StockMovement, StockReservation, StockSerial
+from mainapps.stock.models import (
+    StockBalance,
+    StockLocation,
+    StockLocationType,
+    StockLot,
+    StockMovement,
+    StockReservation,
+    StockSerial,
+)
 from mainapps.stock.views import (
     InventoryItemViewSet as InventoryOperationsItemViewSet,
     StockLocationViewSet,
@@ -108,6 +117,17 @@ def _payload_to_data(value: BaseModel | dict[str, Any] | None) -> dict[str, Any]
     if isinstance(value, BaseModel):
         return value.model_dump(mode="json", exclude_none=True)
     return value
+
+
+def _prepare_inventory_item_payload_data(data: dict[str, Any] | None) -> dict[str, Any]:
+    prepared = dict(data or {})
+    # MCP contracts use explicit *_id names, while DRF ModelSerializer expects
+    # the FK field names for writes. Normalize here so tool calls persist.
+    if "inventory_category_id" in prepared and "inventory_category" not in prepared:
+        prepared["inventory_category"] = prepared.pop("inventory_category_id")
+    if "default_supplier_id" in prepared and "default_supplier" not in prepared:
+        prepared["default_supplier"] = prepared.pop("default_supplier_id")
+    return prepared
 
 
 @dataclass(slots=True)
@@ -238,6 +258,7 @@ def _inventory_item_payload(inventory_item: InventoryItem, *, summary: dict[str,
         "product_variant": resolved_summary.get("product_variant")
         or inventory_item.barcode_snapshot
         or (str(inventory_item.product_variant_id) if inventory_item.product_variant_id else ""),
+        "product_variant_image_url": inventory_item.product_variant_image_url or "",
     }
 
 
@@ -458,18 +479,23 @@ def _list_inventory_items_sync(
     *,
     principal: InventoryMcpPrincipal,
 ) -> dict[str, Any]:
-    queryset = _inventory_item_queryset(principal=principal)
-    items = list(queryset)
-    summary_map = get_inventory_item_summary_map(items) 
-    return {
-        "profile_id": principal.profile_id,
-        "company_code": principal.company_code,
-        "count": len(items),
-        "results": [
-            _inventory_item_payload(item, summary=summary_map.get(item.id, {}))
-            for item in items
-        ],
-    }
+    close_old_connections()
+    try:
+        queryset = _inventory_item_queryset(principal=principal)
+        items = list(queryset)
+        return {
+            "profile_id": principal.profile_id,
+            "company_code": principal.company_code,
+            "count": len(items),
+            "results": [
+                _inventory_item_payload(item)
+                for item in items
+            ],
+        }
+    finally:
+        close_old_connections()
+
+
 def _search_inventory_items_sync(
     *,
     principal: InventoryMcpPrincipal,
@@ -479,35 +505,43 @@ def _search_inventory_items_sync(
     status: str | None,
     inventory_item_id: str | None,
 ) -> dict[str, Any]:
-    queryset = _inventory_item_queryset(principal=principal)
-    if inventory_type:
-        queryset = queryset.filter(inventory_type=inventory_type)
-    if status:
-        queryset = queryset.filter(status=status)
-    if inventory_item_id:
-        queryset = queryset.filter(id=inventory_item_id)
+    close_old_connections()
+    try:
+        queryset = _inventory_item_queryset(principal=principal)
+        if inventory_type:
+            queryset = queryset.filter(inventory_type=inventory_type)
+        if status:
+            queryset = queryset.filter(status=status)
+        if inventory_item_id:
+            queryset = queryset.filter(id=inventory_item_id)
 
-    search_term = str(query or "").strip()
-    if search_term:
-        queryset = queryset.filter(
-            Q(name_snapshot__icontains=search_term)
-            | Q(sku_snapshot__icontains=search_term)
-            | Q(barcode_snapshot__icontains=search_term)
-            | Q(description__icontains=search_term)
+        search_term = str(query or "").strip()
+        if search_term:
+            queryset = queryset.filter(
+                Q(name_snapshot__icontains=search_term)
+                | Q(sku_snapshot__icontains=search_term)
+                | Q(barcode_snapshot__icontains=search_term)
+                | Q(description__icontains=search_term)
+            )
+
+        items = list(queryset[:limit])
+        summary_map = (
+            get_inventory_item_summary_map(items)
+            if items and (search_term or inventory_item_id)
+            else {}
         )
-
-    items = list(queryset[:limit])
-    summary_map = get_inventory_item_summary_map(items)
-    return {
-        "query": search_term or None,
-        "count": len(items),
-        "limit": limit,
-        "profile_id": principal.profile_id,
-        "results": [
-            _inventory_item_payload(item, summary=summary_map.get(item.id, {}))
-            for item in items
-        ],
-    }
+        return {
+            "query": search_term or None,
+            "count": len(items),
+            "limit": limit,
+            "profile_id": principal.profile_id,
+            "results": [
+                _inventory_item_payload(item, summary=summary_map.get(item.id, {}))
+                for item in items
+            ],
+        }
+    finally:
+        close_old_connections()
 
 
 def _get_inventory_item_details_sync(
@@ -516,36 +550,708 @@ def _get_inventory_item_details_sync(
     inventory_item_id: str,
     history_limit: int,
 ) -> dict[str, Any]:
-    inventory_item = _inventory_item_queryset(principal=principal).filter(id=inventory_item_id).first()
-    if inventory_item is None:
-        raise ValueError("Inventory item not found.")
-    summary = get_inventory_item_summary_map([inventory_item]).get(inventory_item.id, {})
-    balances = list(
-        _stock_balance_queryset(principal=principal).filter(
-            inventory_item_id=inventory_item.id,
-        )[:history_limit]
-    )
-    lots = list(
-        _stock_lot_queryset(principal=principal).filter(inventory_item_id=inventory_item.id)[:history_limit]
-    )
-    serials = list(
-        _stock_serial_queryset(principal=principal).filter(inventory_item_id=inventory_item.id)[:history_limit]
-    )
-    reservations = list(
-        _stock_reservation_queryset(principal=principal).filter(inventory_item_id=inventory_item.id)[:history_limit]
-    )
-    movements = list(
-        _stock_movement_queryset(principal=principal).filter(inventory_item_id=inventory_item.id)[:history_limit]
+    close_old_connections()
+    try:
+        inventory_item = _inventory_item_queryset(principal=principal).filter(id=inventory_item_id).first()
+        if inventory_item is None:
+            raise ValueError("Inventory item not found.")
+        summary = get_inventory_item_summary_map([inventory_item]).get(inventory_item.id, {})
+        balances = list(
+            _stock_balance_queryset(principal=principal).filter(
+                inventory_item_id=inventory_item.id,
+            )[:history_limit]
+        )
+        lots = list(
+            _stock_lot_queryset(principal=principal).filter(inventory_item_id=inventory_item.id)[:history_limit]
+        )
+        serials = list(
+            _stock_serial_queryset(principal=principal).filter(inventory_item_id=inventory_item.id)[:history_limit]
+        )
+        reservations = list(
+            _stock_reservation_queryset(principal=principal).filter(inventory_item_id=inventory_item.id)[:history_limit]
+        )
+        movements = list(
+            _stock_movement_queryset(principal=principal).filter(inventory_item_id=inventory_item.id)[:history_limit]
+        )
+        return {
+            "profile_id": principal.profile_id,
+            "inventory_item": _inventory_item_payload(inventory_item, summary=summary),
+            "balances": [_balance_payload(balance) for balance in balances],
+            "lots": [_lot_payload(lot) for lot in lots],
+            "serials": [_serial_payload(serial) for serial in serials],
+            "active_reservations": [_reservation_payload(reservation) for reservation in reservations],
+            "recent_movements": [_movement_payload(movement) for movement in movements],
+        }
+    finally:
+        close_old_connections()
+
+
+_INVENTORY_CATEGORY_RULES: tuple[dict[str, Any], ...] = (
+    {
+        "name": "Aftershave",
+        "description": "After-shave lotions, shaving fragrance, and related post-shave care products.",
+        "keywords": (
+            "after shave",
+            "after-shave",
+            "aftershave",
+            "shaving lotion",
+            "post shave",
+            "post-shave",
+        ),
+    },
+    {
+        "name": "Perfume & Fragrances",
+        "description": "Perfumes, colognes, eau de parfum, eau de toilette, and fragrance products.",
+        "keywords": (
+            "perfume",
+            "parfum",
+            "eau de parfum",
+            "eau de toilette",
+            "fragrance",
+            "cologne",
+            "scent",
+            "de toilette",
+        ),
+    },
+    {
+        "name": "Skincare & Personal Care",
+        "description": "Skincare, body care, grooming, and personal care consumables.",
+        "keywords": (
+            "skin care",
+            "skincare",
+            "body cream",
+            "body lotion",
+            "lotion",
+            "cream",
+            "serum",
+            "cleanser",
+            "soap",
+            "shampoo",
+            "conditioner",
+            "deodorant",
+            "cosmetic",
+            "makeup",
+        ),
+    },
+    {
+        "name": "Audio Equipment",
+        "description": "Headphones, speakers, earbuds, audio accessories, and sound equipment.",
+        "keywords": (
+            "headphone",
+            "headphones",
+            "earbud",
+            "earbuds",
+            "speaker",
+            "bluetooth speaker",
+            "audio",
+            "soundbar",
+            "microphone",
+        ),
+    },
+    {
+        "name": "Electronics",
+        "description": "Phones, computers, cameras, appliances, networking devices, and electronic accessories.",
+        "keywords": (
+            "phone",
+            "iphone",
+            "samsung",
+            "laptop",
+            "computer",
+            "tablet",
+            "television",
+            "tv",
+            "router",
+            "printer",
+            "camera",
+            "charger",
+            "cable",
+            "keyboard",
+            "mouse",
+            "console",
+            "playstation",
+            "electronics",
+            "electronic",
+        ),
+    },
+    {
+        "name": "Watches & Wearables",
+        "description": "Watches, smartwatches, fitness bands, and wearable accessories.",
+        "keywords": (
+            "watch",
+            "smartwatch",
+            "sport band",
+            "fitness band",
+            "wearable",
+            "wristband",
+        ),
+    },
+    {
+        "name": "Eyewear",
+        "description": "Sunglasses, glasses, lenses, and eyewear accessories.",
+        "keywords": (
+            "sunglass",
+            "sunglasses",
+            "eyeglass",
+            "eyeglasses",
+            "glasses",
+            "spectacles",
+            "lens",
+            "lenses",
+            "eyewear",
+        ),
+    },
+    {
+        "name": "Bags & Accessories",
+        "description": "Bags, wallets, cases, straps, and fashion accessories.",
+        "keywords": (
+            "bag",
+            "handbag",
+            "backpack",
+            "wallet",
+            "purse",
+            "case",
+            "strap",
+            "accessory",
+            "accessories",
+        ),
+    },
+    {
+        "name": "Footwear",
+        "description": "Shoes, sandals, sneakers, boots, and other footwear.",
+        "keywords": (
+            "shoe",
+            "shoes",
+            "sneaker",
+            "sneakers",
+            "sandal",
+            "sandals",
+            "boot",
+            "boots",
+            "footwear",
+        ),
+    },
+    {
+        "name": "Apparel",
+        "description": "Clothing, shirts, dresses, trousers, sleeves, and other apparel.",
+        "keywords": (
+            "shirt",
+            "t-shirt",
+            "dress",
+            "trouser",
+            "pants",
+            "jacket",
+            "sleeve",
+            "clothing",
+            "apparel",
+            "wear",
+        ),
+    },
+    {
+        "name": "Packaging Materials",
+        "description": "Boxes, bottles, labels, wrappers, and inventory packaging materials.",
+        "keywords": (
+            "packaging",
+            "package",
+            "box",
+            "carton",
+            "label",
+            "wrapper",
+            "bottle",
+            "container",
+            "glass",
+            "veneer box",
+        ),
+    },
+)
+
+
+def _inventory_category_match_for_item(item: InventoryItem) -> dict[str, Any] | None:
+    haystack = " ".join(
+        value
+        for value in (
+            item.name_snapshot,
+            item.sku_snapshot,
+            item.barcode_snapshot,
+            item.description,
+            item.inventory_type,
+        )
+        if value
+    ).lower()
+    if not haystack:
+        return None
+    for rule in _INVENTORY_CATEGORY_RULES:
+        for keyword in rule["keywords"]:
+            if keyword in haystack:
+                return {
+                    "name": rule["name"],
+                    "description": rule["description"],
+                    "matched_keyword": keyword,
+                }
+    return None
+
+
+def _category_payload_for_auto_categorize(category: InventoryCategory) -> dict[str, Any]:
+    return {
+        "id": str(category.id),
+        "name": category.name,
+        "description": category.description or "",
+        "structural": category.structural,
+        "is_active": category.is_active,
+    }
+
+
+def _auto_categorize_inventory_items_sync(
+    *,
+    principal: InventoryMcpPrincipal,
+    only_uncategorized: bool,
+    create_missing_categories: bool,
+    apply_changes: bool,
+    limit: int,
+) -> dict[str, Any]:
+    close_old_connections()
+    try:
+        item_queryset = _inventory_item_queryset(principal=principal).select_related("inventory_category")
+        if only_uncategorized:
+            item_queryset = item_queryset.filter(inventory_category__isnull=True)
+        items = list(item_queryset[: max(1, min(int(limit), 200))])
+
+        category_queryset = scope_queryset_by_identity(
+            InventoryCategory.objects.all(),
+            canonical_field="profile_id",
+            legacy_field="profile",
+            value=principal.profile_id,
+        ).filter(is_active=True)
+        categories_by_name = {
+            category.name.strip().casefold(): category
+            for category in category_queryset
+        }
+
+        created_categories: list[dict[str, Any]] = []
+        assigned_items: list[dict[str, Any]] = []
+        planned_assignments: list[dict[str, Any]] = []
+        skipped_items: list[dict[str, Any]] = []
+
+        for item in items:
+            match = _inventory_category_match_for_item(item)
+            if match is None:
+                skipped_items.append(
+                    {
+                        "id": str(item.id),
+                        "name": item.name_snapshot,
+                        "reason": "No confident category match from item name or description.",
+                    }
+                )
+                continue
+
+            category_key = str(match["name"]).casefold()
+            category = categories_by_name.get(category_key)
+            if category is None:
+                if not create_missing_categories or not apply_changes:
+                    planned_assignments.append(
+                        {
+                            "inventory_item_id": str(item.id),
+                            "inventory_item_name": item.name_snapshot,
+                            "category_name": match["name"],
+                            "matched_keyword": match["matched_keyword"],
+                            "would_create_category": True,
+                        }
+                    )
+                    continue
+                category = InventoryCategory.objects.create(
+                    profile_id=principal.profile_id,
+                    name=match["name"],
+                    description=match["description"],
+                    structural=False,
+                    is_active=True,
+                )
+                categories_by_name[category_key] = category
+                created_categories.append(_category_payload_for_auto_categorize(category))
+
+            if not apply_changes:
+                planned_assignments.append(
+                    {
+                        "inventory_item_id": str(item.id),
+                        "inventory_item_name": item.name_snapshot,
+                        "category_id": str(category.id),
+                        "category_name": category.name,
+                        "matched_keyword": match["matched_keyword"],
+                    }
+                )
+                continue
+
+            item.inventory_category = category
+            metadata = dict(item.metadata or {})
+            metadata["auto_categorized"] = {
+                "source": "inventory_mcp.auto_categorize_inventory_items",
+                "category_name": category.name,
+                "matched_keyword": match["matched_keyword"],
+                "applied_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            }
+            item.metadata = metadata
+            item.save(update_fields=["inventory_category", "metadata", "updated_at"])
+            assigned_items.append(
+                {
+                    "inventory_item": _inventory_item_payload(item),
+                    "category": _category_payload_for_auto_categorize(category),
+                    "matched_keyword": match["matched_keyword"],
+                }
+            )
+
+        return {
+            "profile_id": principal.profile_id,
+            "company_code": principal.company_code,
+            "apply_changes": apply_changes,
+            "only_uncategorized": only_uncategorized,
+            "processed_count": len(items),
+            "created_categories": created_categories,
+            "assigned_items": assigned_items,
+            "planned_assignments": planned_assignments,
+            "skipped_items": skipped_items,
+            "summary": {
+                "created_category_count": len(created_categories),
+                "assigned_item_count": len(assigned_items),
+                "planned_assignment_count": len(planned_assignments),
+                "skipped_item_count": len(skipped_items),
+            },
+        }
+    finally:
+        close_old_connections()
+
+
+def _assign_inventory_item_category_sync(
+    *,
+    principal: InventoryMcpPrincipal,
+    inventory_item_id: str,
+    category_id: str,
+) -> dict[str, Any]:
+    close_old_connections()
+    try:
+        item = _inventory_item_queryset(principal=principal).filter(id=inventory_item_id).first()
+        if item is None:
+            raise ValueError("Inventory item not found for this workspace.")
+
+        category = scope_queryset_by_identity(
+            InventoryCategory.objects.filter(id=category_id),
+            canonical_field="profile_id",
+            legacy_field="profile",
+            value=principal.profile_id,
+        ).first()
+        if category is None:
+            raise ValueError("Inventory category not found for this workspace.")
+        if category.structural:
+            raise ValueError("Cannot assign an inventory item to a structural category.")
+        if not category.is_active:
+            raise ValueError("Cannot assign an inventory item to an inactive category.")
+
+        item.inventory_category = category
+        metadata = dict(item.metadata or {})
+        metadata["category_assignment"] = {
+            "source": "inventory_mcp.assign_inventory_item_category",
+            "category_id": str(category.id),
+            "category_name": category.name,
+            "applied_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        }
+        item.metadata = metadata
+        item.save(update_fields=["inventory_category", "metadata", "updated_at"])
+        item.refresh_from_db(fields=["inventory_category", "metadata", "updated_at"])
+
+        verified = str(item.inventory_category_id or "") == str(category.id)
+        return {
+            "profile_id": principal.profile_id,
+            "assigned": verified,
+            "inventory_item": _inventory_item_payload(item),
+            "category": _category_payload_for_auto_categorize(category),
+        }
+    finally:
+        close_old_connections()
+
+
+_INVENTORY_CONTROL_PROFILES: tuple[dict[str, Any], ...] = (
+    {
+        "profile": "serialized_electronics",
+        "keywords": (
+            "phone",
+            "iphone",
+            "galaxy",
+            "laptop",
+            "computer",
+            "tablet",
+            "camera",
+            "console",
+            "printer",
+            "router",
+            "watch",
+            "headphone",
+            "earbud",
+            "speaker",
+        ),
+        "controls": {
+            "minimum_stock_level": Decimal("2"),
+            "safety_stock_level": Decimal("3"),
+            "reorder_point": Decimal("5"),
+            "reorder_quantity": Decimal("10"),
+            "track_lot": False,
+            "track_serial": True,
+            "track_expiry": False,
+            "allow_negative_stock": False,
+        },
+        "reason": "High-value durable electronics should usually be serial-tracked, protected from negative stock, and replenished before stockout.",
+    },
+    {
+        "profile": "fragrance_and_cosmetics",
+        "keywords": (
+            "perfume",
+            "parfum",
+            "fragrance",
+            "cologne",
+            "aftershave",
+            "after-shave",
+            "eau de parfum",
+            "eau de toilette",
+            "lotion",
+            "cream",
+            "serum",
+            "cosmetic",
+        ),
+        "controls": {
+            "minimum_stock_level": Decimal("3"),
+            "safety_stock_level": Decimal("5"),
+            "reorder_point": Decimal("8"),
+            "reorder_quantity": Decimal("20"),
+            "track_lot": True,
+            "track_serial": False,
+            "track_expiry": True,
+            "allow_negative_stock": False,
+        },
+        "reason": "Fragrance and cosmetics should usually be lot/expiry tracked and replenished in modest batches.",
+    },
+    {
+        "profile": "apparel_footwear_accessories",
+        "keywords": (
+            "shoe",
+            "sneaker",
+            "sandal",
+            "boot",
+            "shirt",
+            "dress",
+            "trouser",
+            "bag",
+            "wallet",
+            "belt",
+            "sunglass",
+            "eyewear",
+            "accessory",
+        ),
+        "controls": {
+            "minimum_stock_level": Decimal("4"),
+            "safety_stock_level": Decimal("6"),
+            "reorder_point": Decimal("10"),
+            "reorder_quantity": Decimal("24"),
+            "track_lot": False,
+            "track_serial": False,
+            "track_expiry": False,
+            "allow_negative_stock": False,
+        },
+        "reason": "Apparel, footwear, and accessories are usually size/style stock, not serial or expiry stock; moderate replenishment buffers are safer.",
+    },
+    {
+        "profile": "food_pharma_perishable",
+        "keywords": (
+            "food",
+            "drink",
+            "beverage",
+            "medicine",
+            "drug",
+            "pharma",
+            "supplement",
+            "vitamin",
+            "perishable",
+            "expiry",
+        ),
+        "controls": {
+            "minimum_stock_level": Decimal("5"),
+            "safety_stock_level": Decimal("10"),
+            "reorder_point": Decimal("15"),
+            "reorder_quantity": Decimal("30"),
+            "track_lot": True,
+            "track_serial": False,
+            "track_expiry": True,
+            "allow_negative_stock": False,
+        },
+        "reason": "Perishable and regulated goods should be lot/expiry tracked with stronger buffers.",
+    },
+    {
+        "profile": "packaging_consumables",
+        "keywords": (
+            "packaging",
+            "package",
+            "box",
+            "carton",
+            "label",
+            "wrapper",
+            "bottle",
+            "container",
+            "consumable",
+        ),
+        "controls": {
+            "minimum_stock_level": Decimal("20"),
+            "safety_stock_level": Decimal("50"),
+            "reorder_point": Decimal("100"),
+            "reorder_quantity": Decimal("250"),
+            "track_lot": False,
+            "track_serial": False,
+            "track_expiry": False,
+            "allow_negative_stock": False,
+        },
+        "reason": "Consumables and packaging usually need volume-based reorder buffers, not serial or expiry tracking.",
+    },
+)
+
+
+def _decimal_control_to_float(value: Any) -> float:
+    try:
+        return float(Decimal(str(value)))
+    except Exception:
+        return 0.0
+
+
+def _inventory_control_profile_for_text(text: str) -> dict[str, Any]:
+    normalized = (text or "").lower()
+    for profile in _INVENTORY_CONTROL_PROFILES:
+        if any(keyword in normalized for keyword in profile["keywords"]):
+            return profile
+    return {
+        "profile": "general_stock",
+        "controls": {
+            "minimum_stock_level": Decimal("2"),
+            "safety_stock_level": Decimal("3"),
+            "reorder_point": Decimal("5"),
+            "reorder_quantity": Decimal("10"),
+            "track_lot": False,
+            "track_serial": False,
+            "track_expiry": False,
+            "allow_negative_stock": False,
+        },
+        "reason": "General stock should still have non-zero reorder controls unless the user explicitly disables replenishment.",
+    }
+
+
+def _inventory_control_recommendation_payload(
+    *,
+    item_name: str,
+    category_name: str = "",
+    description: str = "",
+    current_controls: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    text = " ".join(value for value in (item_name, category_name, description) if value)
+    profile = _inventory_control_profile_for_text(text)
+    controls = dict(profile["controls"])
+    existing = current_controls or {}
+    zero_or_blank_thresholds = all(
+        _decimal_control_to_float(existing.get(field, 0)) == 0
+        for field in ("minimum_stock_level", "safety_stock_level", "reorder_point", "reorder_quantity")
     )
     return {
-        "profile_id": principal.profile_id,
-        "inventory_item": _inventory_item_payload(inventory_item, summary=summary),
-        "balances": [_balance_payload(balance) for balance in balances],
-        "lots": [_lot_payload(lot) for lot in lots],
-        "serials": [_serial_payload(serial) for serial in serials],
-        "active_reservations": [_reservation_payload(reservation) for reservation in reservations],
-        "recent_movements": [_movement_payload(movement) for movement in movements],
+        "profile": profile["profile"],
+        "item_name": item_name,
+        "category_name": category_name,
+        "recommended_controls": {
+            key: _decimal_to_float(value) if isinstance(value, Decimal) else value
+            for key, value in controls.items()
+        },
+        "reason": profile["reason"],
+        "should_apply": zero_or_blank_thresholds,
+        "notes": (
+            "Current replenishment thresholds are all zero, so these recommendations should be applied before creating or updating the item."
+            if zero_or_blank_thresholds
+            else "Existing replenishment thresholds are already set; do not overwrite them unless the user asks for a recalibration."
+        ),
     }
+
+
+def _recommend_inventory_item_controls_sync(
+    *,
+    principal: InventoryMcpPrincipal,
+    inventory_item_id: str | None,
+    item_name: str,
+    category_name: str,
+    description: str,
+    apply_changes: bool,
+) -> dict[str, Any]:
+    close_old_connections()
+    try:
+        item: InventoryItem | None = None
+        current_controls: dict[str, Any] = {}
+        if inventory_item_id:
+            item = _inventory_item_queryset(principal=principal).filter(id=inventory_item_id).first()
+            if item is None:
+                raise ValueError("inventory_item_id was not found for this workspace")
+            item_name = item.name_snapshot
+            category_name = item.inventory_category.name if item.inventory_category_id else category_name
+            description = item.description or description
+            current_controls = {
+                "minimum_stock_level": item.minimum_stock_level,
+                "safety_stock_level": item.safety_stock_level,
+                "reorder_point": item.reorder_point,
+                "reorder_quantity": item.reorder_quantity,
+                "track_lot": item.track_lot,
+                "track_serial": item.track_serial,
+                "track_expiry": item.track_expiry,
+                "allow_negative_stock": item.allow_negative_stock,
+            }
+
+        recommendation = _inventory_control_recommendation_payload(
+            item_name=item_name,
+            category_name=category_name,
+            description=description,
+            current_controls=current_controls,
+        )
+
+        applied = False
+        if apply_changes and item is not None and recommendation["should_apply"]:
+            controls = recommendation["recommended_controls"]
+            for field in (
+                "minimum_stock_level",
+                "safety_stock_level",
+                "reorder_point",
+                "reorder_quantity",
+                "track_lot",
+                "track_serial",
+                "track_expiry",
+                "allow_negative_stock",
+            ):
+                setattr(item, field, controls[field])
+            metadata = dict(item.metadata or {})
+            metadata["inventory_control_recommendation"] = {
+                "source": "inventory_mcp.recommend_inventory_item_controls",
+                "profile": recommendation["profile"],
+                "applied_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            }
+            item.metadata = metadata
+            item.save(
+                update_fields=[
+                    "minimum_stock_level",
+                    "safety_stock_level",
+                    "reorder_point",
+                    "reorder_quantity",
+                    "track_lot",
+                    "track_serial",
+                    "track_expiry",
+                    "allow_negative_stock",
+                    "metadata",
+                    "updated_at",
+                ]
+            )
+            applied = True
+
+        return {
+            "apply_changes": apply_changes,
+            "applied": applied,
+            "inventory_item": _inventory_item_payload(item) if item else None,
+            **recommendation,
+        }
+    finally:
+        close_old_connections()
 
 
 def _get_inventory_alerts_sync(
@@ -554,37 +1260,41 @@ def _get_inventory_alerts_sync(
     limit: int,
     expiring_days: int,
 ) -> dict[str, Any]:
-    inventories = list(
-        _inventory_queryset(principal=principal).exclude(status__in=["archived", "discontinued"])
-    )
-    summary_map = get_inventory_item_summary_map(inventories, expiring_days=expiring_days)
-    low_stock = []
-    needs_reorder = []
-    out_of_stock = []
-    expiring = []
+    close_old_connections()
+    try:
+        inventories = list(
+            _inventory_queryset(principal=principal).exclude(status__in=["archived", "discontinued"])
+        )
+        summary_map = get_inventory_item_summary_map(inventories, expiring_days=expiring_days)
+        low_stock = []
+        needs_reorder = []
+        out_of_stock = []
+        expiring = []
 
-    for inventory in inventories:
-        summary = summary_map.get(inventory.id, {})
-        current_stock = Decimal(summary.get("quantity", Decimal("0")))
-        payload = _inventory_item_payload(inventory, summary=summary)
-        if current_stock <= 0:
-            out_of_stock.append(payload)
-        elif current_stock <= Decimal(inventory.minimum_stock_level):
-            low_stock.append(payload)
-        elif current_stock <= Decimal(inventory.reorder_point):
-            needs_reorder.append(payload)
-        days_to_expiry = summary.get("days_to_expiry")
-        if days_to_expiry is not None and 0 <= int(days_to_expiry) <= expiring_days:
-            expiring.append(payload)
+        for inventory in inventories:
+            summary = summary_map.get(inventory.id, {})
+            current_stock = Decimal(summary.get("quantity", Decimal("0")))
+            payload = _inventory_item_payload(inventory, summary=summary)
+            if current_stock <= 0:
+                out_of_stock.append(payload)
+            elif current_stock <= Decimal(inventory.minimum_stock_level):
+                low_stock.append(payload)
+            elif current_stock <= Decimal(inventory.reorder_point):
+                needs_reorder.append(payload)
+            days_to_expiry = summary.get("days_to_expiry")
+            if days_to_expiry is not None and 0 <= int(days_to_expiry) <= expiring_days:
+                expiring.append(payload)
 
-    return {
-        "profile_id": principal.profile_id,
-        "expiring_days": expiring_days,
-        "low_stock": low_stock[:limit],
-        "needs_reorder": needs_reorder[:limit],
-        "out_of_stock": out_of_stock[:limit],
-        "expiring_soon": expiring[:limit],
-    }
+        return {
+            "profile_id": principal.profile_id,
+            "expiring_days": expiring_days,
+            "low_stock": low_stock[:limit],
+            "needs_reorder": needs_reorder[:limit],
+            "out_of_stock": out_of_stock[:limit],
+            "expiring_soon": expiring[:limit],
+        }
+    finally:
+        close_old_connections()
 
 
 def _search_stock_locations_sync(
@@ -595,37 +1305,44 @@ def _search_stock_locations_sync(
     structural_only: bool | None,
     external_only: bool | None,
 ) -> dict[str, Any]:
-    queryset = _stock_location_queryset(principal=principal)
-    if structural_only is True:
-        queryset = queryset.filter(structural=True)
-    elif structural_only is False:
-        queryset = queryset.filter(structural=False)
-    if external_only is True:
-        queryset = queryset.filter(external=True)
-    elif external_only is False:
-        queryset = queryset.filter(external=False)
+    close_old_connections()
+    try:
+        queryset = _stock_location_queryset(principal=principal)
+        if structural_only is True:
+            queryset = queryset.filter(structural=True)
+        elif structural_only is False:
+            queryset = queryset.filter(structural=False)
+        if external_only is True:
+            queryset = queryset.filter(external=True)
+        elif external_only is False:
+            queryset = queryset.filter(external=False)
 
-    search_term = str(query or "").strip()
-    if search_term:
-        queryset = queryset.filter(
-            Q(name__icontains=search_term)
-            | Q(code__icontains=search_term)
-            | Q(description__icontains=search_term)
-            | Q(physical_address__icontains=search_term)
-            | Q(location_type__name__icontains=search_term)
-        )
+        search_term = str(query or "").strip()
+        if search_term:
+            queryset = queryset.filter(
+                Q(name__icontains=search_term)
+                | Q(code__icontains=search_term)
+                | Q(description__icontains=search_term)
+                | Q(physical_address__icontains=search_term)
+                | Q(location_type__name__icontains=search_term)
+            )
 
-    locations = list(queryset[:limit])
-    return {
-        "query": search_term or None,
-        "count": len(locations),
-        "limit": limit,
-        "profile_id": principal.profile_id,
-        "results": [
-            _location_payload(location, summary=get_location_stock_summary(location))
-            for location in locations
-        ],
-    }
+        locations = list(queryset[:limit])
+        return {
+            "query": search_term or None,
+            "count": len(locations),
+            "limit": limit,
+            "profile_id": principal.profile_id,
+            "results": [
+                _location_payload(
+                    location,
+                    summary=get_location_stock_summary(location) if search_term else None,
+                )
+                for location in locations
+            ],
+        }
+    finally:
+        close_old_connections()
 
 
 def _list_stock_location_types_sync(
@@ -944,9 +1661,14 @@ def _invoke_view_action_sync(
     data: dict[str, Any] | None = None,
     query_params: dict[str, Any] | None = None,
 ) -> Any:
+    close_old_connections()
     factory = APIRequestFactory()
     http_method = method.lower().strip()
     path = "/mcp/internal"
+    request_headers = {
+        "HTTP_AUTHORIZATION": f"Bearer {principal.token}",
+        "HTTP_HOST": "localhost",
+    }
     sanitized_query_params = {
         key: value for key, value in (query_params or {}).items() if value not in (None, "")
     }
@@ -957,23 +1679,24 @@ def _invoke_view_action_sync(
         )
         if encoded_query:
             path = f"{path}?{encoded_query}"
-    auth_header = f"Bearer {principal.token}"
-
     if http_method == "get":
-        request = factory.get(path, data=sanitized_query_params, format="json", HTTP_AUTHORIZATION=auth_header)
+        request = factory.get(path, data=sanitized_query_params, format="json", **request_headers)
     elif http_method == "post":
-        request = factory.post(path, data=data or {}, format="json", HTTP_AUTHORIZATION=auth_header)
+        request = factory.post(path, data=data or {}, format="json", **request_headers)
     elif http_method == "patch":
-        request = factory.patch(path, data=data or {}, format="json", HTTP_AUTHORIZATION=auth_header)
+        request = factory.patch(path, data=data or {}, format="json", **request_headers)
     elif http_method == "put":
-        request = factory.put(path, data=data or {}, format="json", HTTP_AUTHORIZATION=auth_header)
+        request = factory.put(path, data=data or {}, format="json", **request_headers)
     elif http_method == "delete":
-        request = factory.delete(path, data=data or {}, format="json", HTTP_AUTHORIZATION=auth_header)
+        request = factory.delete(path, data=data or {}, format="json", **request_headers)
     else:
         raise ValueError(f"Unsupported method: {method}")
 
     view = viewset_cls.as_view({http_method: action})
-    response = view(request, pk=pk) if pk is not None else view(request)
+    try:
+        response = view(request, pk=pk) if pk is not None else view(request)
+    finally:
+        close_old_connections()
     status_code = getattr(response, "status_code", 200)
     payload = getattr(response, "data", None)
     if payload is None:
@@ -1023,6 +1746,8 @@ def _search_purchase_orders_sync(
 ) -> dict[str, Any]:
     from mainapps.orders.views import PurchaseOrderViewSet
 
+    normalized_status = str(status or "").strip().lower() or None
+    status_filter = "active" if normalized_status == "open" else ""
     payload = _invoke_view_action_sync(
         principal=principal,
         viewset_cls=PurchaseOrderViewSet,
@@ -1030,10 +1755,18 @@ def _search_purchase_orders_sync(
         method="get",
         query_params={
             "search": str(query or "").strip(),
-            "status": status or "",
+            "status": "" if status_filter else (status or ""),
+            "status_filter": status_filter,
             "page_size": limit,
         },
     )
+    if isinstance(payload, list):
+        payload = {
+            "count": len(payload),
+            "next": None,
+            "previous": None,
+            "results": payload,
+        }
     return {
         "profile_id": principal.profile_id,
         "query": str(query or "").strip() or None,
@@ -1104,25 +1837,57 @@ def _search_sales_orders_sync(
     status: str | None,
     limit: int,
 ) -> dict[str, Any]:
-    from mainapps.orders.views import SalesOrderViewSet
+    close_old_connections()
+    try:
+        from mainapps.orders.models import SalesOrder
 
-    payload = _invoke_view_action_sync(
-        principal=principal,
-        viewset_cls=SalesOrderViewSet,
-        action="list",
-        method="get",
-        query_params={
-            "search": str(query or "").strip(),
-            "status": status or "",
-            "page_size": limit,
-        },
-    )
-    return {
-        "profile_id": principal.profile_id,
-        "query": str(query or "").strip() or None,
-        "status": status,
-        "results": payload,
-    }
+        queryset = SalesOrder.objects.select_related("customer").order_by("-created_at")
+        queryset = scope_queryset_by_identity(
+            queryset,
+            canonical_field="profile_id",
+            legacy_field="profile",
+            value=principal.profile_id,
+        )
+        search_term = str(query or "").strip()
+        if search_term:
+            queryset = queryset.filter(
+                Q(reference__icontains=search_term)
+                | Q(description__icontains=search_term)
+                | Q(customer_reference__icontains=search_term)
+                | Q(customer__name__icontains=search_term)
+            )
+        normalized_status = str(status or "").strip().lower()
+        if normalized_status:
+            queryset = queryset.filter(status=normalized_status)
+        records = list(
+            queryset.values(
+                "id",
+                "reference",
+                "status",
+                "customer_id",
+                "customer_reference",
+                "description",
+                "notes",
+                "issue_date",
+                "shipment_date",
+                "delivery_date",
+                "received_date",
+            )[: max(limit, 1)]
+        )
+        payload = {
+            "count": len(records),
+            "next": None,
+            "previous": None,
+            "results": records,
+        }
+        return {
+            "profile_id": principal.profile_id,
+            "query": search_term or None,
+            "status": status,
+            "results": payload,
+        }
+    finally:
+        close_old_connections()
 
 
 def _get_sales_order_details_sync(*, principal: InventoryMcpPrincipal, sales_order_id: str) -> dict[str, Any]:
@@ -1172,25 +1937,56 @@ def _search_return_orders_sync(
     status: str | None,
     limit: int,
 ) -> dict[str, Any]:
-    from mainapps.orders.views import ReturnOrderViewSet
+    close_old_connections()
+    try:
+        from mainapps.orders.models import ReturnOrder
 
-    payload = _invoke_view_action_sync(
-        principal=principal,
-        viewset_cls=ReturnOrderViewSet,
-        action="list",
-        method="get",
-        query_params={
-            "search": str(query or "").strip(),
-            "status": status or "",
-            "page_size": limit,
-        },
-    )
-    return {
-        "profile_id": principal.profile_id,
-        "query": str(query or "").strip() or None,
-        "status": status,
-        "results": payload,
-    }
+        queryset = ReturnOrder.objects.select_related("purchase_order").order_by("-created_at")
+        queryset = scope_queryset_by_identity(
+            queryset,
+            canonical_field="profile_id",
+            legacy_field="profile",
+            value=principal.profile_id,
+        )
+        search_term = str(query or "").strip()
+        if search_term:
+            queryset = queryset.filter(
+                Q(reference__icontains=search_term)
+                | Q(purchase_order__reference__icontains=search_term)
+            )
+        normalized_status = str(status or "").strip().lower()
+        if normalized_status:
+            queryset = queryset.filter(status=normalized_status)
+        records = list(
+            queryset.values(
+                "id",
+                "reference",
+                "status",
+                "purchase_order_id",
+                "customer_id",
+                "customer_reference",
+                "return_reason",
+                "description",
+                "notes",
+                "issue_date",
+                "delivery_date",
+                "received_date",
+            )[: max(limit, 1)]
+        )
+        payload = {
+            "count": len(records),
+            "next": None,
+            "previous": None,
+            "results": records,
+        }
+        return {
+            "profile_id": principal.profile_id,
+            "query": search_term or None,
+            "status": status,
+            "results": payload,
+        }
+    finally:
+        close_old_connections()
 
 
 def _get_return_order_details_sync(*, principal: InventoryMcpPrincipal, return_order_id: str) -> dict[str, Any]:
@@ -1238,13 +2034,29 @@ def _adjust_inventory_item_stock_via_view_sync(
     inventory_item_id: str,
     data: dict[str, Any],
 ) -> dict[str, Any]:
+    request_data = dict(data)
+    adjustments = request_data.get("adjustments")
+    if isinstance(adjustments, list) and adjustments:
+        first_adjustment = adjustments[0] if isinstance(adjustments[0], dict) else {}
+        stock_location_id = first_adjustment.get("stock_location_id")
+        quantity = first_adjustment.get("quantity")
+        adjustment_type = str(first_adjustment.get("adjustment_type") or "").strip().lower()
+        if stock_location_id and "location_id" not in request_data:
+            request_data["location_id"] = stock_location_id
+        if quantity not in (None, "") and "quantity_change" not in request_data:
+            quantity_change = Decimal(str(quantity))
+            if adjustment_type == "remove" and quantity_change > 0:
+                quantity_change = -quantity_change
+            request_data["quantity_change"] = str(quantity_change)
+        if first_adjustment.get("notes") and "notes" not in request_data:
+            request_data["notes"] = first_adjustment.get("notes")
     payload = _invoke_view_action_sync(
         principal=principal,
         viewset_cls=InventoryCatalogItemViewSet,
         action="adjust_stock",
         method="post",
         pk=inventory_item_id,
-        data=data,
+        data=request_data,
     )
     return {
         "profile_id": principal.profile_id,
@@ -1258,13 +2070,27 @@ def _transfer_stock_via_view_sync(
     location_id: str,
     data: dict[str, Any],
 ) -> dict[str, Any]:
+    request_data = dict(data)
+    transfers = request_data.get("transfers")
+    if isinstance(transfers, list) and transfers:
+        first_transfer = transfers[0] if isinstance(transfers[0], dict) else {}
+        for source_key, target_key in (
+            ("inventory_item_id", "inventory_item_id"),
+            ("to_location_id", "to_location_id"),
+            ("stock_lot_id", "stock_lot_id"),
+            ("stock_serial_id", "stock_serial_id"),
+            ("quantity", "quantity"),
+            ("notes", "notes"),
+        ):
+            if first_transfer.get(source_key) not in (None, "") and target_key not in request_data:
+                request_data[target_key] = first_transfer.get(source_key)
     payload = _invoke_view_action_sync(
         principal=principal,
         viewset_cls=StockLocationViewSet,
         action="transfer_stock",
         method="post",
         pk=location_id,
-        data=data,
+        data=request_data,
     )
     return {
         "profile_id": principal.profile_id,
@@ -1277,16 +2103,21 @@ def _create_stock_reservation_via_view_sync(
     principal: InventoryMcpPrincipal,
     data: dict[str, Any],
 ) -> dict[str, Any]:
+    request_data = dict(data)
+    if "stock_location_id" in request_data and "location_id" not in request_data:
+        request_data["location_id"] = request_data["stock_location_id"]
+    if "reserved_quantity" in request_data and "quantity" not in request_data:
+        request_data["quantity"] = request_data["reserved_quantity"]
     payload = _invoke_view_action_sync(
         principal=principal,
         viewset_cls=StockReservationViewSet,
         action="create",
         method="post",
-        data=data,
+        data=request_data,
     )
     return {
         "profile_id": principal.profile_id,
-        "reservation": payload,
+        "reservation": _normalize_reservation_payload(payload),
     }
 
 
@@ -1307,8 +2138,34 @@ def _reservation_action_via_view_sync(
     )
     return {
         "profile_id": principal.profile_id,
-        "reservation": payload,
+        "reservation": _normalize_reservation_payload(payload),
     }
+
+
+def _normalize_reservation_payload(payload: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return payload
+    normalized = dict(payload)
+    if normalized.get("inventory_item") and "inventory_item_id" not in normalized:
+        normalized["inventory_item_id"] = normalized.get("inventory_item")
+    if normalized.get("stock_location") and "stock_location_id" not in normalized:
+        normalized["stock_location_id"] = normalized.get("stock_location")
+    if normalized.get("location_name") and "stock_location_name" not in normalized:
+        normalized["stock_location_name"] = normalized.get("location_name")
+    if normalized.get("stock_lot") and "stock_lot_id" not in normalized:
+        normalized["stock_lot_id"] = normalized.get("stock_lot")
+    if normalized.get("stock_serial") and "stock_serial_id" not in normalized:
+        normalized["stock_serial_id"] = normalized.get("stock_serial")
+    for key in (
+        "inventory_item_id",
+        "stock_location_id",
+        "stock_lot_id",
+        "stock_serial_id",
+    ):
+        value = normalized.get(key)
+        if value not in (None, ""):
+            normalized[key] = str(value)
+    return normalized
 
 
 def _inventory_category_action_sync(
@@ -1344,18 +2201,43 @@ def _inventory_item_crud_action_sync(
     data: dict[str, Any] | None = None,
     query_params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    prepared_data = _prepare_inventory_item_payload_data(data=data)
+    if action == "create" and "profile_id" not in prepared_data:
+        prepared_data["profile_id"] = principal.profile_id
     payload = _invoke_view_action_sync(
         principal=principal,
         viewset_cls=InventoryCatalogItemViewSet,
         action=action,
         method=method,
         pk=inventory_item_id,
-        data=data,
+        data=prepared_data,
         query_params=query_params,
     )
     return {
         "profile_id": principal.profile_id,
         "inventory_item": payload,
+    }
+
+
+def _bulk_update_inventory_item_controls_sync(
+    *,
+    principal: InventoryMcpPrincipal,
+    data: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    payload = _invoke_view_action_sync(
+        principal=principal,
+        viewset_cls=InventoryCatalogItemViewSet,
+        action="bulk_update_controls",
+        method="post",
+        data=data or {},
+    )
+    if not isinstance(payload, dict):
+        raise ValueError("bulk_update_controls returned an unexpected response payload")
+    return {
+        "profile_id": principal.profile_id,
+        "updated_count": int(payload.get("updated_count") or 0),
+        "skipped_count": int(payload.get("skipped_count") or 0),
+        "results": payload.get("results") or [],
     }
 
 
@@ -2377,6 +3259,89 @@ async def get_inventory_category_inventories(
 
 
 @mcp.tool(
+    name="auto_categorize_inventory_items",
+    description=(
+        "Automatically categorize inventory items for the authenticated workspace. "
+        "Use this when the user asks to categorize inventory items. By default it only "
+        "updates uncategorized items, creates missing non-structural categories when "
+        "there is a confident match, attaches matching items, and returns uncertain "
+        "items for manual review."
+    ),
+)
+async def auto_categorize_inventory_items(
+    only_uncategorized: bool = True,
+    create_missing_categories: bool = True,
+    apply_changes: bool = True,
+    limit: int = 100,
+) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    return await sync_to_async(_auto_categorize_inventory_items_sync, thread_sensitive=True)(
+        principal=principal,
+        only_uncategorized=only_uncategorized,
+        create_missing_categories=create_missing_categories,
+        apply_changes=apply_changes,
+        limit=limit,
+    )
+
+
+@mcp.tool(
+    name="recommend_inventory_item_controls",
+    description=(
+        "Recommend operational stock controls for an inventory item: minimum stock, "
+        "safety stock, reorder point, reorder quantity, lot/serial/expiry tracking, "
+        "and negative-stock policy. Use before creating inventory items when these "
+        "fields are missing or zero, and use for existing items when the user asks "
+        "to review or fix inventory item settings. If inventory_item_id is provided "
+        "and apply_changes is true, only applies recommendations when all current "
+        "replenishment thresholds are zero."
+    ),
+)
+async def recommend_inventory_item_controls(
+    inventory_item_id: str | None = None,
+    item_name: str = "",
+    category_name: str = "",
+    description: str = "",
+    apply_changes: bool = False,
+) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    return await sync_to_async(_recommend_inventory_item_controls_sync, thread_sensitive=True)(
+        principal=principal,
+        inventory_item_id=inventory_item_id,
+        item_name=item_name,
+        category_name=category_name,
+        description=description,
+        apply_changes=apply_changes,
+    )
+
+
+@mcp.tool(
+    name="assign_inventory_item_category",
+    description=(
+        "Assign an existing inventory item to an existing non-structural inventory category "
+        "for the authenticated workspace. Use this instead of update_inventory_item when the "
+        "only intended change is category assignment. The response includes assigned=true only "
+        "after the saved item is re-read and verified."
+    ),
+)
+async def assign_inventory_item_category(
+    inventory_item_id: str,
+    category_id: str,
+) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    target_item_id = str(inventory_item_id or "").strip()
+    target_category_id = str(category_id or "").strip()
+    if not target_item_id:
+        raise ValueError("inventory_item_id is required")
+    if not target_category_id:
+        raise ValueError("category_id is required")
+    return await sync_to_async(_assign_inventory_item_category_sync, thread_sensitive=True)(
+        principal=principal,
+        inventory_item_id=target_item_id,
+        category_id=target_category_id,
+    )
+
+
+@mcp.tool(
     name="create_inventory_category",
     description="Create an inventory category. Payload should match the backend create schema.",
 )
@@ -2421,7 +3386,7 @@ async def update_inventory_category(
     description="Create an inventory item definition. Payload should match the backend create schema.",
 )
 async def create_inventory_item(
-    payload: inventory_payloads.InventoryItemCreateUpdatePayload,
+    payload: inventory_payloads.InventoryItemCreatePayload,
 ) -> inventory_payloads.InventoryItemMutationResponsePayload:
     #  we need to properly define all payload fields and validation for this tool before we can safely expose it, as it has significant potential to cause data integrity issues if used incorrectly. For now, we'll leave this as a passthrough to the view action and require internal access until we can build out a more robust interface for inventory creation.
     principal = get_current_principal(required=True)
@@ -2441,7 +3406,7 @@ async def create_inventory_item(
 )
 async def update_inventory_item(
     inventory_item_id: str,
-    payload: inventory_payloads.InventoryItemCreateUpdatePayload,
+    payload: inventory_payloads.InventoryItemUpdatePayload,
 ) -> inventory_payloads.InventoryItemMutationResponsePayload:
     principal = get_current_principal(required=True)
     target_id = str(inventory_item_id or "").strip()
@@ -2454,6 +3419,22 @@ async def update_inventory_item(
         action="partial_update",
         method="patch",
         inventory_item_id=target_id,
+        data=_payload_to_data(payload),
+    )
+
+
+@mcp.tool(
+    name="bulk_update_inventory_item_controls",
+    description="Bulk update stock-control thresholds and tracking flags across inventory items.",
+)
+async def bulk_update_inventory_item_controls(
+    payload: inventory_payloads.BulkInventoryItemControlsPayload,
+) -> inventory_payloads.BulkInventoryItemControlsResponsePayload:
+    principal = get_current_principal(required=True)
+    if not payload or not payload.updates:
+        raise ValueError("payload.updates is required")
+    return await sync_to_async(_bulk_update_inventory_item_controls_sync, thread_sensitive=True)(
+        principal=principal,
         data=_payload_to_data(payload),
     )
 

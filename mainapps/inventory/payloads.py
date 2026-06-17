@@ -56,10 +56,11 @@ class InventoryCategoryCreateUpdatePayload(BaseModel):
 # ------------------------------------------------------------------------------
 # InventoryItem
 # ------------------------------------------------------------------------------
-class InventoryItemCreateUpdatePayload(BaseModel):
-    """Payload for creating/updating an InventoryItem."""
+class InventoryItemCreatePayload(BaseModel):
+    """Payload for creating an InventoryItem."""
     product_template_id: Optional[uuid.UUID] = Field(None, description="Associated product template UUID")
     product_variant_id: Optional[uuid.UUID] = Field(None, description="Associated product variant UUID")
+    product_variant_image_url: str = Field("", description="Projected product-variant image URL")
     name_snapshot: str = Field(..., description="Snapshot of item name")
     sku_snapshot: str = Field("", description="Snapshot of SKU")
     barcode_snapshot: str = Field("", description="Snapshot of barcode")
@@ -81,10 +82,96 @@ class InventoryItemCreateUpdatePayload(BaseModel):
     status: InventoryItemStatus = Field(InventoryItemStatus.ACTIVE, description="Item status")
     metadata: Dict[str, Any] = Field(default_factory=dict, description="Extra metadata")
 
+
+class InventoryItemUpdatePayload(BaseModel):
+    """Payload for partially updating an InventoryItem."""
+
+    product_template_id: Optional[uuid.UUID] = Field(None, description="Associated product template UUID")
+    product_variant_id: Optional[uuid.UUID] = Field(None, description="Associated product variant UUID")
+    product_variant_image_url: Optional[str] = Field(None, description="Projected product-variant image URL")
+    name_snapshot: Optional[str] = Field(None, description="Snapshot of item name")
+    sku_snapshot: Optional[str] = Field(None, description="Snapshot of SKU")
+    barcode_snapshot: Optional[str] = Field(None, description="Snapshot of barcode")
+    description: Optional[str] = Field(None, description="Item description")
+    inventory_category_id: Optional[uuid.UUID] = Field(None, description="UUID of InventoryCategory")
+    inventory_type: Optional[InventoryType] = Field(None, description="Type of inventory")
+    default_uom_code: Optional[str] = Field(None, description="Default unit of measure code")
+    stock_uom_code: Optional[str] = Field(None, description="Stock unit of measure code")
+    track_stock: Optional[bool] = Field(None, description="Enable stock tracking")
+    track_lot: Optional[bool] = Field(None, description="Enable lot tracking")
+    track_serial: Optional[bool] = Field(None, description="Enable serial tracking")
+    track_expiry: Optional[bool] = Field(None, description="Enable expiry tracking")
+    allow_negative_stock: Optional[bool] = Field(None, description="Allow negative stock balances")
+    reorder_point: Optional[Decimal] = Field(None, description="Reorder point quantity")
+    reorder_quantity: Optional[Decimal] = Field(None, description="Reorder quantity")
+    minimum_stock_level: Optional[Decimal] = Field(None, description="Minimum allowed stock")
+    safety_stock_level: Optional[Decimal] = Field(None, description="Safety stock quantity")
+    default_supplier_id: Optional[uuid.UUID] = Field(None, description="UUID of default supplier (Company)")
+    status: Optional[InventoryItemStatus] = Field(None, description="Item status")
+    metadata: Optional[Dict[str, Any]] = Field(None, description="Extra metadata")
+
 class McpPayloadModel(BaseModel):
     """Shared MCP contract model that preserves known schema while tolerating backend extras."""
 
     model_config = ConfigDict(extra="allow")
+
+
+class BulkInventoryItemControlsEntryPayload(McpPayloadModel):
+    inventory_item_ids: List[uuid.UUID] = Field(
+        default_factory=list,
+        description="Specific inventory item identifiers to update",
+    )
+    inventory_type: Optional[InventoryType] = Field(
+        None,
+        description="Optional inventory type filter applied within the current workspace",
+    )
+    minimum_stock_level: Optional[Decimal] = Field(None, description="Minimum allowed stock")
+    safety_stock_level: Optional[Decimal] = Field(None, description="Safety stock quantity")
+    reorder_point: Optional[Decimal] = Field(None, description="Reorder point quantity")
+    reorder_quantity: Optional[Decimal] = Field(None, description="Reorder quantity")
+    track_lot: Optional[bool] = Field(None, description="Enable lot tracking")
+    track_serial: Optional[bool] = Field(None, description="Enable serial tracking")
+    track_expiry: Optional[bool] = Field(None, description="Enable expiry tracking")
+    allow_negative_stock: Optional[bool] = Field(None, description="Allow negative stock balances")
+    only_if_all_thresholds_zero: bool = Field(
+        False,
+        description="Skip items whose replenishment thresholds are already set",
+    )
+    reason: Optional[str] = Field(None, description="Reason for this bulk control update")
+
+
+class BulkInventoryItemControlsPayload(McpPayloadModel):
+    updates: List[BulkInventoryItemControlsEntryPayload] = Field(
+        default_factory=list,
+        description="One or more bulk control update instructions",
+    )
+
+
+class BulkInventoryItemControlsResultPayload(McpPayloadModel):
+    inventory_item_id: str = Field(..., description="Inventory item identifier")
+    name: str = Field(..., description="Inventory item name")
+    inventory_type: Optional[str] = Field(None, description="Inventory item type")
+    updated_fields: List[str] = Field(default_factory=list, description="Fields updated on this item")
+    skipped: bool = Field(False, description="Whether the item update was skipped")
+    skip_reason: Optional[str] = Field(None, description="Why the item was skipped")
+    minimum_stock_level: Optional[float] = Field(None, description="Minimum stock threshold after processing")
+    safety_stock_level: Optional[float] = Field(None, description="Safety stock threshold after processing")
+    reorder_point: Optional[float] = Field(None, description="Reorder point threshold after processing")
+    reorder_quantity: Optional[float] = Field(None, description="Reorder quantity after processing")
+    track_lot: Optional[bool] = Field(None, description="Whether lot tracking is enabled")
+    track_serial: Optional[bool] = Field(None, description="Whether serial tracking is enabled")
+    track_expiry: Optional[bool] = Field(None, description="Whether expiry tracking is enabled")
+    allow_negative_stock: Optional[bool] = Field(None, description="Whether negative stock is allowed")
+
+
+class BulkInventoryItemControlsResponsePayload(McpPayloadModel):
+    profile_id: int = Field(..., description="Workspace profile identifier")
+    updated_count: int = Field(0, description="Number of inventory items updated")
+    skipped_count: int = Field(0, description="Number of inventory items skipped")
+    results: List[BulkInventoryItemControlsResultPayload] = Field(
+        default_factory=list,
+        description="Per-item bulk update results",
+    )
 
 
 class InventoryLocationBreakdownPayload(McpPayloadModel):
@@ -138,6 +225,7 @@ class InventoryItemResponsePayload(McpPayloadModel):
     days_to_expiry: Optional[int] = Field(None, description="Days until expiry")
     last_movement_at: Optional[str] = Field(None, description="ISO-8601 last movement timestamp")
     product_variant: Optional[str] = Field(None, description="Associated product variant reference")
+    product_variant_image_url: Optional[str] = Field(None, description="Projected product-variant image URL")
 
 
 class InventoryCategoryResponsePayload(McpPayloadModel):

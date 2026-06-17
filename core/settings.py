@@ -67,6 +67,7 @@ LOGGING = {
 _default_allowed_hosts = [
     'localhost',
     '127.0.0.1',
+    '10.0.2.2',
     'dev.inventory.interaims.com',
 ]
 _allowed_hosts_env = os.getenv("ALLOWED_HOSTS", "").strip()
@@ -364,10 +365,13 @@ CORS_ALLOW_HEADERS = [
     'user-agent',
     'x-csrftoken',
     'x-requested-with',
+    'x-device-id',
 ]
 
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:3000",
+    "http://10.0.2.2:3000",
+    "http://10.0.2.2:8080",
     'https://interaims.com',
     'https://www.interaims.com',
     'https://dev.interaims.com'

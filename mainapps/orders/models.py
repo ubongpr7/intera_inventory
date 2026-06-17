@@ -2,7 +2,7 @@
 import logging
 import os
 import sys
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 import uuid
 from django.core.exceptions import ValidationError
@@ -20,6 +20,33 @@ from django.utils import timezone
 from mainapps.company.models import  Company, CompanyAddress, Contact 
 from subapps.utils.statuses import *
 from decimal import Decimal, ROUND_HALF_UP
+
+
+def _coerce_inventory_date(value):
+    if value in (None, ""):
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        try:
+            return date.fromisoformat(value)
+        except ValueError as exc:
+            raise ValidationError("Invalid inventory date value.") from exc
+    raise ValidationError("Invalid inventory date value.")
+
+
+def _validate_inventory_dates(*, manufactured_date: date | None, expiry_date: date | None) -> None:
+    manufactured_date = _coerce_inventory_date(manufactured_date)
+    expiry_date = _coerce_inventory_date(expiry_date)
+    today = timezone.now().date()
+    if manufactured_date and manufactured_date > today:
+        raise ValidationError("Manufactured date cannot be in the future.")
+    if expiry_date and expiry_date <= today:
+        raise ValidationError("Expiry date must be in the future.")
+    if manufactured_date and expiry_date and expiry_date <= manufactured_date:
+        raise ValidationError("Expiry date must be later than the manufactured date.")
 
 class PurchaseOrderLineItem(UUIDBaseModel):
     purchase_order = models.ForeignKey(
@@ -81,6 +108,15 @@ class PurchaseOrderLineItem(UUIDBaseModel):
             raise ValidationError("Quantity received cannot be negative.")
         if Decimal(str(self.quantity_received)) > Decimal(str(self.quantity)):
             raise ValidationError("Quantity received cannot exceed ordered quantity.")
+        _validate_inventory_dates(
+            manufactured_date=self.manufactured_date,
+            expiry_date=self.expiry_date,
+        )
+        minimum_quantity = Decimal(str(self.inventory_item.reorder_quantity or 0)) if self.inventory_item_id else Decimal("0")
+        if minimum_quantity > 0 and Decimal(str(self.quantity)) < minimum_quantity:
+            raise ValidationError(
+                {"quantity": f"Quantity cannot be lower than the inventory item's reorder quantity ({minimum_quantity})."}
+            )
 
     @property
     def tax_amount(self):

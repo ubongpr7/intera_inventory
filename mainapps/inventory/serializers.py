@@ -51,6 +51,7 @@ class InventoryItemSummaryMixin:
 class InventoryListSerializer(InventoryItemSummaryMixin, serializers.ModelSerializer):
     name = serializers.CharField(source='name_snapshot', read_only=True)
     category_name = serializers.CharField(source='inventory_category.name', read_only=True)
+    display_image = serializers.CharField(source='product_variant_image_url', read_only=True)
     stock_status = serializers.SerializerMethodField()
     total_stock_value = serializers.SerializerMethodField()
     current_stock_level = serializers.SerializerMethodField()
@@ -64,6 +65,8 @@ class InventoryListSerializer(InventoryItemSummaryMixin, serializers.ModelSerial
             'sku_snapshot',
             'barcode_snapshot',
             'product_variant_id',
+            'display_image',
+            'product_variant_image_url',
             'inventory_type',
             'category_name',
             'stock_status',
@@ -92,6 +95,7 @@ class InventoryListSerializer(InventoryItemSummaryMixin, serializers.ModelSerial
 
 class InventoryDetailSerializer(InventoryItemSummaryMixin, UserDetailMixin, serializers.ModelSerializer):
     name = serializers.CharField(source='name_snapshot', read_only=True)
+    display_image = serializers.CharField(source='product_variant_image_url', read_only=True)
     category_details = InventoryCategoryListSerializer(source='inventory_category', read_only=True)
     current_stock = serializers.SerializerMethodField()
     stock_status = serializers.SerializerMethodField()
@@ -144,6 +148,14 @@ class InventoryAnalyticsSerializer(serializers.Serializer):
     stock_status_distribution = serializers.DictField()
     top_value_items = serializers.ListField()
     expiring_soon = serializers.ListField()
+
+
+class InventorySetupSummarySerializer(serializers.Serializer):
+    total_locations = serializers.IntegerField()
+    total_categories = serializers.IntegerField()
+    total_inventory_items = serializers.IntegerField()
+    total_stock_value = serializers.DecimalField(max_digits=15, decimal_places=2)
+    low_stock_count = serializers.IntegerField()
 
 
 class StockAnalyticsSerializer(serializers.Serializer):

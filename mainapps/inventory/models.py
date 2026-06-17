@@ -491,6 +491,11 @@ class InventoryItem(TenantStampedUUIDModel):
         db_index=True,
         verbose_name=_("Product Variant ID"),
     )
+    product_variant_image_url = models.URLField(
+        blank=True,
+        default="",
+        verbose_name=_("Product Variant Image URL"),
+    )
     name_snapshot = models.CharField(max_length=255, verbose_name=_("Name Snapshot"))
     sku_snapshot = models.CharField(max_length=100, blank=True, default="", verbose_name=_("SKU Snapshot"))
     barcode_snapshot = models.CharField(max_length=100, blank=True, default="", verbose_name=_("Barcode Snapshot"))

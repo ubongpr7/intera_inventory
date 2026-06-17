@@ -16,6 +16,7 @@ from mainapps.orders.models import (
     SalesOrderLineItem,
     SalesOrderShipment,
     SalesOrderShipmentLine,
+    _validate_inventory_dates,
 )
 
 class InventoryItemReferenceSerializer(serializers.ModelSerializer):
@@ -23,6 +24,7 @@ class InventoryItemReferenceSerializer(serializers.ModelSerializer):
     sku = serializers.CharField(source='sku_snapshot', read_only=True)
     barcode = serializers.CharField(source='barcode_snapshot', read_only=True)
     unit_code = serializers.SerializerMethodField()
+    display_image = serializers.CharField(source='product_variant_image_url', read_only=True)
 
     class Meta:
         model = InventoryItem
@@ -39,8 +41,10 @@ class InventoryItemReferenceSerializer(serializers.ModelSerializer):
             'track_serial',
             'minimum_stock_level',
             'reorder_point',
+            'reorder_quantity',
             'status',
             'unit_code',
+            'display_image',
         ]
 
     def get_unit_code(self, obj):
@@ -420,6 +424,7 @@ class SalesOrderShipSerializer(serializers.Serializer):
 class PurchaseOrderLineItemSerializer(UserDetailMixin, serializers.ModelSerializer):
     """Serializer for purchase order line items"""
     inventory_item_name = serializers.CharField(source='inventory_item.name_snapshot', read_only=True)
+    inventory_item_image_url = serializers.CharField(source='inventory_item.product_variant_image_url', read_only=True)
     inventory_item_details = InventoryItemReferenceSerializer(source='inventory_item', read_only=True)
     quantity_w_unit = serializers.SerializerMethodField()
     tax_amount = serializers.DecimalField(max_digits=18, decimal_places=2, read_only=True)
@@ -432,7 +437,7 @@ class PurchaseOrderLineItemSerializer(UserDetailMixin, serializers.ModelSerializ
     class Meta:
         model = PurchaseOrderLineItem
         fields = [
-            'id', 'purchase_order', 'inventory_item', 'inventory_item_name', 'inventory_item_details',
+            'id', 'purchase_order', 'inventory_item', 'inventory_item_name', 'inventory_item_image_url', 'inventory_item_details',
             'quantity', 'quantity_w_unit', 'unit_price',
             'discount_rate', 'tax_rate', 'description',
             'batch_number', 'expiry_date', 'manufactured_date', 'quantity_received',
@@ -535,6 +540,30 @@ class PurchaseOrderLineItemCreateSerializer(serializers.ModelSerializer):
         exclude = ['purchase_order']
         read_only_fields = ['tax_amount', 'discount', 'total_price', 'batch_number']
 
+    def validate(self, attrs):
+        inventory_item = attrs.get('inventory_item') or getattr(self.instance, 'inventory_item', None)
+        quantity = attrs.get('quantity', getattr(self.instance, 'quantity', None))
+        manufactured_date = attrs.get('manufactured_date', getattr(self.instance, 'manufactured_date', None))
+        expiry_date = attrs.get('expiry_date', getattr(self.instance, 'expiry_date', None))
+
+        _validate_inventory_dates(
+            manufactured_date=manufactured_date,
+            expiry_date=expiry_date,
+        )
+
+        if inventory_item is not None and quantity is not None:
+            reorder_quantity = Decimal(str(inventory_item.reorder_quantity or 0))
+            if reorder_quantity > 0 and Decimal(str(quantity)) < reorder_quantity:
+                raise serializers.ValidationError(
+                    {
+                        'quantity': (
+                            f"Quantity cannot be lower than the inventory item's reorder quantity "
+                            f"({reorder_quantity})."
+                        )
+                    }
+                )
+        return attrs
+
     def create(self, validated_data):
         po_reference = validated_data.pop('purchase_order_reference', None)
         if po_reference:
@@ -573,6 +602,10 @@ class ReceiveItemsSerializer(serializers.Serializer):
                 raise serializers.ValidationError(
                     "Quantity received must be greater than 0"
                 )
+            _validate_inventory_dates(
+                manufactured_date=item.get('manufactured_date'),
+                expiry_date=item.get('expiry_date'),
+            )
         return value
 
 

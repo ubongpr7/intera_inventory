@@ -362,6 +362,7 @@ class InventoryItemViewSet(BaseInventoryViewSetMixin):
             'name_snapshot': data.get('name') or variant.display_name,
             'sku_snapshot': variant.variant_sku or '',
             'barcode_snapshot': variant.variant_barcode or '',
+            'product_variant_image_url': variant.image_url or '',
             'description': data.get('description') or '',
             'inventory_category': inventory_category,
             'inventory_type': data.get('inventory_type') or 'finished_good',

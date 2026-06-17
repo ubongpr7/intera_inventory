@@ -9,12 +9,14 @@ from typing import Any
 from django.db.models import Sum
 
 from mainapps.inventory.models import InventoryItem, InventoryItemStatus
+from mainapps.orders.models import GoodsReceiptLine
 from mainapps.projections.models import CatalogVariantProjection
 from mainapps.stock.models import StockBalance, StockReservation
 from subapps.kafka.client import publish_event
 from subapps.kafka.topics import (
     INVENTORY_AVAILABILITY_TOPIC,
     INVENTORY_FULFILLMENT_TOPIC,
+    INVENTORY_PURCHASE_PRICE_TOPIC,
     INVENTORY_RESERVATION_TOPIC,
 )
 
@@ -109,6 +111,53 @@ def _sync_inventory_item_variant_fields(
             "metadata",
             "updated_at",
         ])
+
+
+def _build_purchase_price_snapshot(goods_receipt_line: GoodsReceiptLine) -> dict[str, Any] | None:
+    inventory_item = goods_receipt_line.inventory_item
+    variant = _resolve_catalog_variant(inventory_item)
+    if variant is not None:
+        _sync_inventory_item_variant_fields(inventory_item, variant)
+
+    variant_id = variant.variant_id if variant is not None else inventory_item.product_variant_id
+    if variant_id is None:
+        logger.warning(
+            "Skipping inventory purchase-price event for goods_receipt_line=%s because no catalog variant mapping was found.",
+            goods_receipt_line.id,
+        )
+        return None
+
+    goods_receipt = goods_receipt_line.goods_receipt
+    purchase_order = goods_receipt.purchase_order if goods_receipt else None
+    supplier_name = ""
+    if goods_receipt and goods_receipt.supplier_id and getattr(goods_receipt.supplier, "name", None):
+        supplier_name = goods_receipt.supplier.name
+    elif purchase_order and purchase_order.supplier_id and getattr(purchase_order.supplier, "name", None):
+        supplier_name = purchase_order.supplier.name
+
+    return {
+        "variant_id": str(variant_id),
+        "product_id": str(variant.product_id) if variant is not None else (
+            str(inventory_item.product_template_id) if inventory_item.product_template_id else ""
+        ),
+        "profile_id": inventory_item.profile_id,
+        "inventory_item_id": str(inventory_item.id),
+        "goods_receipt_line_id": str(goods_receipt_line.id),
+        "goods_receipt_reference": goods_receipt.reference if goods_receipt else "",
+        "purchase_order_reference": purchase_order.reference if purchase_order else "",
+        "variant_barcode": (
+            variant.variant_barcode if variant is not None else inventory_item.barcode_snapshot or None
+        ),
+        "variant_sku": variant.variant_sku if variant is not None else inventory_item.sku_snapshot or "",
+        "purchase_price": goods_receipt_line.unit_cost,
+        "quantity_purchased": goods_receipt_line.received_quantity,
+        "currency": purchase_order.order_currency if purchase_order else "",
+        "supplier": supplier_name,
+        "received_at": goods_receipt.received_at.isoformat() if goods_receipt and goods_receipt.received_at else None,
+        "purchase_order_line_id": (
+            str(goods_receipt_line.purchase_order_line_id) if goods_receipt_line.purchase_order_line_id else ""
+        ),
+    }
 
 
 def _derive_stock_status(inventory_item: InventoryItem, total_quantity: Decimal) -> str:
@@ -265,6 +314,38 @@ def publish_inventory_fulfillment_completed(*, reservation_id) -> dict[str, Any]
     return publish_event(
         INVENTORY_FULFILLMENT_TOPIC,
         "inventory.fulfillment.completed",
+        payload,
+        key=payload["variant_id"],
+    )
+
+
+def publish_inventory_purchase_price_recorded(*, goods_receipt_line_id) -> dict[str, Any] | None:
+    goods_receipt_line = (
+        GoodsReceiptLine.objects
+        .select_related(
+            "inventory_item",
+            "goods_receipt",
+            "goods_receipt__purchase_order",
+            "goods_receipt__supplier",
+            "goods_receipt__purchase_order__supplier",
+        )
+        .filter(id=goods_receipt_line_id)
+        .first()
+    )
+    if goods_receipt_line is None:
+        logger.warning(
+            "Skipping inventory purchase-price event because goods_receipt_line=%s was not found.",
+            goods_receipt_line_id,
+        )
+        return None
+
+    payload = _build_purchase_price_snapshot(goods_receipt_line)
+    if payload is None:
+        return None
+
+    return publish_event(
+        INVENTORY_PURCHASE_PRICE_TOPIC,
+        "inventory.purchase_price.recorded",
         payload,
         key=payload["variant_id"],
     )
