@@ -19,6 +19,35 @@ from mainapps.orders.models import (
     _validate_inventory_dates,
 )
 
+class StructuralLocationSerializerMixin:
+    def _get_structural_location(self, stock_location):
+        if not stock_location:
+            return None
+        if getattr(stock_location, 'structural', False):
+            return stock_location
+        return stock_location.get_ancestors(include_self=True).filter(structural=True).last()
+
+    def _structural_location_id(self, stock_location):
+        structural_location = self._get_structural_location(stock_location)
+        return structural_location.id if structural_location else None
+
+    def _structural_location_name(self, stock_location):
+        structural_location = self._get_structural_location(stock_location)
+        return structural_location.name if structural_location else None
+
+    def _collect_structural_preview(self, lines, *, limit=3):
+        names = []
+        seen = set()
+        for line in lines:
+            structural_name = self._structural_location_name(getattr(line, 'stock_location', None))
+            if not structural_name or structural_name in seen:
+                continue
+            names.append(structural_name)
+            seen.add(structural_name)
+            if len(names) >= limit:
+                break
+        return names
+
 class InventoryItemReferenceSerializer(serializers.ModelSerializer):
     name = serializers.CharField(source='name_snapshot', read_only=True)
     sku = serializers.CharField(source='sku_snapshot', read_only=True)
@@ -52,9 +81,11 @@ class InventoryItemReferenceSerializer(serializers.ModelSerializer):
 
 
 
-class SalesOrderShipmentLineSerializer(serializers.ModelSerializer):
+class SalesOrderShipmentLineSerializer(StructuralLocationSerializerMixin, serializers.ModelSerializer):
     inventory_name = serializers.CharField(source='sales_order_line.inventory_item.name_snapshot', read_only=True)
     location_name = serializers.CharField(source='stock_location.name', read_only=True)
+    structural_location_id = serializers.SerializerMethodField()
+    structural_location_name = serializers.SerializerMethodField()
     lot_number = serializers.CharField(source='stock_lot.lot_number', read_only=True)
     serial_number = serializers.CharField(source='stock_serial.serial_number', read_only=True)
     reservation_id = serializers.UUIDField(source='reservation.id', read_only=True)
@@ -67,6 +98,8 @@ class SalesOrderShipmentLineSerializer(serializers.ModelSerializer):
             'inventory_name',
             'stock_location',
             'location_name',
+            'structural_location_id',
+            'structural_location_name',
             'stock_lot',
             'lot_number',
             'stock_serial',
@@ -76,6 +109,12 @@ class SalesOrderShipmentLineSerializer(serializers.ModelSerializer):
             'notes',
             'created_at',
         ]
+
+    def get_structural_location_id(self, obj):
+        return self._structural_location_id(getattr(obj, 'stock_location', None))
+
+    def get_structural_location_name(self, obj):
+        return self._structural_location_name(getattr(obj, 'stock_location', None))
 
 
 class SalesOrderShipmentSerializer(UserDetailMixin, serializers.ModelSerializer):
@@ -106,7 +145,7 @@ class SalesOrderShipmentSerializer(UserDetailMixin, serializers.ModelSerializer)
         return self.get_user_details(self.resolve_user_reference(obj, 'checked_by_user_id', 'checked_by'))
 
 
-class SalesOrderShipmentListSerializer(UserDetailMixin, serializers.ModelSerializer):
+class SalesOrderShipmentListSerializer(StructuralLocationSerializerMixin, UserDetailMixin, serializers.ModelSerializer):
     order_reference = serializers.CharField(source='order.reference', read_only=True)
     customer_name = serializers.CharField(source='order.customer.name', read_only=True)
     order_status = serializers.CharField(source='order.status', read_only=True)
@@ -116,6 +155,7 @@ class SalesOrderShipmentListSerializer(UserDetailMixin, serializers.ModelSeriali
     location_count = serializers.SerializerMethodField()
     inventory_preview = serializers.SerializerMethodField()
     location_preview = serializers.SerializerMethodField()
+    structural_location_preview = serializers.SerializerMethodField()
 
     class Meta:
         model = SalesOrderShipment
@@ -140,6 +180,7 @@ class SalesOrderShipmentListSerializer(UserDetailMixin, serializers.ModelSeriali
             'location_count',
             'inventory_preview',
             'location_preview',
+            'structural_location_preview',
             'created_at',
             'updated_at',
         ]
@@ -170,6 +211,10 @@ class SalesOrderShipmentListSerializer(UserDetailMixin, serializers.ModelSeriali
             .values_list('stock_location__name', flat=True)
             .distinct()[:3]
         )
+
+    def get_structural_location_preview(self, obj):
+        lines = list(obj.lines.select_related('stock_location')[:10])
+        return self._collect_structural_preview(lines)
 
 
 class SalesOrderShipmentDetailSerializer(SalesOrderShipmentListSerializer):
@@ -207,10 +252,12 @@ class SalesOrderLineItemSerializer(serializers.ModelSerializer):
         ]
 
 
-class GoodsReceiptLineSerializer(serializers.ModelSerializer):
+class GoodsReceiptLineSerializer(StructuralLocationSerializerMixin, serializers.ModelSerializer):
     purchase_order_line_id = serializers.UUIDField(source='purchase_order_line.id', read_only=True, allow_null=True)
     inventory_item_name = serializers.CharField(source='inventory_item.name_snapshot', read_only=True)
     location_name = serializers.CharField(source='stock_location.name', read_only=True)
+    structural_location_id = serializers.SerializerMethodField()
+    structural_location_name = serializers.SerializerMethodField()
 
     class Meta:
         model = GoodsReceiptLine
@@ -223,6 +270,8 @@ class GoodsReceiptLineSerializer(serializers.ModelSerializer):
             'inventory_item_name',
             'stock_location',
             'location_name',
+            'structural_location_id',
+            'structural_location_name',
             'received_quantity',
             'unit_cost',
             'lot_number',
@@ -231,8 +280,14 @@ class GoodsReceiptLineSerializer(serializers.ModelSerializer):
             'created_at',
         ]
 
+    def get_structural_location_id(self, obj):
+        return self._structural_location_id(getattr(obj, 'stock_location', None))
 
-class GoodsReceiptListSerializer(UserDetailMixin, serializers.ModelSerializer):
+    def get_structural_location_name(self, obj):
+        return self._structural_location_name(getattr(obj, 'stock_location', None))
+
+
+class GoodsReceiptListSerializer(StructuralLocationSerializerMixin, UserDetailMixin, serializers.ModelSerializer):
     purchase_order_reference = serializers.CharField(source='purchase_order.reference', read_only=True)
     supplier_name = serializers.CharField(source='supplier.name', read_only=True)
     received_by_details = serializers.SerializerMethodField()
@@ -241,6 +296,7 @@ class GoodsReceiptListSerializer(UserDetailMixin, serializers.ModelSerializer):
     location_count = serializers.SerializerMethodField()
     inventory_preview = serializers.SerializerMethodField()
     location_preview = serializers.SerializerMethodField()
+    structural_location_preview = serializers.SerializerMethodField()
 
     class Meta:
         model = GoodsReceipt
@@ -259,6 +315,7 @@ class GoodsReceiptListSerializer(UserDetailMixin, serializers.ModelSerializer):
             'location_count',
             'inventory_preview',
             'location_preview',
+            'structural_location_preview',
             'notes',
             'created_at',
             'updated_at',
@@ -290,6 +347,10 @@ class GoodsReceiptListSerializer(UserDetailMixin, serializers.ModelSerializer):
             .values_list('stock_location__name', flat=True)
             .distinct()[:3]
         )
+
+    def get_structural_location_preview(self, obj):
+        lines = list(obj.lines.select_related('stock_location')[:10])
+        return self._collect_structural_preview(lines)
 
 
 class GoodsReceiptDetailSerializer(GoodsReceiptListSerializer):
@@ -363,6 +424,7 @@ class SalesOrderReserveSerializer(serializers.Serializer):
         child=serializers.DictField(),
         help_text="List of sales order line items to reserve against stock",
     )
+    structural_location_id = serializers.UUIDField(required=False, allow_null=True)
     expires_at = serializers.DateTimeField(required=False, allow_null=True)
     notes = serializers.CharField(required=False, allow_blank=True)
 
@@ -384,6 +446,7 @@ class SalesOrderReleaseSerializer(serializers.Serializer):
         child=serializers.DictField(),
         help_text="List of reservation records to release",
     )
+    structural_location_id = serializers.UUIDField(required=False, allow_null=True)
     notes = serializers.CharField(required=False, allow_blank=True)
 
     def validate_reservation_items(self, value):
@@ -400,6 +463,7 @@ class SalesOrderShipSerializer(serializers.Serializer):
         child=serializers.DictField(),
         help_text="List of sales order line items to ship",
     )
+    structural_location_id = serializers.UUIDField(required=False, allow_null=True)
     shipment_date = serializers.DateField(required=False, allow_null=True)
     delivery_date = serializers.DateField(required=False, allow_null=True)
     tracking_number = serializers.CharField(required=False, allow_blank=True)
@@ -585,6 +649,7 @@ class PurchaseOrderWorkflowSerializer(serializers.Serializer):
 
 class ReceiveItemsSerializer(serializers.Serializer):
     """Serializer for receiving purchase order items"""
+    structural_location_id = serializers.UUIDField(required=False, allow_null=True)
     received_items = serializers.ListField(
         child=serializers.DictField(),
         help_text="List of items being received"
@@ -602,6 +667,13 @@ class ReceiveItemsSerializer(serializers.Serializer):
                 raise serializers.ValidationError(
                     "Quantity received must be greater than 0"
                 )
+            if item.get('unit_cost') is not None:
+                try:
+                    unit_cost = Decimal(str(item['unit_cost']))
+                except Exception as exc:
+                    raise serializers.ValidationError("Unit cost must be a valid number.") from exc
+                if unit_cost < 0:
+                    raise serializers.ValidationError("Unit cost cannot be negative.")
             _validate_inventory_dates(
                 manufactured_date=item.get('manufactured_date'),
                 expiry_date=item.get('expiry_date'),
@@ -708,6 +780,7 @@ class ReturnOrderProcessSerializer(serializers.Serializer):
         child=serializers.DictField(),
         help_text="List of return line items to issue out of stock",
     )
+    structural_location_id = serializers.UUIDField(required=False, allow_null=True)
     notes = serializers.CharField(required=False, allow_blank=True)
 
     def validate_return_items(self, value):

@@ -58,6 +58,10 @@ from subapps.services.inventory_read_model import (
     get_location_stock_summary,
     get_profile_stock_analytics,
 )
+from subapps.services.location_scope import (
+    get_location_scope_ids_for_locations,
+    resolve_structural_locations,
+)
 from subapps.utils.request_context import coerce_identity_id, scope_queryset_by_identity
 import uuid
 from mainapps.inventory import payloads as inventory_payloads
@@ -411,6 +415,46 @@ def _stock_location_queryset(*, principal: InventoryMcpPrincipal) -> QuerySet[St
     )
 
 
+def _resolve_structural_scope_locations_sync(
+    *,
+    principal: InventoryMcpPrincipal,
+    structural_location_id: str | None,
+) -> list[StockLocation]:
+    normalized_id = str(structural_location_id or "").strip()
+    if not normalized_id:
+        return []
+
+    location = _stock_location_queryset(principal=principal).filter(id=normalized_id).first()
+    if location is None:
+        raise ValueError("Structural location not found.")
+
+    resolved_locations = resolve_structural_locations(
+        profile_id=principal.profile_id,
+        stock_locations=[location],
+    )
+    if not resolved_locations:
+        raise ValueError("Structural location not found.")
+    return resolved_locations
+
+
+def _resolve_scoped_leaf_location_ids_sync(
+    *,
+    principal: InventoryMcpPrincipal,
+    structural_location_id: str | None,
+) -> list[uuid.UUID] | None:
+    scoped_locations = _resolve_structural_scope_locations_sync(
+        principal=principal,
+        structural_location_id=structural_location_id,
+    )
+    if not scoped_locations:
+        return None
+    scoped_ids = get_location_scope_ids_for_locations(
+        profile_id=principal.profile_id,
+        stock_locations=scoped_locations,
+    )
+    return scoped_ids or None
+
+
 def _stock_location_type_queryset() -> QuerySet[StockLocationType]:
     return StockLocationType.objects.order_by("name", "id")
 
@@ -478,17 +522,27 @@ def _stock_movement_queryset(*, principal: InventoryMcpPrincipal) -> QuerySet[St
 def _list_inventory_items_sync(
     *,
     principal: InventoryMcpPrincipal,
+    structural_location_id: str | None = None,
 ) -> dict[str, Any]:
     close_old_connections()
     try:
         queryset = _inventory_item_queryset(principal=principal)
         items = list(queryset)
+        scoped_locations = _resolve_structural_scope_locations_sync(
+            principal=principal,
+            structural_location_id=structural_location_id,
+        )
+        summary_map = (
+            get_inventory_item_summary_map(items, stock_locations=scoped_locations)
+            if items
+            else {}
+        )
         return {
             "profile_id": principal.profile_id,
             "company_code": principal.company_code,
             "count": len(items),
             "results": [
-                _inventory_item_payload(item)
+                _inventory_item_payload(item, summary=summary_map.get(item.id, {}))
                 for item in items
             ],
         }
@@ -504,6 +558,7 @@ def _search_inventory_items_sync(
     inventory_type: str | None,
     status: str | None,
     inventory_item_id: str | None,
+    structural_location_id: str | None = None,
 ) -> dict[str, Any]:
     close_old_connections()
     try:
@@ -525,9 +580,13 @@ def _search_inventory_items_sync(
             )
 
         items = list(queryset[:limit])
+        scoped_locations = _resolve_structural_scope_locations_sync(
+            principal=principal,
+            structural_location_id=structural_location_id,
+        )
         summary_map = (
-            get_inventory_item_summary_map(items)
-            if items and (search_term or inventory_item_id)
+            get_inventory_item_summary_map(items, stock_locations=scoped_locations)
+            if items and (search_term or inventory_item_id or scoped_locations)
             else {}
         )
         return {
@@ -549,30 +608,52 @@ def _get_inventory_item_details_sync(
     principal: InventoryMcpPrincipal,
     inventory_item_id: str,
     history_limit: int,
+    structural_location_id: str | None = None,
 ) -> dict[str, Any]:
     close_old_connections()
     try:
         inventory_item = _inventory_item_queryset(principal=principal).filter(id=inventory_item_id).first()
         if inventory_item is None:
             raise ValueError("Inventory item not found.")
-        summary = get_inventory_item_summary_map([inventory_item]).get(inventory_item.id, {})
-        balances = list(
-            _stock_balance_queryset(principal=principal).filter(
-                inventory_item_id=inventory_item.id,
-            )[:history_limit]
+        scoped_locations = _resolve_structural_scope_locations_sync(
+            principal=principal,
+            structural_location_id=structural_location_id,
         )
+        scoped_leaf_location_ids = _resolve_scoped_leaf_location_ids_sync(
+            principal=principal,
+            structural_location_id=structural_location_id,
+        )
+        summary = get_inventory_item_summary_map(
+            [inventory_item],
+            stock_locations=scoped_locations,
+        ).get(inventory_item.id, {})
+        balances_queryset = _stock_balance_queryset(principal=principal).filter(
+            inventory_item_id=inventory_item.id,
+        )
+        serials_queryset = _stock_serial_queryset(principal=principal).filter(
+            inventory_item_id=inventory_item.id,
+        )
+        reservations_queryset = _stock_reservation_queryset(principal=principal).filter(
+            inventory_item_id=inventory_item.id,
+        )
+        movements_queryset = _stock_movement_queryset(principal=principal).filter(
+            inventory_item_id=inventory_item.id,
+        )
+        if scoped_leaf_location_ids is not None:
+            balances_queryset = balances_queryset.filter(stock_location_id__in=scoped_leaf_location_ids)
+            serials_queryset = serials_queryset.filter(stock_location_id__in=scoped_leaf_location_ids)
+            reservations_queryset = reservations_queryset.filter(stock_location_id__in=scoped_leaf_location_ids)
+            movements_queryset = movements_queryset.filter(
+                Q(from_location_id__in=scoped_leaf_location_ids)
+                | Q(to_location_id__in=scoped_leaf_location_ids)
+            )
+        balances = list(balances_queryset[:history_limit])
         lots = list(
             _stock_lot_queryset(principal=principal).filter(inventory_item_id=inventory_item.id)[:history_limit]
         )
-        serials = list(
-            _stock_serial_queryset(principal=principal).filter(inventory_item_id=inventory_item.id)[:history_limit]
-        )
-        reservations = list(
-            _stock_reservation_queryset(principal=principal).filter(inventory_item_id=inventory_item.id)[:history_limit]
-        )
-        movements = list(
-            _stock_movement_queryset(principal=principal).filter(inventory_item_id=inventory_item.id)[:history_limit]
-        )
+        serials = list(serials_queryset[:history_limit])
+        reservations = list(reservations_queryset[:history_limit])
+        movements = list(movements_queryset[:history_limit])
         return {
             "profile_id": principal.profile_id,
             "inventory_item": _inventory_item_payload(inventory_item, summary=summary),
@@ -1259,13 +1340,22 @@ def _get_inventory_alerts_sync(
     principal: InventoryMcpPrincipal,
     limit: int,
     expiring_days: int,
+    structural_location_id: str | None = None,
 ) -> dict[str, Any]:
     close_old_connections()
     try:
         inventories = list(
             _inventory_queryset(principal=principal).exclude(status__in=["archived", "discontinued"])
         )
-        summary_map = get_inventory_item_summary_map(inventories, expiring_days=expiring_days)
+        scoped_locations = _resolve_structural_scope_locations_sync(
+            principal=principal,
+            structural_location_id=structural_location_id,
+        )
+        summary_map = get_inventory_item_summary_map(
+            inventories,
+            stock_locations=scoped_locations,
+            expiring_days=expiring_days,
+        )
         low_stock = []
         needs_reorder = []
         out_of_stock = []
@@ -1274,12 +1364,14 @@ def _get_inventory_alerts_sync(
         for inventory in inventories:
             summary = summary_map.get(inventory.id, {})
             current_stock = Decimal(summary.get("quantity", Decimal("0")))
+            minimum_stock_level = Decimal(str(inventory.minimum_stock_level or 0))
+            reorder_point = Decimal(str(inventory.reorder_point or 0))
             payload = _inventory_item_payload(inventory, summary=summary)
             if current_stock <= 0:
                 out_of_stock.append(payload)
-            elif current_stock <= Decimal(inventory.minimum_stock_level):
+            elif minimum_stock_level > 0 and current_stock <= minimum_stock_level:
                 low_stock.append(payload)
-            elif current_stock <= Decimal(inventory.reorder_point):
+            elif reorder_point > 0 and current_stock <= reorder_point:
                 needs_reorder.append(payload)
             days_to_expiry = summary.get("days_to_expiry")
             if days_to_expiry is not None and 0 <= int(days_to_expiry) <= expiring_days:
@@ -1575,6 +1667,7 @@ def _search_stock_balances_sync(
     limit: int,
     inventory_item_id: str | None,
     location_id: str | None,
+    structural_location_id: str | None = None,
 ) -> dict[str, Any]:
     queryset = _stock_balance_queryset(principal=principal).filter(
         Q(quantity_on_hand__gt=0) | Q(quantity_reserved__gt=0)
@@ -1583,6 +1676,12 @@ def _search_stock_balances_sync(
         queryset = queryset.filter(inventory_item_id=inventory_item_id)
     if location_id:
         queryset = queryset.filter(stock_location_id=location_id)
+    scoped_leaf_location_ids = _resolve_scoped_leaf_location_ids_sync(
+        principal=principal,
+        structural_location_id=structural_location_id,
+    )
+    if scoped_leaf_location_ids is not None:
+        queryset = queryset.filter(stock_location_id__in=scoped_leaf_location_ids)
 
     search_term = str(query or "").strip()
     if search_term:
@@ -1642,8 +1741,19 @@ def _search_stock_movements_sync(
     }
 
 
-def _get_stock_analytics_sync(*, principal: InventoryMcpPrincipal) -> dict[str, Any]:
-    analytics = get_profile_stock_analytics(profile_id=principal.profile_id)
+def _get_stock_analytics_sync(
+    *,
+    principal: InventoryMcpPrincipal,
+    structural_location_id: str | None = None,
+) -> dict[str, Any]:
+    scoped_locations = _resolve_structural_scope_locations_sync(
+        principal=principal,
+        structural_location_id=structural_location_id,
+    )
+    analytics = get_profile_stock_analytics(
+        profile_id=principal.profile_id,
+        stock_locations=scoped_locations,
+    )
     return {
         "profile_id": principal.profile_id,
         "company_code": principal.company_code,
@@ -2039,10 +2149,13 @@ def _adjust_inventory_item_stock_via_view_sync(
     if isinstance(adjustments, list) and adjustments:
         first_adjustment = adjustments[0] if isinstance(adjustments[0], dict) else {}
         stock_location_id = first_adjustment.get("stock_location_id")
+        structural_location_id = first_adjustment.get("structural_location_id")
         quantity = first_adjustment.get("quantity")
         adjustment_type = str(first_adjustment.get("adjustment_type") or "").strip().lower()
         if stock_location_id and "location_id" not in request_data:
             request_data["location_id"] = stock_location_id
+        if structural_location_id and "structural_location_id" not in request_data:
+            request_data["structural_location_id"] = structural_location_id
         if quantity not in (None, "") and "quantity_change" not in request_data:
             quantity_change = Decimal(str(quantity))
             if adjustment_type == "remove" and quantity_change > 0:
@@ -2084,6 +2197,8 @@ def _transfer_stock_via_view_sync(
         ):
             if first_transfer.get(source_key) not in (None, "") and target_key not in request_data:
                 request_data[target_key] = first_transfer.get(source_key)
+        if first_transfer.get("structural_location_id") not in (None, "") and "structural_location_id" not in request_data:
+            request_data["structural_location_id"] = first_transfer.get("structural_location_id")
     payload = _invoke_view_action_sync(
         principal=principal,
         viewset_cls=StockLocationViewSet,
@@ -2408,10 +2523,13 @@ mcp = FastMCP(
     name="list_inventory_items",
     description="Retrieve all inventory items for the authenticated workspace.",
 )
-async def list_inventory_items() -> inventory_payloads.InventoryItemCollectionResponsePayload:
+async def list_inventory_items(
+    structural_location_id: str | None = None,
+) -> inventory_payloads.InventoryItemCollectionResponsePayload:
     principal = get_current_principal(required=True)
     return await sync_to_async(_list_inventory_items_sync, thread_sensitive=True)(
         principal=principal,
+        structural_location_id=str(structural_location_id).strip() if structural_location_id else None,
     )
 @mcp.tool(
     name="search_inventory_items",
@@ -2423,6 +2541,7 @@ async def search_inventory_items(
     inventory_type: str | None = None,
     status: str | None = None,
     inventory_item_id: str | None = None,
+    structural_location_id: str | None = None,
 ) -> inventory_payloads.InventoryItemCollectionResponsePayload:
     principal = get_current_principal(required=True)
     limit_value = max(1, min(int(limit), 25))
@@ -2433,6 +2552,7 @@ async def search_inventory_items(
         inventory_type=inventory_type,
         status=status,
         inventory_item_id=str(inventory_item_id).strip() if inventory_item_id else None,
+        structural_location_id=str(structural_location_id).strip() if structural_location_id else None,
     )
 
 
@@ -2443,6 +2563,7 @@ async def search_inventory_items(
 async def get_inventory_item_details(
     inventory_item_id: str,
     history_limit: int = 10,
+    structural_location_id: str | None = None,
 ) -> stock_payloads.InventoryItemDetailResponsePayload:
     principal = get_current_principal(required=True)
     target_item_id = str(inventory_item_id or "").strip()
@@ -2453,6 +2574,7 @@ async def get_inventory_item_details(
         principal=principal,
         inventory_item_id=target_item_id,
         history_limit=limit_value,
+        structural_location_id=str(structural_location_id).strip() if structural_location_id else None,
     )
 
 
@@ -2463,6 +2585,7 @@ async def get_inventory_item_details(
 async def get_inventory_alerts(
     limit: int = 10,
     expiring_days: int = 30,
+    structural_location_id: str | None = None,
 ) -> inventory_payloads.InventoryAlertsResponsePayload:
     principal = get_current_principal(required=True)
     limit_value = max(1, min(int(limit), 25))
@@ -2471,6 +2594,7 @@ async def get_inventory_alerts(
         principal=principal,
         limit=limit_value,
         expiring_days=day_window,
+        structural_location_id=str(structural_location_id).strip() if structural_location_id else None,
     )
 
 
@@ -2621,6 +2745,7 @@ async def search_stock_balances(
     limit: int = 10,
     inventory_item_id: str | None = None,
     location_id: str | None = None,
+    structural_location_id: str | None = None,
 ) -> stock_payloads.StockBalanceCollectionResponsePayload:
     principal = get_current_principal(required=True)
     limit_value = max(1, min(int(limit), 25))
@@ -2630,6 +2755,7 @@ async def search_stock_balances(
         limit=limit_value,
         inventory_item_id=str(inventory_item_id).strip() if inventory_item_id else None,
         location_id=str(location_id).strip() if location_id else None,
+        structural_location_id=str(structural_location_id).strip() if structural_location_id else None,
     )
 
 
@@ -2660,9 +2786,14 @@ async def search_stock_movements(
     name="get_stock_analytics",
     description="Get workspace-level stock analytics across locations, value, and aging posture.",
 )
-async def get_stock_analytics() -> inventory_payloads.InventoryAnalyticsResponsePayload:
+async def get_stock_analytics(
+    structural_location_id: str | None = None,
+) -> inventory_payloads.InventoryAnalyticsResponsePayload:
     principal = get_current_principal(required=True)
-    return await sync_to_async(_get_stock_analytics_sync, thread_sensitive=True)(principal=principal)
+    return await sync_to_async(_get_stock_analytics_sync, thread_sensitive=True)(
+        principal=principal,
+        structural_location_id=str(structural_location_id).strip() if structural_location_id else None,
+    )
 
 
 @mcp.tool(

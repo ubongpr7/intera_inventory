@@ -5,6 +5,7 @@ from django.utils import timezone
 from django.utils.text import slugify
 from mainapps.company.models import Company
 from django.core.validators import MinValueValidator
+from django.core.exceptions import ValidationError
 from django.db import models
 from mptt.models import MPTTModel, TreeForeignKey
 from mainapps.content_type_linking_models.models import ProfileMixin, TenantStampedUUIDModel, _sync_identity_fields
@@ -98,6 +99,12 @@ class StockLocationType(models.Model):
         return self.name
 
 class StockLocation(ProfileMixin, MPTTModel):
+    is_default_structural_location = models.BooleanField(
+        default=False,
+        db_index=True,
+        verbose_name=_("Default structural location"),
+        help_text=_("Marks the structural location that should be used as the workspace default operational stock scope."),
+    )
     code = models.CharField(
         max_length=100,
         unique=True,
@@ -167,20 +174,32 @@ class StockLocation(ProfileMixin, MPTTModel):
     def save(self, *args, **kwargs):
         """Auto-generate location code on first save"""
         _sync_identity_fields(self, canonical_field='official_user_id', legacy_field='official')
+        _sync_identity_fields(self, canonical_field='profile_id', legacy_field='profile')
+        if self.is_default_structural_location and not self.structural:
+            raise ValidationError(_("Only structural stock locations can be marked as workspace defaults."))
+
         if self.parent and not self.physical_address:
             self.physical_address =self.parent.physical_address
 
-        if (self.profile_id is not None or self.profile) and not self.code:
+        if self.structural and not self.is_default_structural_location and self.profile_id is not None:
+            other_default_exists = StockLocation.objects.filter(
+                profile_id=self.profile_id,
+                structural=True,
+                is_default_structural_location=True,
+            ).exclude(pk=self.pk).exists()
+            if not other_default_exists:
+                self.is_default_structural_location = True
+
+        if self.profile_id is not None and not self.code:
             if self.location_type and self.location_type.name:
                 base = self.location_type.name.upper().replace(' ', '_')
             else:
                 normalized_name = slugify(self.name or "", allow_unicode=False).replace("-", "_").upper()
                 base = normalized_name[:24] if normalized_name else "LOCATION"
-            profile_id = self.profile_id if self.profile_id is not None else self.profile
 
             last_code = StockLocation.objects.filter(
-                models.Q(profile_id=profile_id) | models.Q(profile=str(profile_id)),
-                code__startswith=f"{base}_{profile_id}_"
+                profile_id=self.profile_id,
+                code__startswith=f"{base}_{self.profile_id}_"
             ).order_by('-code').values_list('code', flat=True).first()
 
             sequence = 1
@@ -190,9 +209,44 @@ class StockLocation(ProfileMixin, MPTTModel):
                 except (ValueError, IndexError):
                     pass
 
-            self.code = f"{base}_{profile_id}_{sequence:03d}"
+            self.code = f"{base}_{self.profile_id}_{sequence:03d}"
 
         super().save(*args, **kwargs)
+        if self.profile_id is not None:
+            normalized_default = ensure_single_default_structural_location(
+                profile_id=self.profile_id,
+                preferred_location_id=self.id if self.structural and self.is_default_structural_location else None,
+            )
+            self.is_default_structural_location = bool(
+                normalized_default is not None and normalized_default.id == self.id
+            )
+
+
+def ensure_single_default_structural_location(*, profile_id, preferred_location_id=None):
+    if profile_id in (None, ""):
+        return None
+
+    queryset = StockLocation.objects.filter(profile_id=profile_id, structural=True)
+    preferred = None
+    if preferred_location_id is not None:
+        preferred = queryset.filter(id=preferred_location_id).first()
+
+    current_defaults = queryset.filter(is_default_structural_location=True).order_by("created_at", "id")
+    selected = (
+        preferred
+        or current_defaults.first()
+        or queryset.filter(parent__isnull=True).order_by("created_at", "id").first()
+        or queryset.order_by("created_at", "id").first()
+    )
+
+    if selected is None:
+        return None
+
+    queryset.exclude(id=selected.id).filter(is_default_structural_location=True).update(is_default_structural_location=False)
+    if not selected.is_default_structural_location:
+        queryset.filter(id=selected.id).update(is_default_structural_location=True)
+        selected.is_default_structural_location = True
+    return selected
 
 class StockLot(TenantStampedUUIDModel):
     inventory_item = models.ForeignKey(

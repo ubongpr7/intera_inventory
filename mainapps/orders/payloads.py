@@ -132,6 +132,7 @@ class GoodsReceiptLineCreateUpdatePayload(BaseModel):
     purchase_order_line_id: Optional[uuid.UUID] = Field(None, description="UUID of PurchaseOrderLineItem (if applicable)")
     inventory_item_id: uuid.UUID = Field(..., description="UUID of InventoryItem received")
     stock_location_id: uuid.UUID = Field(..., description="UUID of StockLocation where goods are placed")
+    structural_location_id: Optional[uuid.UUID] = Field(None, description="UUID of structural StockLocation scope for this receipt line")
     received_quantity: Decimal = Field(..., gt=0, description="Quantity received")
     unit_cost: Decimal = Field(..., ge=0, description="Unit cost")
     lot_number: Optional[str] = Field(None, max_length=100, description="Lot number")
@@ -216,6 +217,7 @@ class SalesOrderShipmentLineCreateUpdatePayload(BaseModel):
     shipment_id: uuid.UUID = Field(..., description="UUID of SalesOrderShipment")
     sales_order_line_id: uuid.UUID = Field(..., description="UUID of SalesOrderLineItem")
     stock_location_id: uuid.UUID = Field(..., description="UUID of StockLocation from which stock is taken")
+    structural_location_id: Optional[uuid.UUID] = Field(None, description="UUID of structural StockLocation scope for this shipment line")
     stock_lot_id: Optional[uuid.UUID] = Field(None, description="UUID of StockLot (if lot-tracked)")
     stock_serial_id: Optional[uuid.UUID] = Field(None, description="UUID of StockSerial (if serial-tracked)")
     reservation_id: Optional[uuid.UUID] = Field(None, description="UUID of StockReservation")
@@ -588,6 +590,10 @@ class PurchaseOrderAdminResponsePayload(McpPayloadModel):
 class OrderActionPayload(McpPayloadModel):
     notes: Optional[str] = Field(None, description="Operator notes")
     reason: Optional[str] = Field(None, description="Business reason")
+    structural_location_id: Optional[uuid.UUID] = Field(
+        None,
+        description="Structural stock-location scope for location-bound order actions",
+    )
     metadata: Dict[str, Any] = Field(default_factory=dict, description="Additional action metadata")
 
 
@@ -605,6 +611,10 @@ class PurchaseOrderReceiveItemPayload(McpPayloadModel):
 
 class PurchaseOrderReceiveItemsPayload(McpPayloadModel):
     items: List[PurchaseOrderReceiveItemPayload] = Field(default_factory=list, description="Items to receive")
+    structural_location_id: Optional[uuid.UUID] = Field(
+        None,
+        description="Structural stock-location scope for the receipt action",
+    )
     notes: Optional[str] = Field(None, description="Receipt notes")
 
 

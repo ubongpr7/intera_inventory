@@ -70,6 +70,7 @@ def publish_event(
     event_id: str | None = None,
     event_version: int = 1,
     use_outbox: bool | None = None,
+    envelope_overrides: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     kafka_settings = get_kafka_settings()
     envelope = {
@@ -80,6 +81,8 @@ def publish_event(
         "source_service": kafka_settings.service_name,
         "payload": payload,
     }
+    if envelope_overrides:
+        envelope.update(envelope_overrides)
     should_use_outbox = kafka_settings.use_outbox if use_outbox is None else use_outbox
     if should_use_outbox:
         from subapps.kafka.reliability import enqueue_outbox_event

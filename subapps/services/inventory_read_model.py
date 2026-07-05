@@ -9,6 +9,11 @@ from django.utils import timezone
 
 from mainapps.inventory.models import InventoryItem
 from mainapps.stock.models import StockBalance, StockMovement, StockSerial
+from subapps.services.location_scope import (
+    get_location_scope_ids,
+    resolve_structural_location,
+    resolve_structural_locations,
+)
 
 
 def _to_decimal(value) -> Decimal:
@@ -56,13 +61,15 @@ def _empty_inventory_item_summary(inventory_item: InventoryItem):
         "days_to_expiry": None,
         "location_id": None,
         "location_name": "",
+        "structural_location_id": None,
+        "structural_location_name": "",
         "location_count": 0,
         "location_breakdown": [],
         "serial_count": 0,
         "lot_count": 0,
         "last_movement_at": None,
         "has_balances": False,
-        "_location_quantities": defaultdict(Decimal),
+        "_location_quantities": {},
         "_location_ids": set(),
         "_unit_costs": [],
     }
@@ -72,16 +79,37 @@ def _finalize_inventory_item_summary(inventory_item: InventoryItem, summary: dic
     summary["location_count"] = len(summary.pop("_location_ids"))
     location_quantities = summary.pop("_location_quantities")
     ordered_locations = sorted(
-        location_quantities.items(),
-        key=lambda item: item[1],
+        location_quantities.values(),
+        key=lambda item: item["quantity"],
         reverse=True,
     )
-    summary["location_breakdown"] = [
-        {"location_name": location_name, "quantity": quantity}
-        for location_name, quantity in ordered_locations
-    ]
+    summary["location_breakdown"] = []
+    for entry in ordered_locations:
+        leaf_locations = sorted(
+            entry.pop("_leaf_locations").values(),
+            key=lambda leaf: leaf["quantity"],
+            reverse=True,
+        )
+        summary["location_breakdown"].append(
+            {
+                "structural_location_id": entry["structural_location_id"],
+                "structural_location_name": entry["structural_location_name"],
+                "location_id": entry["structural_location_id"],
+                "location_name": entry["structural_location_name"],
+                "quantity": entry["quantity"],
+                "total_quantity": entry["quantity"],
+                "quantity_reserved": entry["quantity_reserved"],
+                "quantity_available": entry["quantity_available"],
+                "total_value": entry["total_value"],
+                "leaf_location_count": len(leaf_locations),
+                "leaf_locations": leaf_locations,
+            }
+        )
     if ordered_locations:
-        summary["location_name"] = ordered_locations[0][0]
+        summary["location_id"] = ordered_locations[0]["structural_location_id"]
+        summary["location_name"] = ordered_locations[0]["structural_location_name"]
+        summary["structural_location_id"] = ordered_locations[0]["structural_location_id"]
+        summary["structural_location_name"] = ordered_locations[0]["structural_location_name"]
     unit_costs = summary.pop("_unit_costs")
     if unit_costs:
         average_cost = sum(unit_costs, Decimal("0")) / Decimal(len(unit_costs))
@@ -96,7 +124,55 @@ def _finalize_inventory_item_summary(inventory_item: InventoryItem, summary: dic
     return summary
 
 
-def get_inventory_item_summary_map(inventory_items, *, stock_location=None, expiring_days: int = 30):
+def _resolve_balance_location_entry(balance, *, structural_location_cache: dict):
+    structural_location = None
+    if balance.stock_location_id:
+        structural_location = structural_location_cache.get(balance.stock_location_id)
+        if structural_location is None:
+            structural_location = resolve_structural_location(
+                profile_id=balance.profile_id,
+                stock_location=balance.stock_location,
+            )
+            structural_location_cache[balance.stock_location_id] = structural_location
+
+    if structural_location is not None:
+        return {
+            "structural_location_id": structural_location.id,
+            "structural_location_name": getattr(structural_location, "name", "Unknown Structural Location"),
+            "leaf_location_id": balance.stock_location_id,
+            "leaf_location_name": getattr(balance.stock_location, "name", "Unknown Location"),
+        }
+
+    location_name = getattr(balance.stock_location, "name", "Unknown Location")
+    return {
+        "structural_location_id": balance.stock_location_id,
+        "structural_location_name": location_name,
+        "leaf_location_id": balance.stock_location_id,
+        "leaf_location_name": location_name,
+    }
+
+
+def _resolve_structural_scope_ids(*, profile_id, stock_location=None, stock_locations=None):
+    resolved_locations = resolve_structural_locations(
+        profile_id=profile_id,
+        stock_locations=[location for location in [stock_location] if location is not None] + list(stock_locations or []),
+    )
+    if not resolved_locations:
+        return None
+
+    scope_ids: set = set()
+    for location in resolved_locations:
+        scope_ids.update(
+            get_location_scope_ids(
+                profile_id=profile_id,
+                stock_location=location,
+            )
+            or [location.id]
+        )
+    return list(scope_ids)
+
+
+def get_inventory_item_summary_map(inventory_items, *, stock_location=None, stock_locations=None, expiring_days: int = 30):
     inventory_item_list = list(inventory_items)
     if not inventory_item_list:
         return {}
@@ -114,8 +190,27 @@ def get_inventory_item_summary_map(inventory_items, *, stock_location=None, expi
         .select_related("stock_location", "stock_lot")
         .order_by("created_at")
     )
-    if stock_location is not None:
-        balances = balances.filter(stock_location=stock_location)
+    profile_id = next(
+        (
+            inventory_item.profile_id
+            for inventory_item in inventory_item_list
+            if getattr(inventory_item, "profile_id", None) is not None
+        ),
+        None,
+    )
+    scoped_location_ids = (
+        _resolve_structural_scope_ids(
+            profile_id=profile_id,
+            stock_location=stock_location,
+            stock_locations=stock_locations,
+        )
+        if profile_id is not None and (stock_location is not None or stock_locations)
+        else None
+    )
+    if scoped_location_ids is not None:
+        balances = balances.filter(stock_location_id__in=scoped_location_ids)
+
+    structural_location_cache: dict = {}
 
     for balance in balances:
         summary = summaries.get(balance.inventory_item_id)
@@ -125,6 +220,8 @@ def get_inventory_item_summary_map(inventory_items, *, stock_location=None, expi
         quantity_on_hand = _to_decimal(balance.quantity_on_hand)
         quantity_reserved = _to_decimal(balance.quantity_reserved)
         quantity_available = _to_decimal(balance.quantity_available)
+        aggregate = None
+        leaf_aggregate = None
 
         summary["has_balances"] = True
         summary["quantity"] += quantity_on_hand
@@ -132,15 +229,56 @@ def get_inventory_item_summary_map(inventory_items, *, stock_location=None, expi
         summary["quantity_available"] += quantity_available
 
         if balance.stock_location_id:
-            summary["_location_ids"].add(balance.stock_location_id)
-            location_name = getattr(balance.stock_location, "name", "Unknown Location")
-            summary["_location_quantities"][location_name] += quantity_on_hand
+            location_entry = _resolve_balance_location_entry(
+                balance,
+                structural_location_cache=structural_location_cache,
+            )
+            structural_location_id = location_entry["structural_location_id"]
+            leaf_location_id = location_entry["leaf_location_id"]
+            summary["_location_ids"].add(structural_location_id)
+            aggregate = summary["_location_quantities"].setdefault(
+                structural_location_id,
+                {
+                    "structural_location_id": structural_location_id,
+                    "structural_location_name": location_entry["structural_location_name"],
+                    "quantity": Decimal("0"),
+                    "quantity_reserved": Decimal("0"),
+                    "quantity_available": Decimal("0"),
+                    "total_value": Decimal("0"),
+                    "_leaf_locations": {},
+                },
+            )
+            aggregate["quantity"] += quantity_on_hand
+            aggregate["quantity_reserved"] += quantity_reserved
+            aggregate["quantity_available"] += quantity_available
+            leaf_aggregate = aggregate["_leaf_locations"].setdefault(
+                leaf_location_id,
+                {
+                    "stock_location_id": leaf_location_id,
+                    "stock_location_name": location_entry["leaf_location_name"],
+                    "quantity": Decimal("0"),
+                    "total_quantity": Decimal("0"),
+                    "quantity_reserved": Decimal("0"),
+                    "quantity_available": Decimal("0"),
+                    "total_value": Decimal("0"),
+                },
+            )
+            leaf_aggregate["quantity"] += quantity_on_hand
+            leaf_aggregate["total_quantity"] += quantity_on_hand
+            leaf_aggregate["quantity_reserved"] += quantity_reserved
+            leaf_aggregate["quantity_available"] += quantity_available
             if summary["location_id"] is None and quantity_on_hand > 0:
-                summary["location_id"] = balance.stock_location_id
+                summary["location_id"] = structural_location_id
+                summary["location_name"] = location_entry["structural_location_name"]
+                summary["structural_location_id"] = structural_location_id
+                summary["structural_location_name"] = location_entry["structural_location_name"]
 
         if balance.stock_lot_id:
             unit_cost = _to_decimal(balance.stock_lot.unit_cost)
             summary["total_stock_value"] += quantity_on_hand * unit_cost
+            if aggregate is not None and leaf_aggregate is not None:
+                aggregate["total_value"] += quantity_on_hand * unit_cost
+                leaf_aggregate["total_value"] += quantity_on_hand * unit_cost
             if quantity_on_hand > 0:
                 summary["_unit_costs"].append(unit_cost)
             if quantity_on_hand > 0:
@@ -179,15 +317,21 @@ def get_inventory_item_summary_map(inventory_items, *, stock_location=None, expi
     return summaries
 
 
-def get_inventory_ids_for_stock_filter(inventories, *, filter_name: str):
-    summary_map = get_inventory_item_summary_map(inventories)
+def get_inventory_ids_for_stock_filter(inventories, *, filter_name: str, stock_location=None, stock_locations=None):
+    summary_map = get_inventory_item_summary_map(
+        inventories,
+        stock_location=stock_location,
+        stock_locations=stock_locations,
+    )
     inventory_ids = []
     for inventory in inventories:
         summary = summary_map.get(inventory.id, {})
         current_stock = _to_decimal(summary.get("quantity"))
-        if filter_name == "low_stock" and current_stock <= _to_decimal(inventory.minimum_stock_level):
+        minimum_stock_level = _to_decimal(inventory.minimum_stock_level)
+        reorder_point = _to_decimal(inventory.reorder_point)
+        if filter_name == "low_stock" and minimum_stock_level > 0 and 0 < current_stock <= minimum_stock_level:
             inventory_ids.append(inventory.id)
-        elif filter_name == "needs_reorder" and current_stock <= _to_decimal(inventory.reorder_point):
+        elif filter_name == "needs_reorder" and reorder_point > 0 and current_stock <= reorder_point:
             inventory_ids.append(inventory.id)
         elif filter_name == "out_of_stock" and current_stock <= 0:
             inventory_ids.append(inventory.id)
@@ -197,10 +341,18 @@ def get_inventory_ids_for_stock_filter(inventories, *, filter_name: str):
 def get_location_stock_summary(location, *, expiring_days: int = 30):
     today = timezone.now().date()
     cutoff_date = today + timedelta(days=expiring_days)
-    balances = location.stock_balances.select_related(
-        "inventory_item",
-        "stock_lot",
-    ).filter(quantity_on_hand__gt=0)
+    scope_ids = get_location_scope_ids(
+        profile_id=location.profile_id,
+        stock_location=location,
+    )
+    balances = (
+        StockBalance.objects.filter(
+            profile_id=location.profile_id,
+            stock_location_id__in=scope_ids or [location.id],
+            quantity_on_hand__gt=0,
+        )
+        .select_related("inventory_item", "stock_lot")
+    )
 
     total_items = 0
     total_quantity = Decimal("0")
@@ -234,24 +386,32 @@ def get_location_stock_summary(location, *, expiring_days: int = 30):
     }
 
 
-def get_profile_stock_analytics(*, profile_id: int):
+def get_profile_stock_analytics(*, profile_id: int, stock_location=None, stock_locations=None):
     today = timezone.now().date()
     balances = StockBalance.objects.filter(profile_id=profile_id).select_related(
         "stock_location",
         "stock_lot",
         "inventory_item",
     )
+    scoped_location_ids = _resolve_structural_scope_ids(
+        profile_id=profile_id,
+        stock_location=stock_location,
+        stock_locations=stock_locations,
+    ) if stock_location is not None or stock_locations else None
+    if scoped_location_ids is not None:
+        balances = balances.filter(stock_location_id__in=scoped_location_ids)
 
     total_inventory_items = set()
     total_locations = set()
     total_stock_value = Decimal("0")
-    location_distribution = defaultdict(lambda: {"item_count": 0, "total_quantity": Decimal("0"), "total_value": Decimal("0")})
+    location_distribution = {}
     aging_analysis = {
         "0-30_days": 0,
         "31-90_days": 0,
         "91-365_days": 0,
         "over_1_year": 0,
     }
+    structural_location_cache: dict = {}
 
     for balance in balances:
         quantity_on_hand = _to_decimal(balance.quantity_on_hand)
@@ -260,12 +420,26 @@ def get_profile_stock_analytics(*, profile_id: int):
 
         total_inventory_items.add(balance.inventory_item_id)
         if balance.stock_location_id:
-            total_locations.add(balance.stock_location_id)
-            location_name = getattr(balance.stock_location, "name", "Unknown Location")
-            location_distribution[location_name]["item_count"] += 1
-            location_distribution[location_name]["total_quantity"] += quantity_on_hand
+            location_entry = _resolve_balance_location_entry(
+                balance,
+                structural_location_cache=structural_location_cache,
+            )
+            structural_location_id = location_entry["structural_location_id"]
+            total_locations.add(structural_location_id)
+            aggregate = location_distribution.setdefault(
+                structural_location_id,
+                {
+                    "structural_location_id": structural_location_id,
+                    "location_name": location_entry["structural_location_name"],
+                    "item_count": 0,
+                    "total_quantity": Decimal("0"),
+                    "total_value": Decimal("0"),
+                },
+            )
+            aggregate["item_count"] += 1
+            aggregate["total_quantity"] += quantity_on_hand
             if balance.stock_lot_id:
-                location_distribution[location_name]["total_value"] += quantity_on_hand * _to_decimal(balance.stock_lot.unit_cost)
+                aggregate["total_value"] += quantity_on_hand * _to_decimal(balance.stock_lot.unit_cost)
 
         if balance.stock_lot_id:
             total_stock_value += quantity_on_hand * _to_decimal(balance.stock_lot.unit_cost)
@@ -287,29 +461,37 @@ def get_profile_stock_analytics(*, profile_id: int):
         "total_stock_value": total_stock_value,
         "location_distribution": [
             {
-                "location_name": location_name,
+                "structural_location_id": values["structural_location_id"],
+                "location_name": values["location_name"],
                 "item_count": values["item_count"],
                 "total_quantity": values["total_quantity"],
                 "total_value": values["total_value"],
             }
-            for location_name, values in sorted(
-                location_distribution.items(),
-                key=lambda item: item[1]["total_quantity"],
-                reverse=True,
+            for values in (
+                item[1]
+                for item in sorted(
+                    location_distribution.items(),
+                    key=lambda item: item[1]["total_quantity"],
+                    reverse=True,
+                )
             )
         ],
         "aging_analysis": aging_analysis,
     }
 
 
-def get_low_stock_rows(inventories):
-    summary_map = get_inventory_item_summary_map(inventories)
+def get_low_stock_rows(inventories, *, stock_location=None, stock_locations=None):
+    summary_map = get_inventory_item_summary_map(
+        inventories,
+        stock_location=stock_location,
+        stock_locations=stock_locations,
+    )
     rows = []
     for inventory in inventories:
         summary = summary_map.get(inventory.id, {})
         current_stock = _to_decimal(summary.get("quantity"))
         minimum_stock_level = _to_decimal(inventory.minimum_stock_level)
-        if current_stock < minimum_stock_level:
+        if minimum_stock_level > 0 and 0 < current_stock <= minimum_stock_level:
             rows.append(
                 {
                     "id": inventory.id,

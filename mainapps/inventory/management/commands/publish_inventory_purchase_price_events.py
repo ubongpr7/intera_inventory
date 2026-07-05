@@ -21,11 +21,12 @@ class Command(BaseCommand):
         if goods_receipt_line_id:
             queryset = queryset.filter(id=goods_receipt_line_id)
 
+        goods_receipt_line_ids = list(queryset.values_list("id", flat=True))
         published_count = 0
         skipped_count = 0
 
-        for goods_receipt_line in queryset.iterator():
-            envelope = publish_inventory_purchase_price_recorded(goods_receipt_line_id=goods_receipt_line.id)
+        for goods_receipt_line_id in goods_receipt_line_ids:
+            envelope = publish_inventory_purchase_price_recorded(goods_receipt_line_id=goods_receipt_line_id)
             if envelope is None:
                 skipped_count += 1
                 continue

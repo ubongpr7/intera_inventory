@@ -70,16 +70,42 @@ class StockLocationListSerializer(serializers.ModelSerializer):
     location_type_name = serializers.CharField(source='location_type.name', read_only=True)
     stock_count = serializers.SerializerMethodField()
     parent_name=serializers.SerializerMethodField()
+    structural_location_id = serializers.SerializerMethodField()
+    structural_location_name = serializers.SerializerMethodField()
     
     class Meta:
         model = StockLocation
-        fields = ['id', 'name', 'code','parent_name','location_type_name', 'stock_count', 'structural', 'external','physical_address']
+        fields = [
+            'id',
+            'name',
+            'code',
+            'parent',
+            'parent_name',
+            'location_type_name',
+            'stock_count',
+            'structural',
+            'external',
+            'physical_address',
+            'is_default_structural_location',
+            'structural_location_id',
+            'structural_location_name',
+        ]
     
     def get_stock_count(self, obj):
         active_balance_count = obj.stock_balances.filter(quantity_on_hand__gt=0).values('inventory_item').distinct().count()
         return active_balance_count
     def get_parent_name(self, obj):
         return f'{obj.parent.name} - {obj.parent.code}' if obj.parent else ''
+    def _get_structural_location(self, obj):
+        if obj.structural:
+            return obj
+        return obj.get_ancestors(include_self=True).filter(structural=True).last()
+    def get_structural_location_id(self, obj):
+        structural_location = self._get_structural_location(obj)
+        return structural_location.id if structural_location else None
+    def get_structural_location_name(self, obj):
+        structural_location = self._get_structural_location(obj)
+        return structural_location.name if structural_location else None
 
 class StockLocationDetailSerializer(UserDetailMixin, serializers.ModelSerializer):
     """Detailed serializer for location CRUD operations"""
@@ -88,16 +114,43 @@ class StockLocationDetailSerializer(UserDetailMixin, serializers.ModelSerializer
     official_details = serializers.SerializerMethodField()
     stock_summary = serializers.SerializerMethodField()
     parent_name=serializers.SerializerMethodField()
+    structural_location_id = serializers.SerializerMethodField()
+    structural_location_name = serializers.SerializerMethodField()
     
     class Meta:
         model = StockLocation
         fields = '__all__'
         read_only_fields = ['code']
+
+    def validate(self, attrs):
+        structural = attrs.get('structural', getattr(self.instance, 'structural', False))
+        is_default = attrs.get(
+            'is_default_structural_location',
+            getattr(self.instance, 'is_default_structural_location', False),
+        )
+        if is_default and not structural:
+            raise serializers.ValidationError(
+                {'is_default_structural_location': 'Only structural stock locations can be the workspace default.'}
+            )
+        return attrs
     
     def get_official_details(self, obj):
         return self.get_user_details(self.resolve_user_reference(obj, 'official_user_id', 'official'))
     def get_parent_name(self, obj):
         return f'{obj.parent.name} - {obj.parent.code}' if obj.parent else ''
+
+    def _get_structural_location(self, obj):
+        if obj.structural:
+            return obj
+        return obj.get_ancestors(include_self=True).filter(structural=True).last()
+
+    def get_structural_location_id(self, obj):
+        structural_location = self._get_structural_location(obj)
+        return structural_location.id if structural_location else None
+
+    def get_structural_location_name(self, obj):
+        structural_location = self._get_structural_location(obj)
+        return structural_location.name if structural_location else None
     
     def get_stock_summary(self, obj):
         """Get stock summary for this location"""
@@ -165,6 +218,8 @@ class StockBalanceDetailSerializer(serializers.ModelSerializer):
     stock_location_name = serializers.CharField(source='stock_location.name', read_only=True)
     stock_lot_id = serializers.UUIDField(read_only=True, allow_null=True)
     lot_number = serializers.CharField(source='stock_lot.lot_number', read_only=True, allow_null=True)
+    structural_location_id = serializers.SerializerMethodField()
+    structural_location_name = serializers.SerializerMethodField()
 
     class Meta:
         model = StockBalance
@@ -174,12 +229,29 @@ class StockBalanceDetailSerializer(serializers.ModelSerializer):
             'inventory_item_name',
             'stock_location_id',
             'stock_location_name',
+            'structural_location_id',
+            'structural_location_name',
             'stock_lot_id',
             'lot_number',
             'quantity_on_hand',
             'quantity_reserved',
             'quantity_available',
         ]
+
+    def _get_structural_location(self, obj):
+        if not obj.stock_location_id:
+            return None
+        if obj.stock_location.structural:
+            return obj.stock_location
+        return obj.stock_location.get_ancestors(include_self=True).filter(structural=True).last()
+
+    def get_structural_location_id(self, obj):
+        structural_location = self._get_structural_location(obj)
+        return structural_location.id if structural_location else None
+
+    def get_structural_location_name(self, obj):
+        structural_location = self._get_structural_location(obj)
+        return structural_location.name if structural_location else None
 
 
 class StockLotDetailSerializer(serializers.ModelSerializer):
@@ -212,6 +284,8 @@ class StockSerialDetailSerializer(serializers.ModelSerializer):
     stock_location_name = serializers.CharField(source='stock_location.name', read_only=True, allow_null=True)
     stock_lot_id = serializers.UUIDField(read_only=True, allow_null=True)
     lot_number = serializers.CharField(source='stock_lot.lot_number', read_only=True, allow_null=True)
+    structural_location_id = serializers.SerializerMethodField()
+    structural_location_name = serializers.SerializerMethodField()
 
     class Meta:
         model = StockSerial
@@ -223,10 +297,27 @@ class StockSerialDetailSerializer(serializers.ModelSerializer):
             'status',
             'stock_location_id',
             'stock_location_name',
+            'structural_location_id',
+            'structural_location_name',
             'stock_lot_id',
             'lot_number',
             'created_at',
         ]
+
+    def _get_structural_location(self, obj):
+        if not obj.stock_location_id:
+            return None
+        if obj.stock_location.structural:
+            return obj.stock_location
+        return obj.stock_location.get_ancestors(include_self=True).filter(structural=True).last()
+
+    def get_structural_location_id(self, obj):
+        structural_location = self._get_structural_location(obj)
+        return structural_location.id if structural_location else None
+
+    def get_structural_location_name(self, obj):
+        structural_location = self._get_structural_location(obj)
+        return structural_location.name if structural_location else None
 
 
 class InventoryItemListSerializer(ProductImageMixin, InventoryItemSummaryMixin, serializers.ModelSerializer):
@@ -303,7 +394,9 @@ class InventoryItemDetailSerializer(ProductImageMixin, InventoryItemSummaryMixin
     quantity = serializers.SerializerMethodField()
     quantity_reserved = serializers.SerializerMethodField()
     quantity_available = serializers.SerializerMethodField()
-    status = serializers.SerializerMethodField()
+    stock_status = serializers.SerializerMethodField()
+    category_name = serializers.CharField(source='inventory_category.name', read_only=True)
+    default_supplier_name = serializers.CharField(source='default_supplier.name', read_only=True)
     location_name = serializers.SerializerMethodField()
     location_breakdown = serializers.SerializerMethodField()
     location_count = serializers.SerializerMethodField()
@@ -328,21 +421,29 @@ class InventoryItemDetailSerializer(ProductImageMixin, InventoryItemSummaryMixin
         fields = [
             'id',
             'name',
+            'name_snapshot',
             'description',
             'sku',
+            'sku_snapshot',
+            'barcode_snapshot',
             'product_variant',
             'product_template_id',
             'product_variant_id',
             'product_variant_image_url',
             'inventory_type',
             'inventory_category',
+            'category_name',
             'default_supplier',
+            'default_supplier_name',
+            'default_uom_code',
+            'stock_uom_code',
             'track_stock',
             'track_lot',
             'track_serial',
             'track_expiry',
             'allow_negative_stock',
             'status',
+            'stock_status',
             'quantity',
             'quantity_reserved',
             'quantity_available',
@@ -359,6 +460,7 @@ class InventoryItemDetailSerializer(ProductImageMixin, InventoryItemSummaryMixin
             'minimum_stock_level',
             'reorder_point',
             'reorder_quantity',
+            'safety_stock_level',
             'metadata',
             'display_image',
             'current_pricing',
@@ -374,7 +476,44 @@ class InventoryItemDetailSerializer(ProductImageMixin, InventoryItemSummaryMixin
             'created_at',
             'updated_at',
         ]
-        read_only_fields = fields
+        read_only_fields = [
+            'id',
+            'name',
+            'sku',
+            'product_variant',
+            'product_template_id',
+            'product_variant_id',
+            'product_variant_image_url',
+            'category_name',
+            'default_supplier_name',
+            'stock_status',
+            'quantity',
+            'quantity_reserved',
+            'quantity_available',
+            'location_name',
+            'location_breakdown',
+            'location_count',
+            'expiry_date',
+            'days_to_expiry',
+            'purchase_price',
+            'total_stock_value',
+            'lot_count',
+            'serial_count',
+            'inventory_name',
+            'display_image',
+            'current_pricing',
+            'balances',
+            'lots',
+            'serials',
+            'active_reservations',
+            'recent_movements',
+            'created_by_user_id',
+            'updated_by_user_id',
+            'created_by_details',
+            'updated_by_details',
+            'created_at',
+            'updated_at',
+        ]
 
     def get_sku(self, obj):
         return self._get_summary(obj).get('sku', obj.sku_snapshot or '')
@@ -395,7 +534,7 @@ class InventoryItemDetailSerializer(ProductImageMixin, InventoryItemSummaryMixin
     def get_quantity_available(self, obj):
         return self._get_summary(obj).get('quantity_available', Decimal('0'))
 
-    def get_status(self, obj):
+    def get_stock_status(self, obj):
         return self._get_summary(obj).get('status', obj.status)
 
     def get_location_name(self, obj):
@@ -510,6 +649,8 @@ class StockReservationSerializer(serializers.ModelSerializer):
     lot_number = serializers.CharField(source='stock_lot.lot_number', read_only=True)
     serial_number = serializers.CharField(source='stock_serial.serial_number', read_only=True)
     remaining_quantity = serializers.SerializerMethodField()
+    structural_location_id = serializers.SerializerMethodField()
+    structural_location_name = serializers.SerializerMethodField()
 
     class Meta:
         model = StockReservation
@@ -523,6 +664,8 @@ class StockReservationSerializer(serializers.ModelSerializer):
             'serial_number',
             'stock_location',
             'location_name',
+            'structural_location_id',
+            'structural_location_name',
             'external_order_type',
             'external_order_id',
             'external_order_line_id',
@@ -538,10 +681,26 @@ class StockReservationSerializer(serializers.ModelSerializer):
     def get_remaining_quantity(self, obj):
         return obj.remaining_quantity
 
+    def _get_structural_location(self, obj):
+        if not obj.stock_location_id:
+            return None
+        if obj.stock_location.structural:
+            return obj.stock_location
+        return obj.stock_location.get_ancestors(include_self=True).filter(structural=True).last()
+
+    def get_structural_location_id(self, obj):
+        structural_location = self._get_structural_location(obj)
+        return structural_location.id if structural_location else None
+
+    def get_structural_location_name(self, obj):
+        structural_location = self._get_structural_location(obj)
+        return structural_location.name if structural_location else None
+
 
 class StockReservationCreateSerializer(serializers.Serializer):
     inventory_item_id = serializers.UUIDField(required=True)
     location_id = serializers.UUIDField()
+    structural_location_id = serializers.UUIDField(required=False)
     quantity = serializers.DecimalField(max_digits=15, decimal_places=5)
     external_order_type = serializers.CharField(max_length=50)
     external_order_id = serializers.CharField(max_length=100)

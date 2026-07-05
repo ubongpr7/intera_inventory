@@ -20,6 +20,7 @@ from mainapps.orders.serializers import (
     PurchaseOrderLineItemCreateSerializer,
     PurchaseOrderListSerializer,
     ReceiveItemsSerializer,
+    ReturnOrderCreateSerializer,
     ReturnOrderDetailSerializer,
     ReturnOrderListSerializer,
     ReturnOrderProcessSerializer,
@@ -45,7 +46,20 @@ from mainapps.stock.models import (
 )
 from subapps.permissions.constants import PURCHASE_ORDER_PERMISSIONS, UNIFIED_PERMISSION_DICT
 from subapps.permissions.microservice_permissions import BaseCachePermissionViewset, HasModelRequestPermission, PermissionRequiredMixin
+from subapps.kafka.producers import (
+    publish_order_admin_event,
+    serialize_goods_receipt,
+    serialize_goods_receipt_line,
+    serialize_purchase_order,
+    serialize_purchase_order_line_item,
+    serialize_return_order,
+    serialize_return_order_line_item,
+    serialize_sales_order,
+    serialize_sales_order_line_item,
+    serialize_sales_order_shipment,
+)
 from subapps.services.emails.email_services import EmailService
+from subapps.services.location_scope import get_location_scope_ids, get_location_scope_ids_for_locations
 from subapps.services.pdf.pdf_service import PDFService, PDFServiceUnavailableError
 from subapps.services.identity_directory import IdentityDirectory
 from subapps.services.stock_domain import StockDomainError, StockDomainService
@@ -62,6 +76,83 @@ from .models import (
     SalesOrder, SalesOrderLineItem, SalesOrderShipment, SalesOrderStatus,
 )
 logger = logging.getLogger(__name__)
+
+
+def _apply_line_location_scope_filter(queryset, *, profile_id, location_id, relation_field: str):
+    scoped_location_ids = get_location_scope_ids(profile_id=profile_id, stock_location_id=location_id)
+    if not scoped_location_ids:
+        return queryset.none()
+    return queryset.filter(**{f"{relation_field}__in": scoped_location_ids})
+
+
+def _apply_line_location_scope_filters(queryset, *, profile_id, location_ids, relation_field: str):
+    scoped_location_ids = get_location_scope_ids_for_locations(profile_id=profile_id, stock_location_ids=location_ids)
+    if not scoped_location_ids:
+        return queryset.none()
+    return queryset.filter(**{f"{relation_field}__in": scoped_location_ids})
+
+
+def _resolve_structural_scope_location_id(request, payload=None):
+    payload = payload or {}
+    return (
+        payload.get('structural_location_id')
+        or request.query_params.get('structural_location_id')
+        or request.query_params.get('stock_location')
+    )
+
+
+def _resolve_structural_scope_location_ids(request):
+    raw_ids: list[str] = []
+    for key in ('structural_location_id', 'stock_location'):
+        value = request.query_params.get(key)
+        if value:
+            raw_ids.append(value)
+    for key in ('structural_location_ids', 'stock_location_ids'):
+        raw_ids.extend(request.query_params.getlist(key))
+        csv_value = request.query_params.get(key)
+        if csv_value:
+            raw_ids.extend([part.strip() for part in csv_value.split(',') if part.strip()])
+    return raw_ids
+
+
+def _resolve_scope_mode(request):
+    value = (request.query_params.get('scope') or '').strip().lower()
+    if value == 'all':
+        return 'all_locations'
+    return value
+
+
+def _assert_location_within_scope(*, profile_id, structural_scope_location_id, stock_location, label: str):
+    if not structural_scope_location_id:
+        return
+    scoped_location_ids = get_location_scope_ids(
+        profile_id=profile_id,
+        stock_location_id=structural_scope_location_id,
+    )
+    if not scoped_location_ids:
+        raise ValueError("The selected structural location scope is unavailable.")
+    if stock_location is None or stock_location.id not in scoped_location_ids:
+        raise ValueError(f"{label} is outside the selected structural location scope.")
+
+
+def _assert_reservation_within_scope(*, profile_id, structural_scope_location_id, reservation, label: str):
+    if reservation is None:
+        raise ValueError(f"{label} not found")
+    _assert_location_within_scope(
+        profile_id=profile_id,
+        structural_scope_location_id=structural_scope_location_id,
+        stock_location=reservation.stock_location,
+        label=label,
+    )
+
+
+def _audit_actor_from_request(request):
+    user_id = get_request_user_id(request, as_str=False)
+    profile_id = get_request_profile_id(request, as_str=False)
+    return {
+        'user_id': str(user_id or ''),
+        'profile_id': str(profile_id or ''),
+    }
 
 
 class GoodsReceiptViewSet(BaseCachePermissionViewset):
@@ -101,9 +192,14 @@ class GoodsReceiptViewSet(BaseCachePermissionViewset):
                 value=profile_id,
             )
 
-        stock_location_id = self.request.query_params.get('stock_location')
-        if stock_location_id:
-            queryset = queryset.filter(lines__stock_location_id=stock_location_id)
+        scope_location_ids = _resolve_structural_scope_location_ids(self.request)
+        if profile_id and _resolve_scope_mode(self.request) != 'all_locations' and scope_location_ids:
+            queryset = _apply_line_location_scope_filters(
+                queryset,
+                profile_id=profile_id,
+                location_ids=scope_location_ids,
+                relation_field='lines__stock_location_id',
+            )
 
         inventory_item_id = self.request.query_params.get('inventory_item')
         if inventory_item_id:
@@ -175,9 +271,14 @@ class SalesOrderShipmentViewSet(BaseCachePermissionViewset):
         if customer_id:
             queryset = queryset.filter(order__customer_id=customer_id)
 
-        stock_location_id = self.request.query_params.get('stock_location')
-        if stock_location_id:
-            queryset = queryset.filter(lines__stock_location_id=stock_location_id)
+        scope_location_ids = _resolve_structural_scope_location_ids(self.request)
+        if profile_id and _resolve_scope_mode(self.request) != 'all_locations' and scope_location_ids:
+            queryset = _apply_line_location_scope_filters(
+                queryset,
+                profile_id=profile_id,
+                location_ids=scope_location_ids,
+                relation_field='lines__stock_location_id',
+            )
 
         inventory_item_id = self.request.query_params.get('inventory_item')
         if inventory_item_id:
@@ -261,6 +362,33 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
         extra_fields['profile_id'] = profile_id
             
         instance = serializer.save(**extra_fields)
+        payload = serialize_purchase_order(instance)
+        publish_order_admin_event(
+            event_name='purchase_order.created',
+            payload=payload,
+            actor=_audit_actor_from_request(self.request),
+            target={
+                'type': 'purchase_order',
+                'id': str(instance.id),
+                'label': instance.reference,
+            },
+            summary=f'Purchase order created: {instance.reference}.',
+            metadata={
+                'status': instance.status,
+                'supplier_id': str(instance.supplier_id or ''),
+                'supplier_name': getattr(instance.supplier, 'name', '') or '',
+            },
+            after=payload,
+            feature_area='purchasing',
+            reference_number=instance.reference,
+            notification_category='purchase_order',
+            notification_title=f'Purchase order {instance.reference} created',
+            notification_message=(
+                f"Purchase order {instance.reference} was created"
+                f"{f' for {getattr(instance.supplier, 'name', '')}' if getattr(instance.supplier, 'name', '') else ''}."
+            ),
+            notification_action_url='/order/purchase',
+        )
         
         # Log activity
         self._log_activity('CREATE', instance, {
@@ -271,6 +399,7 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
     def perform_update(self, serializer):
         """Set modified_by on update and log changes"""
         current_user_id = get_request_user_id(self.request, as_str=False)
+        before = serialize_purchase_order(serializer.instance)
         original_data = self.get_serializer(serializer.instance).data
         
         extra_fields = {}
@@ -278,11 +407,52 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
             extra_fields['updated_by_user_id'] = current_user_id
         
         instance = serializer.save(**extra_fields)
+        after = serialize_purchase_order(instance)
+        publish_order_admin_event(
+            event_name='purchase_order.updated',
+            payload=after,
+            actor=_audit_actor_from_request(self.request),
+            target={
+                'type': 'purchase_order',
+                'id': str(instance.id),
+                'label': instance.reference,
+            },
+            summary=f'Purchase order updated: {instance.reference}.',
+            metadata={
+                'status': instance.status,
+                'updated_fields': list(serializer.validated_data.keys()),
+            },
+            before=before,
+            after=after,
+            feature_area='purchasing',
+            reference_number=instance.reference,
+        )
         
         # Log activity
         self._log_activity('UPDATE', instance, {
             'changes': self._get_field_changes(original_data, serializer.data)
         })
+
+    def perform_destroy(self, instance):
+        before = serialize_purchase_order(instance)
+        publish_order_admin_event(
+            event_name='purchase_order.deleted',
+            payload=before,
+            actor=_audit_actor_from_request(self.request),
+            target={
+                'type': 'purchase_order',
+                'id': str(instance.id),
+                'label': instance.reference,
+            },
+            summary=f'Purchase order deleted: {instance.reference}.',
+            metadata={'status': instance.status},
+            before=before,
+            after={},
+            severity='warning',
+            feature_area='purchasing',
+            reference_number=instance.reference,
+        )
+        instance.delete()
     
     # ==================== LINE ITEM MANAGEMENT ====================
     @action(detail=True, methods=['get'])
@@ -312,6 +482,27 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
         serializer = PurchaseOrderLineItemCreateSerializer(data=request.data)
         if serializer.is_valid():
             line_item = serializer.save(purchase_order=purchase_order)
+            payload = serialize_purchase_order_line_item(line_item)
+            publish_order_admin_event(
+                event_name='purchase_order.line_item.added',
+                payload=payload,
+                actor=_audit_actor_from_request(request),
+                target={
+                    'type': 'purchase_order_line_item',
+                    'id': str(line_item.id),
+                    'label': f'{purchase_order.reference} / {line_item.inventory_item.name_snapshot}',
+                    'barcode': line_item.inventory_item.barcode_snapshot or '',
+                    'sku': line_item.inventory_item.sku_snapshot or '',
+                },
+                summary=f'Line item added to purchase order {purchase_order.reference}.',
+                metadata={
+                    'purchase_order_id': str(purchase_order.id),
+                    'purchase_order_reference': purchase_order.reference,
+                },
+                after=payload,
+                feature_area='purchasing',
+                reference_number=purchase_order.reference,
+            )
             
             # Recalculate order total
             
@@ -365,7 +556,30 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
             line_item, data=request.data, partial=True
         )
         if serializer.is_valid():
-            serializer.save()
+            before = serialize_purchase_order_line_item(line_item)
+            line_item = serializer.save()
+            after = serialize_purchase_order_line_item(line_item)
+            publish_order_admin_event(
+                event_name='purchase_order.line_item.updated',
+                payload=after,
+                actor=_audit_actor_from_request(request),
+                target={
+                    'type': 'purchase_order_line_item',
+                    'id': str(line_item.id),
+                    'label': f'{purchase_order.reference} / {line_item.inventory_item.name_snapshot}',
+                    'barcode': line_item.inventory_item.barcode_snapshot or '',
+                    'sku': line_item.inventory_item.sku_snapshot or '',
+                },
+                summary=f'Line item updated on purchase order {purchase_order.reference}.',
+                metadata={
+                    'purchase_order_id': str(purchase_order.id),
+                    'purchase_order_reference': purchase_order.reference,
+                },
+                before=before,
+                after=after,
+                feature_area='purchasing',
+                reference_number=purchase_order.reference,
+            )
             
             # Recalculate order total
             
@@ -399,6 +613,29 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
+        before = serialize_purchase_order_line_item(line_item)
+        publish_order_admin_event(
+            event_name='purchase_order.line_item.removed',
+            payload=before,
+            actor=_audit_actor_from_request(request),
+            target={
+                'type': 'purchase_order_line_item',
+                'id': str(line_item.id),
+                'label': f'{purchase_order.reference} / {line_item.inventory_item.name_snapshot}',
+                'barcode': line_item.inventory_item.barcode_snapshot or '',
+                'sku': line_item.inventory_item.sku_snapshot or '',
+            },
+            summary=f'Line item removed from purchase order {purchase_order.reference}.',
+            metadata={
+                'purchase_order_id': str(purchase_order.id),
+                'purchase_order_reference': purchase_order.reference,
+            },
+            before=before,
+            after={},
+            severity='warning',
+            feature_area='purchasing',
+            reference_number=purchase_order.reference,
+        )
         line_item.delete()
         
         # Recalculate order total
@@ -425,10 +662,32 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
         
         
         with transaction.atomic():
+            before = serialize_purchase_order(purchase_order)
             purchase_order.status = PurchaseOrderStatus.APPROVED
             purchase_order.approved_by_user_id = get_request_user_id(request, required=True, as_str=False)
             purchase_order.approved_at = timezone.now()
             purchase_order.save()
+            after = serialize_purchase_order(purchase_order)
+            publish_order_admin_event(
+                event_name='purchase_order.approved',
+                payload=after,
+                actor=_audit_actor_from_request(request),
+                target={
+                    'type': 'purchase_order',
+                    'id': str(purchase_order.id),
+                    'label': purchase_order.reference,
+                },
+                summary=f'Purchase order approved: {purchase_order.reference}.',
+                metadata={'status': purchase_order.status},
+                before=before,
+                after=after,
+                feature_area='purchasing',
+                reference_number=purchase_order.reference,
+                notification_category='approval_required',
+                notification_title=f'Purchase order {purchase_order.reference} approved',
+                notification_message=f'Purchase order {purchase_order.reference} was approved and is ready for issue.',
+                notification_action_url='/order/purchase',
+            )
             
             # # Log activity
             # self._log_activity('APPROVE', purchase_order, {
@@ -460,6 +719,7 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
         
         try:
             with transaction.atomic():
+                before = serialize_purchase_order(purchase_order)
                 # Calculate total price
                 total_price =purchase_order.total_price
                 
@@ -467,6 +727,7 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
                 purchase_order.issue_date = timezone.now()
                 purchase_order.updated_by_user_id = current_user_id
                 purchase_order.save()
+                after = serialize_purchase_order(purchase_order)
                 
                 # Send email notification if requested
                 email_sent = False
@@ -477,6 +738,31 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
                     except Exception as e:
                         logger.warning(f"Failed to send email for PO {purchase_order.reference}: {str(e)}")
                         # Don't fail the entire operation if email fails
+                publish_order_admin_event(
+                    event_name='purchase_order.issued',
+                    payload=after,
+                    actor=_audit_actor_from_request(request),
+                    target={
+                        'type': 'purchase_order',
+                        'id': str(purchase_order.id),
+                        'label': purchase_order.reference,
+                    },
+                    summary=f'Purchase order issued: {purchase_order.reference}.',
+                    metadata={
+                        'status': purchase_order.status,
+                        'email_sent': email_sent,
+                        'notify_supplier': bool(request.data.get('notify_supplier', True)),
+                        'total_price': str(total_price),
+                    },
+                    before=before,
+                    after=after,
+                    feature_area='purchasing',
+                    reference_number=purchase_order.reference,
+                    notification_category='purchase_order',
+                    notification_title=f'Purchase order {purchase_order.reference} issued',
+                    notification_message=f'Purchase order {purchase_order.reference} was issued to the supplier.',
+                    notification_action_url='/order/purchase',
+                )
                 
                 # # Log activity
                 # self._log_activity('ISSUE', purchase_order, {
@@ -516,10 +802,32 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
         current_user_id = current_user.get('id')
         
         with transaction.atomic():
+            before = serialize_purchase_order(purchase_order)
             purchase_order.status = PurchaseOrderStatus.RECEIVED
             purchase_order.received_date = timezone.now()
             purchase_order.received_by_user_id = current_user_id
             purchase_order.save()
+            after = serialize_purchase_order(purchase_order)
+            publish_order_admin_event(
+                event_name='purchase_order.received',
+                payload=after,
+                actor=_audit_actor_from_request(request),
+                target={
+                    'type': 'purchase_order',
+                    'id': str(purchase_order.id),
+                    'label': purchase_order.reference,
+                },
+                summary=f'Purchase order received: {purchase_order.reference}.',
+                metadata={'status': purchase_order.status},
+                before=before,
+                after=after,
+                feature_area='purchasing',
+                reference_number=purchase_order.reference,
+                notification_category='purchase_order',
+                notification_title=f'Purchase order {purchase_order.reference} received',
+                notification_message=f'Purchase order {purchase_order.reference} was marked received.',
+                notification_action_url='/order/purchase',
+            )
             
             # # Log activity
             # self._log_activity('RECEIVE', purchase_order, {
@@ -552,15 +860,25 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
         current_user = IdentityDirectory.get_current_user(request) or {}
         current_user_id = get_request_user_id(request, as_str=False)
         profile_id = get_request_profile_id(request, required=True, as_str=False)
+        structural_scope_location_id = _resolve_structural_scope_location_id(request, serializer.validated_data)
         
         try:
             with transaction.atomic():
+                before = serialize_purchase_order(purchase_order)
+                actor = _audit_actor_from_request(request)
                 goods_receipt = StockDomainService.create_goods_receipt(
                     purchase_order=purchase_order,
                     actor_user_id=current_user_id,
                     notes=request.data.get('notes', ''),
                 )
                 received_count = 0
+                receipt_line_summaries = []
+                total_quantity_received = Decimal('0')
+                total_serials_received = 0
+                touched_location_ids: set[str] = set()
+                touched_inventory_item_ids: set[str] = set()
+                fully_received_line_count = 0
+                partially_received_line_count = 0
                 
                 for item_data in received_items:
                     line_item_id = item_data['line_item_id']
@@ -572,6 +890,7 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
                         line_item = purchase_order.line_items.get(id=line_item_id)
                     except PurchaseOrderLineItem.DoesNotExist:
                         raise ValueError(f"Line item {line_item_id} not found")
+                    before_line = serialize_purchase_order_line_item(line_item)
                     stock_location = scope_queryset_by_identity(
                         StockLocation.objects.filter(id=location_id),
                         canonical_field='profile_id',
@@ -580,12 +899,19 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
                     ).first()
                     if stock_location is None:
                         raise ValueError(f"Stock location {location_id} not found")
+                    _assert_location_within_scope(
+                        profile_id=profile_id,
+                        structural_scope_location_id=structural_scope_location_id,
+                        stock_location=stock_location,
+                        label=f"Receiving location {location_id}",
+                    )
 
-                    StockDomainService.receive_purchase_line(
+                    receipt_result = StockDomainService.receive_purchase_line(
                         purchase_order=purchase_order,
                         line_item=line_item,
                         stock_location=stock_location,
                         quantity_received=quantity_received,
+                        unit_cost=item_data.get('unit_cost'),
                         actor_user_id=current_user_id,
                         goods_receipt=goods_receipt,
                         lot_number=item_data.get('lot_number', ''),
@@ -594,15 +920,193 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
                         serial_numbers=item_data.get('serial_numbers'),
                         notes=item_data.get('notes') or request.data.get('notes', ''),
                     )
+                    line_item.refresh_from_db()
+                    after_line = serialize_purchase_order_line_item(line_item)
+                    goods_receipt_line = receipt_result['goods_receipt_line']
+                    goods_receipt_line_payload = serialize_goods_receipt_line(goods_receipt_line)
+                    stock_lot = receipt_result.get('stock_lot')
+                    stock_serials = receipt_result.get('stock_serials') or []
+                    balance = receipt_result.get('balance')
+                    serial_numbers = [serial.serial_number for serial in stock_serials]
+                    is_fully_received = bool(goods_receipt_line_payload.get('fully_received'))
+                    line_receipt_state = 'complete' if is_fully_received else 'partial'
+                    line_event_metadata = {
+                        'purchase_order_id': str(purchase_order.id),
+                        'purchase_order_reference': purchase_order.reference,
+                        'goods_receipt_id': str(goods_receipt.id),
+                        'goods_receipt_reference': goods_receipt.reference,
+                        'stock_location_id': str(stock_location.id),
+                        'stock_location_name': stock_location.name,
+                        'inventory_item_id': str(line_item.inventory_item_id),
+                        'inventory_name': line_item.inventory_item.name_snapshot,
+                        'inventory_sku': line_item.inventory_item.sku_snapshot or '',
+                        'inventory_barcode': line_item.inventory_item.barcode_snapshot or '',
+                        'product_variant_image_url': line_item.inventory_item.product_variant_image_url or '',
+                        'quantity_received': str(quantity_received),
+                        'quantity_received_to_date': goods_receipt_line_payload.get('quantity_received_to_date'),
+                        'remaining_quantity': goods_receipt_line_payload.get('remaining_quantity'),
+                        'fully_received': goods_receipt_line_payload.get('fully_received'),
+                        'receipt_completion_state': line_receipt_state,
+                        'lot_number': goods_receipt_line_payload.get('lot_number', ''),
+                        'stock_lot_id': str(getattr(stock_lot, 'id', '') or ''),
+                        'serial_count': len(serial_numbers),
+                        'serial_numbers': serial_numbers,
+                        'balance_quantity_on_hand': str(getattr(balance, 'quantity_on_hand', '')),
+                    }
+                    receipt_line_summaries.append({
+                        **line_event_metadata,
+                        'goods_receipt_line_id': str(goods_receipt_line.id),
+                    })
+                    publish_order_admin_event(
+                        event_name='goods_receipt.line.received',
+                        payload=goods_receipt_line_payload,
+                        actor=actor,
+                        target={
+                            'type': 'goods_receipt_line',
+                            'id': str(goods_receipt_line.id),
+                            'label': f'{goods_receipt.reference} / {line_item.inventory_item.name_snapshot}',
+                            'barcode': line_item.inventory_item.barcode_snapshot or '',
+                            'sku': line_item.inventory_item.sku_snapshot or '',
+                        },
+                        summary=(
+                            f'{"Fully" if is_fully_received else "Partially"} received {quantity_received} of {line_item.inventory_item.name_snapshot} '
+                            f'into {stock_location.name} on {goods_receipt.reference}.'
+                        ),
+                        metadata=line_event_metadata,
+                        before=before_line,
+                        after=goods_receipt_line_payload,
+                        feature_area='goods_receipts',
+                        reference_number=goods_receipt.reference,
+                    )
                     
                     received_count += 1
+                    total_quantity_received += Decimal(str(quantity_received))
+                    total_serials_received += len(serial_numbers)
+                    touched_location_ids.add(str(stock_location.id))
+                    touched_inventory_item_ids.add(str(line_item.inventory_item_id))
+                    if is_fully_received:
+                        fully_received_line_count += 1
+                    else:
+                        partially_received_line_count += 1
                 
                 # Update order status if not already received
+                status_transitioned_to_received = False
                 if purchase_order.status == PurchaseOrderStatus.ISSUED:
                     purchase_order.status = PurchaseOrderStatus.RECEIVED
                     purchase_order.received_date = timezone.now()
                     purchase_order.received_by_user_id = current_user_id
                     purchase_order.save()
+                    status_transitioned_to_received = True
+                after = serialize_purchase_order(purchase_order)
+                goods_receipt_payload = serialize_goods_receipt(goods_receipt)
+                open_line_count = purchase_order.line_items.filter(remaining_quantity__gt=0).count()
+                receipt_completion_state = 'complete' if open_line_count == 0 else 'partial'
+                if status_transitioned_to_received:
+                    publish_order_admin_event(
+                        event_name='purchase_order.received',
+                        payload=after,
+                        actor=actor,
+                        target={
+                            'type': 'purchase_order',
+                            'id': str(purchase_order.id),
+                            'label': purchase_order.reference,
+                        },
+                        summary=f'Purchase order received: {purchase_order.reference}.',
+                        metadata={
+                            'status': purchase_order.status,
+                            'goods_receipt_id': str(goods_receipt.id),
+                            'goods_receipt_reference': goods_receipt.reference,
+                            'received_count': received_count,
+                            'total_quantity_received': str(total_quantity_received),
+                            'receipt_completion_state': receipt_completion_state,
+                            'open_line_count': open_line_count,
+                            'fully_received_line_count': fully_received_line_count,
+                            'partially_received_line_count': partially_received_line_count,
+                        },
+                        before=before,
+                        after=after,
+                        feature_area='purchasing',
+                        reference_number=purchase_order.reference,
+                        notification_category='purchase_order',
+                        notification_title=f'Purchase order {purchase_order.reference} received',
+                        notification_message=(
+                            f'Purchase order {purchase_order.reference} was marked received through goods receipt {goods_receipt.reference}.'
+                        ),
+                        notification_action_url='/order/purchase',
+                    )
+                publish_order_admin_event(
+                    event_name='goods_receipt.created',
+                    payload=goods_receipt_payload,
+                    actor=actor,
+                    target={
+                        'type': 'goods_receipt',
+                        'id': str(goods_receipt.id),
+                        'label': goods_receipt.reference,
+                    },
+                    summary=f'Goods receipt created: {goods_receipt.reference}.',
+                    metadata={
+                        'purchase_order_id': str(purchase_order.id),
+                        'purchase_order_reference': purchase_order.reference,
+                        'received_count': received_count,
+                        'total_quantity_received': str(total_quantity_received),
+                        'total_serials_received': total_serials_received,
+                        'receipt_completion_state': receipt_completion_state,
+                        'open_line_count': open_line_count,
+                        'fully_received_line_count': fully_received_line_count,
+                        'partially_received_line_count': partially_received_line_count,
+                        'receipt_lines': receipt_line_summaries,
+                    },
+                    after=goods_receipt_payload,
+                    feature_area='goods_receipts',
+                    reference_number=goods_receipt.reference,
+                    notification_category='purchase_order',
+                    notification_title=(
+                        f'{"Complete" if receipt_completion_state == "complete" else "Partial"} goods receipt {goods_receipt.reference} posted'
+                    ),
+                    notification_message=(
+                        f'Goods receipt {goods_receipt.reference} was posted for purchase order {purchase_order.reference} '
+                        f'with a {receipt_completion_state} receiving state.'
+                    ),
+                    notification_action_url='/order/purchase',
+                )
+                publish_order_admin_event(
+                    event_name='purchase_order.items_received',
+                    payload=after,
+                    actor=actor,
+                    target={
+                        'type': 'purchase_order',
+                        'id': str(purchase_order.id),
+                        'label': purchase_order.reference,
+                    },
+                    summary=f'Items received for purchase order {purchase_order.reference}.',
+                    metadata={
+                        'goods_receipt_id': str(goods_receipt.id),
+                        'goods_receipt_reference': goods_receipt.reference,
+                        'received_count': received_count,
+                        'total_quantity_received': str(total_quantity_received),
+                        'total_serials_received': total_serials_received,
+                        'receipt_completion_state': receipt_completion_state,
+                        'open_line_count': open_line_count,
+                        'fully_received_line_count': fully_received_line_count,
+                        'partially_received_line_count': partially_received_line_count,
+                        'location_ids': sorted(touched_location_ids),
+                        'inventory_item_ids': sorted(touched_inventory_item_ids),
+                        'receipt_lines': receipt_line_summaries,
+                    },
+                    before=before,
+                    after=after,
+                    feature_area='goods_receipts',
+                    reference_number=purchase_order.reference,
+                    notification_category='purchase_order',
+                    notification_title=(
+                        f'{"Complete" if receipt_completion_state == "complete" else "Partial"} receipt on {purchase_order.reference}'
+                    ),
+                    notification_message=(
+                        f'{received_count} line item{"" if received_count == 1 else "s"} were received on '
+                        f'purchase order {purchase_order.reference} with a {receipt_completion_state} receiving state.'
+                    ),
+                    notification_action_url='/order/purchase',
+                )
                 
                 # Log activity
                 self._log_activity('RECEIVE_ITEMS', purchase_order, {
@@ -647,10 +1151,32 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
         
         try:
             with transaction.atomic():
+                before = serialize_purchase_order(purchase_order)
                 purchase_order.status = PurchaseOrderStatus.COMPLETED
                 purchase_order.complete_date = timezone.now()
                 purchase_order.updated_by_user_id = current_user_id
                 purchase_order.save()
+                after = serialize_purchase_order(purchase_order)
+                publish_order_admin_event(
+                    event_name='purchase_order.completed',
+                    payload=after,
+                    actor=_audit_actor_from_request(request),
+                    target={
+                        'type': 'purchase_order',
+                        'id': str(purchase_order.id),
+                        'label': purchase_order.reference,
+                    },
+                    summary=f'Purchase order completed: {purchase_order.reference}.',
+                    metadata={'status': purchase_order.status},
+                    before=before,
+                    after=after,
+                    feature_area='purchasing',
+                    reference_number=purchase_order.reference,
+                    notification_category='purchase_order',
+                    notification_title=f'Purchase order {purchase_order.reference} completed',
+                    notification_message=f'Purchase order {purchase_order.reference} was completed.',
+                    notification_action_url='/order/purchase',
+                )
                 
                 # Log activity
                 self._log_activity('COMPLETE', purchase_order, {
@@ -687,10 +1213,33 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
         current_user_id = current_user.get('id')
         
         with transaction.atomic():
+            before = serialize_purchase_order(purchase_order)
             purchase_order.status = PurchaseOrderStatus.CANCELLED
             purchase_order.updated_by_user_id = current_user_id
             purchase_order.notes = request.data.get('notes', purchase_order.notes)
             purchase_order.save()
+            after = serialize_purchase_order(purchase_order)
+            publish_order_admin_event(
+                event_name='purchase_order.cancelled',
+                payload=after,
+                actor=_audit_actor_from_request(request),
+                target={
+                    'type': 'purchase_order',
+                    'id': str(purchase_order.id),
+                    'label': purchase_order.reference,
+                },
+                summary=f'Purchase order cancelled: {purchase_order.reference}.',
+                metadata={'reason': request.data.get('notes', '')},
+                before=before,
+                after=after,
+                severity='warning',
+                feature_area='purchasing',
+                reference_number=purchase_order.reference,
+                notification_category='purchase_order',
+                notification_title=f'Purchase order {purchase_order.reference} cancelled',
+                notification_message=f'Purchase order {purchase_order.reference} was cancelled.',
+                notification_action_url='/order/purchase',
+            )
             
             # Log activity
             self._log_activity('CANCEL', purchase_order, {
@@ -768,6 +1317,40 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
                         discount=line_item.discount,
                         return_reason=item.get('reason', '')
                     )
+                return_order_payload = serialize_return_order(return_order)
+                return_line_payloads = [
+                    serialize_return_order_line_item(line) for line in return_order.line_items.select_related(
+                        'original_line_item',
+                        'original_line_item__inventory_item',
+                        'return_order',
+                    )
+                ]
+                publish_order_admin_event(
+                    event_name='return_order.created',
+                    payload=return_order_payload,
+                    actor=_audit_actor_from_request(request),
+                    target={
+                        'type': 'return_order',
+                        'id': str(return_order.id),
+                        'label': return_order.reference,
+                    },
+                    summary=f'Return order created: {return_order.reference}.',
+                    metadata={
+                        'purchase_order_id': str(purchase_order.id),
+                        'purchase_order_reference': purchase_order.reference,
+                        'return_reason': return_reason,
+                        'line_items': return_line_payloads,
+                    },
+                    after=return_order_payload,
+                    feature_area='supplier_returns',
+                    reference_number=return_order.reference,
+                    notification_category='purchase_order',
+                    notification_title=f'Return order {return_order.reference} created',
+                    notification_message=(
+                        f'Return order {return_order.reference} was created for purchase order {purchase_order.reference}.'
+                    ),
+                    notification_action_url='/order/purchase',
+                )
                 
                 # Send notifications if requested
                 try:
@@ -1167,6 +1750,22 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
         
         try:
             pdf_content = PDFService.generate_purchase_order_pdf(purchase_order)
+            payload = serialize_purchase_order(purchase_order)
+            publish_order_admin_event(
+                event_name='purchase_order.pdf_downloaded',
+                payload=payload,
+                actor=_audit_actor_from_request(request),
+                target={
+                    'type': 'purchase_order',
+                    'id': str(purchase_order.id),
+                    'label': purchase_order.reference,
+                },
+                summary=f'Purchase order PDF downloaded: {purchase_order.reference}.',
+                metadata={'format': 'pdf'},
+                after=payload,
+                feature_area='purchasing_documents',
+                reference_number=purchase_order.reference,
+            )
             
             response = HttpResponse(pdf_content.getvalue(), content_type='application/pdf')
             response['Content-Disposition'] = f'attachment; filename="PO_{purchase_order.reference}.pdf"'
@@ -1211,6 +1810,27 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
                 purchase_orders,
                 date_range=request.data.get('date_range')
             )
+            profile_id = get_request_profile_id(request, as_str=False)
+            payload = {
+                'profile_id': profile_id,
+                'purchase_order_ids': [str(order.id) for order in purchase_orders],
+                'purchase_order_references': [order.reference for order in purchase_orders],
+                'count': purchase_orders.count(),
+            }
+            publish_order_admin_event(
+                event_name='purchase_order.bulk_pdf_downloaded',
+                payload=payload,
+                actor=_audit_actor_from_request(request),
+                target={
+                    'type': 'purchase_order_bulk_export',
+                    'id': timezone.now().strftime('%Y%m%d%H%M%S'),
+                    'label': f'{purchase_orders.count()} purchase orders',
+                },
+                summary='Bulk purchase order PDF download generated.',
+                metadata={'format': 'pdf', 'date_range': request.data.get('date_range')},
+                after=payload,
+                feature_area='purchasing_documents',
+            )
             
             response = HttpResponse(pdf_content.getvalue(), content_type='application/pdf')
             response['Content-Disposition'] = f'attachment; filename="PO_Summary_{timezone.now().strftime("%Y%m%d")}.pdf"'
@@ -1252,6 +1872,22 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
                 )
             
             self._send_purchase_order_email(purchase_order)
+            payload = serialize_purchase_order(purchase_order)
+            publish_order_admin_event(
+                event_name='purchase_order.email_resent',
+                payload=payload,
+                actor=_audit_actor_from_request(request),
+                target={
+                    'type': 'purchase_order',
+                    'id': str(purchase_order.id),
+                    'label': purchase_order.reference,
+                },
+                summary=f'Purchase order email resent: {purchase_order.reference}.',
+                metadata={'status': purchase_order.status},
+                after=payload,
+                feature_area='purchasing_notifications',
+                reference_number=purchase_order.reference,
+            )
             
             # Log activity
             current_user = IdentityDirectory.get_current_user(request)
@@ -1339,15 +1975,84 @@ class SalesOrderViewSet(BaseCachePermissionViewset):
             extra_fields['created_by_user_id'] = current_user_id
             extra_fields['responsible_user_id'] = current_user_id
         instance = serializer.save(**extra_fields)
+        payload = serialize_sales_order(instance)
+        publish_order_admin_event(
+            event_name='sales_order.created',
+            payload=payload,
+            actor=_audit_actor_from_request(self.request),
+            target={
+                'type': 'sales_order',
+                'id': str(instance.id),
+                'label': instance.reference,
+            },
+            summary=f'Sales order created: {instance.reference}.',
+            metadata={
+                'status': instance.status,
+                'customer_id': str(instance.customer_id or ''),
+                'customer_name': getattr(instance.customer, 'name', '') or '',
+            },
+            after=payload,
+            feature_area='sales_orders',
+            reference_number=instance.reference,
+            notification_category='sales_order',
+            notification_title=f'Sales order {instance.reference} created',
+            notification_message=(
+                f"Sales order {instance.reference} was created"
+                f"{f' for {getattr(instance.customer, 'name', '')}' if getattr(instance.customer, 'name', '') else ''}."
+            ),
+            notification_action_url='/order/sales',
+        )
         self._log_activity('CREATE', instance, {'initial_data': self.request.data})
 
     def perform_update(self, serializer):
         current_user_id = get_request_user_id(self.request, as_str=False)
+        before = serialize_sales_order(serializer.instance)
         extra_fields = {}
         if current_user_id:
             extra_fields['updated_by_user_id'] = current_user_id
         instance = serializer.save(**extra_fields)
+        after = serialize_sales_order(instance)
+        publish_order_admin_event(
+            event_name='sales_order.updated',
+            payload=after,
+            actor=_audit_actor_from_request(self.request),
+            target={
+                'type': 'sales_order',
+                'id': str(instance.id),
+                'label': instance.reference,
+            },
+            summary=f'Sales order updated: {instance.reference}.',
+            metadata={
+                'status': instance.status,
+                'updated_fields': list(serializer.validated_data.keys()),
+            },
+            before=before,
+            after=after,
+            feature_area='sales_orders',
+            reference_number=instance.reference,
+        )
         self._log_activity('UPDATE', instance, {'updated_fields': list(serializer.validated_data.keys())})
+
+    def perform_destroy(self, instance):
+        before = serialize_sales_order(instance)
+        publish_order_admin_event(
+            event_name='sales_order.deleted',
+            payload=before,
+            actor=_audit_actor_from_request(self.request),
+            target={
+                'type': 'sales_order',
+                'id': str(instance.id),
+                'label': instance.reference,
+            },
+            summary=f'Sales order deleted: {instance.reference}.',
+            metadata={'status': instance.status},
+            before=before,
+            after={},
+            severity='warning',
+            feature_area='sales_orders',
+            reference_number=instance.reference,
+        )
+        instance.delete()
 
     @action(detail=True, methods=['get'])
     def line_items(self, request, pk=None):
@@ -1373,6 +2078,27 @@ class SalesOrderViewSet(BaseCachePermissionViewset):
         serializer = SalesOrderLineItemCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         line_item = serializer.save(sales_order=sales_order)
+        payload = serialize_sales_order_line_item(line_item)
+        publish_order_admin_event(
+            event_name='sales_order.line_item.added',
+            payload=payload,
+            actor=_audit_actor_from_request(request),
+            target={
+                'type': 'sales_order_line_item',
+                'id': str(line_item.id),
+                'label': f'{sales_order.reference} / {line_item.inventory_item.name_snapshot}',
+                'barcode': line_item.inventory_item.barcode_snapshot or '',
+                'sku': line_item.inventory_item.sku_snapshot or '',
+            },
+            summary=f'Line item added to sales order {sales_order.reference}.',
+            metadata={
+                'sales_order_id': str(sales_order.id),
+                'sales_order_reference': sales_order.reference,
+            },
+            after=payload,
+            feature_area='sales_orders',
+            reference_number=sales_order.reference,
+        )
         self._log_activity('ADD_LINE_ITEM', sales_order, {'line_item_id': str(line_item.id)})
         return Response(SalesOrderLineItemSerializer(line_item).data, status=status.HTTP_201_CREATED)
 
@@ -1396,7 +2122,30 @@ class SalesOrderViewSet(BaseCachePermissionViewset):
 
         serializer = SalesOrderLineItemCreateSerializer(line_item, data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
+        before = serialize_sales_order_line_item(line_item)
         line_item = serializer.save()
+        after = serialize_sales_order_line_item(line_item)
+        publish_order_admin_event(
+            event_name='sales_order.line_item.updated',
+            payload=after,
+            actor=_audit_actor_from_request(request),
+            target={
+                'type': 'sales_order_line_item',
+                'id': str(line_item.id),
+                'label': f'{sales_order.reference} / {line_item.inventory_item.name_snapshot}',
+                'barcode': line_item.inventory_item.barcode_snapshot or '',
+                'sku': line_item.inventory_item.sku_snapshot or '',
+            },
+            summary=f'Line item updated on sales order {sales_order.reference}.',
+            metadata={
+                'sales_order_id': str(sales_order.id),
+                'sales_order_reference': sales_order.reference,
+            },
+            before=before,
+            after=after,
+            feature_area='sales_orders',
+            reference_number=sales_order.reference,
+        )
         self._log_activity('UPDATE_LINE_ITEM', sales_order, {'line_item_id': str(line_item.id)})
         return Response(SalesOrderLineItemSerializer(line_item).data)
 
@@ -1424,6 +2173,29 @@ class SalesOrderViewSet(BaseCachePermissionViewset):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        before = serialize_sales_order_line_item(line_item)
+        publish_order_admin_event(
+            event_name='sales_order.line_item.removed',
+            payload=before,
+            actor=_audit_actor_from_request(request),
+            target={
+                'type': 'sales_order_line_item',
+                'id': str(line_item.id),
+                'label': f'{sales_order.reference} / {line_item.inventory_item.name_snapshot}',
+                'barcode': line_item.inventory_item.barcode_snapshot or '',
+                'sku': line_item.inventory_item.sku_snapshot or '',
+            },
+            summary=f'Line item removed from sales order {sales_order.reference}.',
+            metadata={
+                'sales_order_id': str(sales_order.id),
+                'sales_order_reference': sales_order.reference,
+            },
+            before=before,
+            after={},
+            severity='warning',
+            feature_area='sales_orders',
+            reference_number=sales_order.reference,
+        )
         line_item.delete()
         self._log_activity('REMOVE_LINE_ITEM', sales_order, {'line_item_id': str(line_item_id)})
         return Response({'message': 'Line item removed successfully'})
@@ -1442,10 +2214,13 @@ class SalesOrderViewSet(BaseCachePermissionViewset):
         payload = serializer.validated_data
         current_user_id = get_request_user_id(request, as_str=False)
         profile_id = get_request_profile_id(request, required=True, as_str=False)
+        structural_scope_location_id = _resolve_structural_scope_location_id(request, payload)
 
         try:
             with transaction.atomic():
+                before = serialize_sales_order(sales_order)
                 reservations = []
+                reservation_summaries = []
                 for item in payload['reservation_items']:
                     line_item = sales_order.line_items.select_related('inventory_item').get(id=item['line_item_id'])
                     default_reserve_quantity = (
@@ -1469,6 +2244,12 @@ class SalesOrderViewSet(BaseCachePermissionViewset):
                     ).first()
                     if stock_location is None:
                         raise ValueError(f"Stock location {item['location_id']} not found")
+                    _assert_location_within_scope(
+                        profile_id=profile_id,
+                        structural_scope_location_id=structural_scope_location_id,
+                        stock_location=stock_location,
+                        label=f"Reservation location {item['location_id']}",
+                    )
 
                     stock_lot = None
                     stock_lot_id = item.get('stock_lot_id')
@@ -1502,11 +2283,42 @@ class SalesOrderViewSet(BaseCachePermissionViewset):
                     line_item.updated_by_user_id = current_user_id
                     line_item.save()
                     reservations.append(str(reservation_result['reservation'].id))
+                    reservation_summaries.append({
+                        'reservation_id': str(reservation_result['reservation'].id),
+                        'sales_order_line_item_id': str(line_item.id),
+                        'inventory_item_id': str(line_item.inventory_item_id),
+                        'inventory_name': line_item.inventory_item.name_snapshot,
+                        'inventory_barcode': line_item.inventory_item.barcode_snapshot or '',
+                        'inventory_sku': line_item.inventory_item.sku_snapshot or '',
+                        'quantity': str(reserve_quantity),
+                        'stock_location_id': str(stock_location.id),
+                        'stock_location_name': stock_location.name,
+                    })
 
                 if sales_order.status == SalesOrderStatus.PENDING:
                     sales_order.status = SalesOrderStatus.IN_PROGRESS
                     sales_order.updated_by_user_id = current_user_id
                     sales_order.save()
+                after = serialize_sales_order(sales_order)
+                publish_order_admin_event(
+                    event_name='sales_order.stock_reserved',
+                    payload=after,
+                    actor=_audit_actor_from_request(request),
+                    target={
+                        'type': 'sales_order',
+                        'id': str(sales_order.id),
+                        'label': sales_order.reference,
+                    },
+                    summary=f'Stock reserved for sales order {sales_order.reference}.',
+                    metadata={
+                        'reservation_count': len(reservations),
+                        'reservations': reservation_summaries,
+                    },
+                    before=before,
+                    after=after,
+                    feature_area='sales_fulfillment',
+                    reference_number=sales_order.reference,
+                )
 
                 self._log_activity('RESERVE_STOCK', sales_order, {
                     'reservation_count': len(reservations),
@@ -1541,10 +2353,13 @@ class SalesOrderViewSet(BaseCachePermissionViewset):
         payload = serializer.validated_data
         current_user_id = get_request_user_id(request, as_str=False)
         profile_id = get_request_profile_id(request, required=True, as_str=False)
+        structural_scope_location_id = _resolve_structural_scope_location_id(request, payload)
 
         try:
             with transaction.atomic():
+                before = serialize_sales_order(sales_order)
                 released_count = 0
+                released_summaries = []
                 for item in payload['reservation_items']:
                     reservation = StockReservation.objects.select_related(
                         'stock_location',
@@ -1558,6 +2373,12 @@ class SalesOrderViewSet(BaseCachePermissionViewset):
                     ).first()
                     if reservation is None:
                         raise ValueError(f"Reservation {item['reservation_id']} not found")
+                    _assert_reservation_within_scope(
+                        profile_id=profile_id,
+                        structural_scope_location_id=structural_scope_location_id,
+                        reservation=reservation,
+                        label=f"Reservation {item['reservation_id']}",
+                    )
 
                     release_quantity = Decimal(str(item.get('quantity', reservation.remaining_quantity)))
                     if release_quantity <= 0:
@@ -1578,6 +2399,15 @@ class SalesOrderViewSet(BaseCachePermissionViewset):
                     line_item.updated_by_user_id = current_user_id
                     line_item.save()
                     released_count += 1
+                    released_summaries.append({
+                        'reservation_id': str(reservation.id),
+                        'sales_order_line_item_id': str(line_item.id),
+                        'inventory_item_id': str(line_item.inventory_item_id),
+                        'inventory_name': line_item.inventory_item.name_snapshot,
+                        'inventory_barcode': line_item.inventory_item.barcode_snapshot or '',
+                        'inventory_sku': line_item.inventory_item.sku_snapshot or '',
+                        'released_quantity': str(release_quantity),
+                    })
 
                 if (
                     sales_order.status == SalesOrderStatus.IN_PROGRESS
@@ -1588,6 +2418,26 @@ class SalesOrderViewSet(BaseCachePermissionViewset):
                     sales_order.status = SalesOrderStatus.PENDING
                     sales_order.updated_by_user_id = current_user_id
                     sales_order.save()
+                after = serialize_sales_order(sales_order)
+                publish_order_admin_event(
+                    event_name='sales_order.reservations_released',
+                    payload=after,
+                    actor=_audit_actor_from_request(request),
+                    target={
+                        'type': 'sales_order',
+                        'id': str(sales_order.id),
+                        'label': sales_order.reference,
+                    },
+                    summary=f'Reservations released for sales order {sales_order.reference}.',
+                    metadata={
+                        'released_count': released_count,
+                        'reservations': released_summaries,
+                    },
+                    before=before,
+                    after=after,
+                    feature_area='sales_fulfillment',
+                    reference_number=sales_order.reference,
+                )
 
                 self._log_activity('RELEASE_RESERVATION', sales_order, {'released_count': released_count})
 
@@ -1618,9 +2468,11 @@ class SalesOrderViewSet(BaseCachePermissionViewset):
         payload = serializer.validated_data
         current_user_id = get_request_user_id(request, as_str=False)
         profile_id = get_request_profile_id(request, required=True, as_str=False)
+        structural_scope_location_id = _resolve_structural_scope_location_id(request, payload)
 
         try:
             with transaction.atomic():
+                before = serialize_sales_order(sales_order)
                 shipment_items_payload = payload['shipment_items']
                 for item in shipment_items_payload:
                     if 'reservation_id' in item:
@@ -1632,6 +2484,12 @@ class SalesOrderViewSet(BaseCachePermissionViewset):
                         ).first()
                         if reservation is None:
                             raise ValueError(f"Reservation {item['reservation_id']} not found")
+                        _assert_reservation_within_scope(
+                            profile_id=profile_id,
+                            structural_scope_location_id=structural_scope_location_id,
+                            reservation=reservation,
+                            label=f"Reservation {item['reservation_id']}",
+                        )
                         line_item = sales_order.line_items.select_related('inventory_item').get(
                             id=reservation.external_order_line_id
                         )
@@ -1652,6 +2510,7 @@ class SalesOrderViewSet(BaseCachePermissionViewset):
                 )
 
                 shipment_line_count = 0
+                shipment_line_summaries = []
                 for item in shipment_items_payload:
                     notes = item.get('notes') or payload.get('notes', '') or f"Shipment {shipment.reference}"
                     reservation = None
@@ -1672,6 +2531,12 @@ class SalesOrderViewSet(BaseCachePermissionViewset):
                         ).first()
                         if reservation is None:
                             raise ValueError(f"Reservation {item['reservation_id']} not found")
+                        _assert_reservation_within_scope(
+                            profile_id=profile_id,
+                            structural_scope_location_id=structural_scope_location_id,
+                            reservation=reservation,
+                            label=f"Reservation {item['reservation_id']}",
+                        )
 
                         line_item = sales_order.line_items.select_related('inventory_item').get(
                             id=reservation.external_order_line_id
@@ -1724,6 +2589,12 @@ class SalesOrderViewSet(BaseCachePermissionViewset):
                         ).first()
                         if stock_location is None:
                             raise ValueError(f"Stock location {item['location_id']} not found")
+                        _assert_location_within_scope(
+                            profile_id=profile_id,
+                            structural_scope_location_id=structural_scope_location_id,
+                            stock_location=stock_location,
+                            label=f"Shipment location {item['location_id']}",
+                        )
 
                         stock_lot_id = item.get('stock_lot_id')
                         if stock_lot_id:
@@ -1768,6 +2639,19 @@ class SalesOrderViewSet(BaseCachePermissionViewset):
                         updated_by_user_id=current_user_id,
                     )
                     shipment_line_count += 1
+                    shipment_line_summaries.append({
+                        'sales_order_line_item_id': str(line_item.id),
+                        'inventory_item_id': str(line_item.inventory_item_id),
+                        'inventory_name': line_item.inventory_item.name_snapshot,
+                        'inventory_barcode': line_item.inventory_item.barcode_snapshot or '',
+                        'inventory_sku': line_item.inventory_item.sku_snapshot or '',
+                        'quantity_shipped': str(ship_quantity),
+                        'stock_location_id': str(stock_location.id),
+                        'stock_location_name': stock_location.name,
+                        'reservation_id': str(reservation.id) if reservation else '',
+                        'lot_number': getattr(stock_lot, 'lot_number', '') or '',
+                        'serial_number': getattr(stock_serial, 'serial_number', '') or '',
+                    })
 
                 sales_order.shipment_date = payload.get('shipment_date') or timezone.now()
                 if not sales_order.issue_date:
@@ -1780,6 +2664,58 @@ class SalesOrderViewSet(BaseCachePermissionViewset):
                 )
                 sales_order.updated_by_user_id = current_user_id
                 sales_order.save()
+                after = serialize_sales_order(sales_order)
+                shipment_payload = serialize_sales_order_shipment(shipment)
+                publish_order_admin_event(
+                    event_name='sales_order.shipment_created',
+                    payload=shipment_payload,
+                    actor=_audit_actor_from_request(request),
+                    target={
+                        'type': 'sales_order_shipment',
+                        'id': str(shipment.id),
+                        'label': shipment.reference,
+                    },
+                    summary=f'Shipment created for sales order {sales_order.reference}: {shipment.reference}.',
+                    metadata={
+                        'sales_order_id': str(sales_order.id),
+                        'sales_order_reference': sales_order.reference,
+                        'shipment_line_count': shipment_line_count,
+                        'shipment_lines': shipment_line_summaries,
+                    },
+                    after=shipment_payload,
+                    feature_area='sales_shipments',
+                    reference_number=shipment.reference,
+                    notification_category='sales_order',
+                    notification_title=f'Shipment {shipment.reference} created',
+                    notification_message=(
+                        f'Shipment {shipment.reference} was created for sales order {sales_order.reference}.'
+                    ),
+                    notification_action_url='/order/sales',
+                )
+                publish_order_admin_event(
+                    event_name='sales_order.shipped',
+                    payload=after,
+                    actor=_audit_actor_from_request(request),
+                    target={
+                        'type': 'sales_order',
+                        'id': str(sales_order.id),
+                        'label': sales_order.reference,
+                    },
+                    summary=f'Sales order shipped: {sales_order.reference}.',
+                    metadata={
+                        'shipment_id': str(shipment.id),
+                        'shipment_reference': shipment.reference,
+                        'shipment_line_count': shipment_line_count,
+                    },
+                    before=before,
+                    after=after,
+                    feature_area='sales_fulfillment',
+                    reference_number=sales_order.reference,
+                    notification_category='sales_order',
+                    notification_title=f'Sales order {sales_order.reference} shipped',
+                    notification_message=f'Sales order {sales_order.reference} was shipped.',
+                    notification_action_url='/order/sales',
+                )
 
                 self._log_activity('SHIP', sales_order, {
                     'shipment_reference': shipment.reference,
@@ -1810,10 +2746,32 @@ class SalesOrderViewSet(BaseCachePermissionViewset):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        before = serialize_sales_order(sales_order)
         sales_order.status = SalesOrderStatus.COMPLETED
         sales_order.complete_date = timezone.now()
         sales_order.updated_by_user_id = get_request_user_id(request, as_str=False)
         sales_order.save()
+        after = serialize_sales_order(sales_order)
+        publish_order_admin_event(
+            event_name='sales_order.completed',
+            payload=after,
+            actor=_audit_actor_from_request(request),
+            target={
+                'type': 'sales_order',
+                'id': str(sales_order.id),
+                'label': sales_order.reference,
+            },
+            summary=f'Sales order completed: {sales_order.reference}.',
+            metadata={'status': sales_order.status},
+            before=before,
+            after=after,
+            feature_area='sales_orders',
+            reference_number=sales_order.reference,
+            notification_category='sales_order',
+            notification_title=f'Sales order {sales_order.reference} completed',
+            notification_message=f'Sales order {sales_order.reference} was completed.',
+            notification_action_url='/order/sales',
+        )
 
         self._log_activity('COMPLETE', sales_order, {'complete_date': sales_order.complete_date})
         return Response(SalesOrderDetailSerializer(sales_order, context={'request': request}).data)
@@ -1837,6 +2795,7 @@ class SalesOrderViewSet(BaseCachePermissionViewset):
 
         try:
             with transaction.atomic():
+                before = serialize_sales_order(sales_order)
                 reservations = StockReservation.objects.select_related(
                     'stock_location',
                     'stock_lot',
@@ -1869,6 +2828,28 @@ class SalesOrderViewSet(BaseCachePermissionViewset):
                 sales_order.updated_by_user_id = current_user_id
                 sales_order.notes = request.data.get('notes', sales_order.notes)
                 sales_order.save()
+                after = serialize_sales_order(sales_order)
+                publish_order_admin_event(
+                    event_name='sales_order.cancelled',
+                    payload=after,
+                    actor=_audit_actor_from_request(request),
+                    target={
+                        'type': 'sales_order',
+                        'id': str(sales_order.id),
+                        'label': sales_order.reference,
+                    },
+                    summary=f'Sales order cancelled: {sales_order.reference}.',
+                    metadata={'notes': request.data.get('notes', '')},
+                    before=before,
+                    after=after,
+                    severity='warning',
+                    feature_area='sales_orders',
+                    reference_number=sales_order.reference,
+                    notification_category='sales_order',
+                    notification_title=f'Sales order {sales_order.reference} cancelled',
+                    notification_message=f'Sales order {sales_order.reference} was cancelled.',
+                    notification_action_url='/order/sales',
+                )
 
                 self._log_activity('CANCEL', sales_order, {'notes': request.data.get('notes', '')})
 
@@ -1953,10 +2934,13 @@ class ReturnOrderViewSet(BaseCachePermissionViewset):
         payload = serializer.validated_data
         current_user_id = get_request_user_id(request, as_str=False)
         profile_id = get_request_profile_id(request, required=True, as_str=False)
+        structural_scope_location_id = _resolve_structural_scope_location_id(request, payload)
 
         try:
             with transaction.atomic():
+                before = serialize_return_order(return_order)
                 processed_count = 0
+                processed_summaries = []
                 for item in payload['return_items']:
                     try:
                         return_line = return_order.line_items.select_related(
@@ -1987,6 +2971,12 @@ class ReturnOrderViewSet(BaseCachePermissionViewset):
                     ).first()
                     if stock_location is None:
                         raise ValueError(f"Stock location {item['location_id']} not found")
+                    _assert_location_within_scope(
+                        profile_id=profile_id,
+                        structural_scope_location_id=structural_scope_location_id,
+                        stock_location=stock_location,
+                        label=f"Return dispatch location {item['location_id']}",
+                    )
 
                     stock_lot = None
                     stock_lot_id = item.get('stock_lot_id')
@@ -2022,12 +3012,49 @@ class ReturnOrderViewSet(BaseCachePermissionViewset):
                     return_line.updated_by_user_id = current_user_id
                     return_line.save()
                     processed_count += 1
+                    processed_summaries.append({
+                        'return_order_line_item_id': str(return_line.id),
+                        'inventory_item_id': str(original_line.inventory_item_id),
+                        'inventory_name': original_line.inventory_item.name_snapshot,
+                        'inventory_barcode': original_line.inventory_item.barcode_snapshot or '',
+                        'inventory_sku': original_line.inventory_item.sku_snapshot or '',
+                        'quantity_processed': str(issue_quantity),
+                        'stock_location_id': str(stock_location.id),
+                        'stock_location_name': stock_location.name,
+                        'lot_number': getattr(stock_lot, 'lot_number', '') or '',
+                        'serial_number': getattr(stock_serial, 'serial_number', '') or '',
+                    })
 
                 return_order.status = ReturnOrderStatus.IN_TRANSIT
                 if not return_order.issue_date:
                     return_order.issue_date = timezone.now()
                 return_order.updated_by_user_id = current_user_id
                 return_order.save()
+                after = serialize_return_order(return_order)
+                publish_order_admin_event(
+                    event_name='return_order.dispatched',
+                    payload=after,
+                    actor=_audit_actor_from_request(request),
+                    target={
+                        'type': 'return_order',
+                        'id': str(return_order.id),
+                        'label': return_order.reference,
+                    },
+                    summary=f'Return order dispatched: {return_order.reference}.',
+                    metadata={
+                        'processed_count': processed_count,
+                        'processed_lines': processed_summaries,
+                        'notes': payload.get('notes', ''),
+                    },
+                    before=before,
+                    after=after,
+                    feature_area='supplier_returns',
+                    reference_number=return_order.reference,
+                    notification_category='purchase_order',
+                    notification_title=f'Return order {return_order.reference} dispatched',
+                    notification_message=f'Return order {return_order.reference} was dispatched.',
+                    notification_action_url='/order/purchase',
+                )
 
                 self._log_activity('DISPATCH_RETURN', return_order, {
                     'processed_lines': processed_count,
@@ -2060,10 +3087,32 @@ class ReturnOrderViewSet(BaseCachePermissionViewset):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
+        before = serialize_return_order(return_order)
         return_order.status = ReturnOrderStatus.COMPLETED
         return_order.complete_date = timezone.now()
         return_order.updated_by_user_id = get_request_user_id(request, as_str=False)
         return_order.save()
+        after = serialize_return_order(return_order)
+        publish_order_admin_event(
+            event_name='return_order.completed',
+            payload=after,
+            actor=_audit_actor_from_request(request),
+            target={
+                'type': 'return_order',
+                'id': str(return_order.id),
+                'label': return_order.reference,
+            },
+            summary=f'Return order completed: {return_order.reference}.',
+            metadata={'status': return_order.status},
+            before=before,
+            after=after,
+            feature_area='supplier_returns',
+            reference_number=return_order.reference,
+            notification_category='purchase_order',
+            notification_title=f'Return order {return_order.reference} completed',
+            notification_message=f'Return order {return_order.reference} was completed.',
+            notification_action_url='/order/purchase',
+        )
 
         self._log_activity('COMPLETE_RETURN', return_order, {
             'completed_at': return_order.complete_date,
@@ -2086,10 +3135,33 @@ class ReturnOrderViewSet(BaseCachePermissionViewset):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
+        before = serialize_return_order(return_order)
         return_order.status = ReturnOrderStatus.CANCELLED
         return_order.updated_by_user_id = get_request_user_id(request, as_str=False)
         return_order.notes = request.data.get('notes', return_order.notes)
         return_order.save()
+        after = serialize_return_order(return_order)
+        publish_order_admin_event(
+            event_name='return_order.cancelled',
+            payload=after,
+            actor=_audit_actor_from_request(request),
+            target={
+                'type': 'return_order',
+                'id': str(return_order.id),
+                'label': return_order.reference,
+            },
+            summary=f'Return order cancelled: {return_order.reference}.',
+            metadata={'notes': request.data.get('notes', '')},
+            before=before,
+            after=after,
+            severity='warning',
+            feature_area='supplier_returns',
+            reference_number=return_order.reference,
+            notification_category='purchase_order',
+            notification_title=f'Return order {return_order.reference} cancelled',
+            notification_message=f'Return order {return_order.reference} was cancelled.',
+            notification_action_url='/order/purchase',
+        )
 
         self._log_activity('CANCEL_RETURN', return_order, {
             'notes': request.data.get('notes', ''),

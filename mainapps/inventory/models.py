@@ -567,4 +567,62 @@ class InventoryItem(TenantStampedUUIDModel):
         return self.name_snapshot
 
 
-registerable_models = [InventoryCategory, InventoryItem]
+class InventoryPlacement(TenantStampedUUIDModel):
+    inventory_item = models.ForeignKey(
+        InventoryItem,
+        on_delete=models.CASCADE,
+        related_name='placements',
+        verbose_name=_("Inventory Item"),
+    )
+    structural_location = TreeForeignKey(
+        'stock.StockLocation',
+        on_delete=models.PROTECT,
+        related_name='inventory_placements',
+        verbose_name=_("Structural Location"),
+    )
+    location_name_snapshot = models.CharField(max_length=255, blank=True, default="", verbose_name=_("Location Snapshot"))
+    active = models.BooleanField(default=True, verbose_name=_("Active"))
+    salable_override = models.BooleanField(null=True, blank=True, verbose_name=_("Salable Override"))
+    purchaseable_override = models.BooleanField(null=True, blank=True, verbose_name=_("Purchaseable Override"))
+    reorder_point_override = models.DecimalField(max_digits=15, decimal_places=5, null=True, blank=True)
+    reorder_quantity_override = models.DecimalField(max_digits=15, decimal_places=5, null=True, blank=True)
+    minimum_stock_level_override = models.DecimalField(max_digits=15, decimal_places=5, null=True, blank=True)
+    safety_stock_level_override = models.DecimalField(max_digits=15, decimal_places=5, null=True, blank=True)
+    allow_negative_stock_override = models.BooleanField(null=True, blank=True, verbose_name=_("Allow Negative Stock Override"))
+    metadata = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        ordering = ['inventory_item__name_snapshot', 'location_name_snapshot']
+        indexes = [
+            models.Index(fields=['profile_id', 'active']),
+            models.Index(fields=['profile_id', 'structural_location']),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=['inventory_item', 'structural_location'],
+                name='unique_inventory_placement_per_location',
+            ),
+        ]
+
+    def clean(self):
+        super().clean()
+        if self.inventory_item_id and self.structural_location_id:
+            inventory_profile_id = _sync_profile_lookup_value(self.inventory_item.profile_id or self.inventory_item.profile)
+            location_profile_id = _sync_profile_lookup_value(self.structural_location.profile_id or self.structural_location.profile)
+            if inventory_profile_id is not None and location_profile_id is not None and inventory_profile_id != location_profile_id:
+                raise ValidationError(_("Inventory placement and structural location must belong to the same workspace."))
+            if not self.structural_location.structural:
+                raise ValidationError(_("Inventory placement must point to a structural stock location."))
+
+    def save(self, *args, **kwargs):
+        if self.inventory_item_id and self.profile_id is None and not self.profile:
+            self.profile_id = _sync_profile_lookup_value(self.inventory_item.profile_id or self.inventory_item.profile)
+        if self.structural_location_id:
+            self.location_name_snapshot = str(self.structural_location.name or "")
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.inventory_item.name_snapshot} @ {self.location_name_snapshot or self.structural_location_id}"
+
+
+registerable_models = [InventoryCategory, InventoryItem, InventoryPlacement]

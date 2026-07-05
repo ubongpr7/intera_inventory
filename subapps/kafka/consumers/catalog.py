@@ -8,6 +8,8 @@ from django.db import transaction
 from mainapps.inventory.models import InventoryItem, InventoryItemStatus
 from mainapps.projections.models import CatalogProductProjection, CatalogVariantProjection
 from subapps.kafka.producers.inventory import publish_inventory_availability_upserted
+from subapps.services.inventory_variant_cleanup import delete_inventory_item_if_safe
+from subapps.services.location_scope import ensure_inventory_item_placement
 
 
 def _coerce_bool(value: Any, default: bool = True) -> bool:
@@ -98,6 +100,7 @@ def _ensure_inventory_item_for_variant(variant: CatalogVariantProjection) -> Inv
         if changed_fields:
             inventory_item.save(update_fields=[*changed_fields, "updated_at"])
 
+    ensure_inventory_item_placement(inventory_item)
     return inventory_item
 
 
@@ -162,12 +165,24 @@ def handle_catalog_variant_event(envelope: dict[str, Any], **_: Any) -> bool:
         )
 
         inventory_item = None
-        if envelope.get("event_name") != "catalog.variant.deleted":
+        publish_inventory_item_id = None
+        if envelope.get("event_name") == "catalog.variant.deleted":
+            inventory_item = (
+                InventoryItem.objects
+                .prefetch_related("stock_balances")
+                .filter(profile_id=variant.profile_id, product_variant_id=variant.variant_id)
+                .first()
+            )
+            if inventory_item is not None:
+                delete_inventory_item_if_safe(inventory_item)
+        else:
             inventory_item = _ensure_inventory_item_for_variant(variant)
+            if inventory_item is not None:
+                publish_inventory_item_id = inventory_item.id
 
-        if inventory_item is not None:
+        if publish_inventory_item_id is not None:
             transaction.on_commit(
-                lambda item_id=inventory_item.id: publish_inventory_availability_upserted(
+                lambda item_id=publish_inventory_item_id: publish_inventory_availability_upserted(
                     inventory_item_id=item_id
                 )
             )

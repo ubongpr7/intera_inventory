@@ -37,6 +37,12 @@ from mainapps.stock.serializers import (
     StockReservationSerializer,
     StockSerialDetailSerializer,
 )
+from subapps.kafka.producers.inventory_admin import (
+    publish_inventory_admin_event,
+    serialize_inventory_item,
+    serialize_stock_location,
+    serialize_stock_reservation,
+)
 from subapps.permissions.constants import UNIFIED_PERMISSION_DICT
 from subapps.permissions.microservice_permissions import BaseCachePermissionViewset, CachingMixin, PermissionRequiredMixin
 from subapps.services.inventory_read_model import (
@@ -44,12 +50,69 @@ from subapps.services.inventory_read_model import (
     get_low_stock_rows,
     get_profile_stock_analytics,
 )
+from subapps.services.location_scope import (
+    get_location_scope_ids,
+    get_location_scope_ids_for_locations,
+    resolve_structural_locations,
+)
 from subapps.services.stock_domain import StockDomainError, StockDomainService
 from subapps.utils.request_context import get_request_profile_id, get_request_user_id, scope_queryset_by_identity
 
 
-def filter_inventory_items_for_location(queryset, location_id):
-    return queryset.filter(stock_balances__stock_location_id=location_id).distinct()
+def _audit_actor_from_request(request) -> dict[str, str]:
+    return {
+        'user_id': str(get_request_user_id(request, required=True) or '').strip(),
+    }
+
+
+def _resolve_location_scope_ids(*, profile_id, location_id):
+    return get_location_scope_ids(profile_id=profile_id, stock_location_id=location_id)
+
+
+def _apply_location_scope_filter(queryset, *, field_name: str, profile_id, location_id):
+    scoped_location_ids = _resolve_location_scope_ids(profile_id=profile_id, location_id=location_id)
+    if not scoped_location_ids:
+        return queryset.none()
+    return queryset.filter(**{f"{field_name}__in": scoped_location_ids})
+
+
+def _get_scope_location_param(request):
+    return request.query_params.get('stock_location') or request.query_params.get('structural_location_id')
+
+
+def _get_scope_location_params(request, *, singular_keys, plural_keys):
+    raw_ids: list[str] = []
+    for key in singular_keys:
+        value = request.query_params.get(key)
+        if value:
+            raw_ids.append(value)
+    for key in plural_keys:
+        raw_ids.extend(request.query_params.getlist(key))
+        csv_value = request.query_params.get(key)
+        if csv_value:
+            raw_ids.extend([part.strip() for part in csv_value.split(',') if part.strip()])
+    return raw_ids
+
+
+def _get_scope_mode(request):
+    value = (request.query_params.get('scope') or '').strip().lower()
+    if value == 'all':
+        return 'all_locations'
+    return value
+
+
+def filter_inventory_items_for_location(queryset, location_id, *, profile_id=None):
+    if profile_id is None:
+        location = StockLocation.objects.filter(id=location_id).first()
+        profile_id = getattr(location, "profile_id", None)
+    if profile_id is None:
+        return queryset.none()
+    return _apply_location_scope_filter(
+        queryset,
+        field_name="stock_balances__stock_location_id",
+        profile_id=profile_id,
+        location_id=location_id,
+    ).distinct()
 
 
 def filter_inventory_items_for_purchase_order(queryset, purchase_order_id):
@@ -73,6 +136,89 @@ class StockLocationViewSet(BaseInventoryViewSet):
     ordering_fields = ['name', 'code', 'created_at']
     ordering = ['name']
 
+    def perform_create(self, serializer):
+        from subapps.services.subscription_entitlements import enforce_subscription_limit
+        profile_id = get_request_profile_id(self.request, required=True, as_str=False)
+        if serializer.validated_data.get('structural', False):
+            usage = self.get_queryset().filter(structural=True).count()
+            enforce_subscription_limit(profile_id=profile_id, feature='structural-locations', usage=usage)
+        super().perform_create(serializer)
+        payload = serialize_stock_location(serializer.instance)
+        publish_inventory_admin_event(
+            event_name='inventory.stock_location.created',
+            payload=payload,
+            actor=_audit_actor_from_request(self.request),
+            target={
+                'type': 'stock_location',
+                'id': payload['stock_location_id'],
+                'label': payload['name'],
+            },
+            summary=f"Stock location created: {payload['name']}.",
+            metadata={
+                'code': payload['code'],
+                'structural': payload['structural'],
+                'external': payload['external'],
+                'location_type_name': payload['location_type_name'],
+            },
+            after=payload,
+            feature_area='stock_topology',
+            reference_number=payload['code'],
+        )
+
+    def perform_update(self, serializer):
+        before = serialize_stock_location(self.get_object())
+        super().perform_update(serializer)
+        payload = serialize_stock_location(serializer.instance)
+        publish_inventory_admin_event(
+            event_name='inventory.stock_location.updated',
+            payload=payload,
+            actor=_audit_actor_from_request(self.request),
+            target={
+                'type': 'stock_location',
+                'id': payload['stock_location_id'],
+                'label': payload['name'],
+            },
+            summary=f"Stock location updated: {payload['name']}.",
+            metadata={
+                'code': payload['code'],
+                'structural': payload['structural'],
+                'external': payload['external'],
+                'location_type_name': payload['location_type_name'],
+            },
+            before=before,
+            after=payload,
+            feature_area='stock_topology',
+            reference_number=payload['code'],
+        )
+
+    def destroy(self, request, *args, **kwargs):
+        location = self.get_object()
+        before = serialize_stock_location(location)
+        response = super().destroy(request, *args, **kwargs)
+        publish_inventory_admin_event(
+            event_name='inventory.stock_location.deleted',
+            payload=before,
+            actor=_audit_actor_from_request(request),
+            target={
+                'type': 'stock_location',
+                'id': before['stock_location_id'],
+                'label': before['name'],
+            },
+            summary=f"Stock location deleted: {before['name']}.",
+            metadata={
+                'code': before['code'],
+                'structural': before['structural'],
+                'external': before['external'],
+                'location_type_name': before['location_type_name'],
+            },
+            before=before,
+            after={},
+            severity='warning',
+            feature_area='stock_topology',
+            reference_number=before['code'],
+        )
+        return response
+
     def get_serializer_class(self):
         if self.action == 'list':
             return StockLocationListSerializer
@@ -81,7 +227,12 @@ class StockLocationViewSet(BaseInventoryViewSet):
     @action(detail=True, methods=['get'])
     def inventory_items(self, request, pk=None):
         location = self.get_object()
-        inventory_item_ids = set(location.stock_balances.values_list('inventory_item_id', flat=True))
+        inventory_item_ids = set(
+            StockBalance.objects.filter(
+                profile_id=location.profile_id,
+                stock_location_id__in=_resolve_location_scope_ids(profile_id=location.profile_id, location_id=location.id) or [location.id],
+            ).values_list('inventory_item_id', flat=True)
+        )
         inventory_items = InventoryItem.objects.filter(id__in=inventory_item_ids).order_by('-created_at')
         summary_map = get_inventory_item_summary_map(inventory_items, stock_location=location)
 
@@ -106,6 +257,7 @@ class StockLocationViewSet(BaseInventoryViewSet):
         from_location = self.get_object()
         data = request.data
         to_location_id = data.get('to_location_id')
+        structural_scope_location_id = data.get('structural_location_id') or request.query_params.get('structural_location_id')
         inventory_item_id = data.get('inventory_item_id')
         stock_lot_id = data.get('stock_lot_id')
         stock_serial_id = data.get('stock_serial_id')
@@ -140,6 +292,15 @@ class StockLocationViewSet(BaseInventoryViewSet):
         ).first()
         if to_location is None:
             return Response({'error': 'Destination location not found'}, status=status.HTTP_404_NOT_FOUND)
+        if structural_scope_location_id:
+            scoped_location_ids = _resolve_location_scope_ids(profile_id=profile_id, location_id=structural_scope_location_id)
+            if not scoped_location_ids:
+                return Response({'error': 'The selected structural location scope is unavailable'}, status=status.HTTP_400_BAD_REQUEST)
+            if from_location.id not in scoped_location_ids or to_location.id not in scoped_location_ids:
+                return Response(
+                    {'error': 'Source and destination locations must belong to the selected structural location scope'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
 
         stock_lot = None
         if stock_lot_id:
@@ -154,7 +315,7 @@ class StockLocationViewSet(BaseInventoryViewSet):
                 return Response({'error': 'Stock serial not found for the selected inventory item'}, status=status.HTTP_404_NOT_FOUND)
 
         try:
-            StockDomainService.transfer_stock(
+            transfer_result = StockDomainService.transfer_stock(
                 inventory_item=inventory_item,
                 from_location=from_location,
                 to_location=to_location,
@@ -166,6 +327,51 @@ class StockLocationViewSet(BaseInventoryViewSet):
             )
         except StockDomainError as exc:
             return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        item_payload = serialize_inventory_item(inventory_item)
+        publish_inventory_admin_event(
+            event_name='inventory.stock.transferred',
+            payload={
+                **item_payload,
+                'from_location_id': str(from_location.id),
+                'from_location_name': from_location.name,
+                'to_location_id': str(to_location.id),
+                'to_location_name': to_location.name,
+                'quantity': float(quantity),
+                'source_quantity_after': float(transfer_result['source_balance'].quantity_on_hand),
+                'destination_quantity_after': float(transfer_result['destination_balance'].quantity_on_hand),
+                'stock_lot_id': str(stock_lot.id) if stock_lot else '',
+                'stock_serial_id': str(stock_serial.id) if stock_serial else '',
+            },
+            actor=_audit_actor_from_request(request),
+            target={
+                'type': 'inventory_item',
+                'id': item_payload['inventory_item_id'],
+                'label': item_payload['name_snapshot'],
+                'barcode': item_payload['barcode_snapshot'],
+                'sku': item_payload['sku_snapshot'],
+            },
+            summary=f"Stock transferred for {item_payload['name_snapshot']} from {from_location.name} to {to_location.name}.",
+            metadata={
+                'from_location_name': from_location.name,
+                'to_location_name': to_location.name,
+                'quantity': float(quantity),
+            },
+            after={
+                'from_location_id': str(from_location.id),
+                'to_location_id': str(to_location.id),
+                'quantity': float(quantity),
+            },
+            feature_area='stock_control',
+            reference_number=item_payload['sku_snapshot'] or item_payload['barcode_snapshot'],
+            notification_category='stock_alert',
+            notification_title=f"Stock transferred for {item_payload['name_snapshot']}",
+            notification_message=(
+                f"{float(quantity)} unit{'s' if quantity != 1 else ''} of {item_payload['name_snapshot']} "
+                f"were transferred from {from_location.name} to {to_location.name}."
+            ),
+            notification_action_url='/inventory',
+        )
 
         return Response({
             'message': 'Stock transferred successfully',
@@ -225,12 +431,146 @@ class InventoryItemViewSet(BaseInventoryViewSetMixin):
             return InventoryItemListSerializer
         return InventoryItemDetailSerializer
 
+    def perform_create(self, serializer):
+        profile_id = get_request_profile_id(self.request, required=True, as_str=False)
+        user_id = get_request_user_id(self.request, required=True, as_str=False)
+        inventory_item = serializer.save(
+            profile_id=profile_id,
+            created_by_user_id=user_id,
+            updated_by_user_id=user_id,
+        )
+        payload = serialize_inventory_item(inventory_item)
+        publish_inventory_admin_event(
+            event_name='inventory.item.created',
+            payload=payload,
+            actor=_audit_actor_from_request(self.request),
+            target={
+                'type': 'inventory_item',
+                'id': payload['inventory_item_id'],
+                'label': payload['name_snapshot'],
+                'barcode': payload['barcode_snapshot'],
+                'sku': payload['sku_snapshot'],
+            },
+            summary=f"Inventory item created: {payload['name_snapshot']}.",
+            metadata={
+                'inventory_type': payload['inventory_type'],
+                'status': payload['status'],
+                'category_name': payload['inventory_category_name'],
+            },
+            after=payload,
+            feature_area='inventory_master',
+            reference_number=payload['sku_snapshot'] or payload['barcode_snapshot'],
+            notification_category='stock_alert',
+            notification_title=f"Inventory item {payload['name_snapshot']} created",
+            notification_message=f"Inventory item {payload['name_snapshot']} was added to the workspace catalog.",
+            notification_action_url='/inventory',
+        )
+
+    def perform_update(self, serializer):
+        before = serialize_inventory_item(self.get_object())
+        inventory_item = serializer.save(updated_by_user_id=get_request_user_id(self.request, required=True, as_str=False))
+        payload = serialize_inventory_item(inventory_item)
+        publish_inventory_admin_event(
+            event_name='inventory.item.updated',
+            payload=payload,
+            actor=_audit_actor_from_request(self.request),
+            target={
+                'type': 'inventory_item',
+                'id': payload['inventory_item_id'],
+                'label': payload['name_snapshot'],
+                'barcode': payload['barcode_snapshot'],
+                'sku': payload['sku_snapshot'],
+            },
+            summary=f"Inventory item updated: {payload['name_snapshot']}.",
+            metadata={
+                'inventory_type': payload['inventory_type'],
+                'status': payload['status'],
+                'category_name': payload['inventory_category_name'],
+            },
+            before=before,
+            after=payload,
+            feature_area='inventory_master',
+            reference_number=payload['sku_snapshot'] or payload['barcode_snapshot'],
+        )
+
+    def destroy(self, request, *args, **kwargs):
+        inventory_item = self.get_object()
+        before = serialize_inventory_item(inventory_item)
+        response = super().destroy(request, *args, **kwargs)
+        publish_inventory_admin_event(
+            event_name='inventory.item.deleted',
+            payload=before,
+            actor=_audit_actor_from_request(request),
+            target={
+                'type': 'inventory_item',
+                'id': before['inventory_item_id'],
+                'label': before['name_snapshot'],
+                'barcode': before['barcode_snapshot'],
+                'sku': before['sku_snapshot'],
+            },
+            summary=f"Inventory item deleted: {before['name_snapshot']}.",
+            metadata={
+                'inventory_type': before['inventory_type'],
+                'status': before['status'],
+                'category_name': before['inventory_category_name'],
+            },
+            before=before,
+            after={},
+            severity='warning',
+            feature_area='inventory_master',
+            reference_number=before['sku_snapshot'] or before['barcode_snapshot'],
+        )
+        return response
+
+    def _get_requested_stock_location(self):
+        profile_id = get_request_profile_id(self.request, as_str=False)
+        if not profile_id:
+            return None
+        location_id = (
+            self.request.query_params.get('structural_location_id')
+            or self.request.query_params.get('stock_location')
+            or self.request.query_params.get('location')
+        )
+        if not location_id:
+            return None
+        return scope_queryset_by_identity(
+            StockLocation.objects.filter(id=location_id),
+            canonical_field='profile_id',
+            legacy_field='profile',
+            value=profile_id,
+        ).first()
+
+    def _get_requested_structural_locations(self):
+        profile_id = get_request_profile_id(self.request, as_str=False)
+        if not profile_id:
+            return []
+        raw_ids = _get_scope_location_params(
+            self.request,
+            singular_keys=('structural_location_id', 'stock_location', 'location'),
+            plural_keys=('structural_location_ids', 'stock_location_ids'),
+        )
+        return resolve_structural_locations(profile_id=profile_id, stock_location_ids=raw_ids)
+
+    def _get_scope_mode(self):
+        return _get_scope_mode(self.request)
+
+    def _get_inventory_scope(self):
+        if self._get_scope_mode() == 'all_locations':
+            return None, []
+        structural_locations = self._get_requested_structural_locations()
+        return (structural_locations[0], structural_locations) if structural_locations else (None, [])
+
     def get_serializer_context(self):
         context = super().get_serializer_context()
         context['request'] = self.request
+        stock_location, stock_locations = self._get_inventory_scope()
         if self.action in {'list', 'expiring_soon'}:
             try:
-                context['inventory_item_summary_map'] = get_inventory_item_summary_map(list(self.get_queryset()))
+                context['inventory_item_summary_map'] = get_inventory_item_summary_map(
+                    list(self.get_queryset()),
+                    stock_location=stock_location,
+                    stock_locations=stock_locations,
+                )
             except Exception:
                 context['inventory_item_summary_map'] = {}
         elif self.action == 'retrieve':
@@ -238,7 +578,11 @@ class InventoryItemViewSet(BaseInventoryViewSetMixin):
                 target_id = self.kwargs.get(self.lookup_field or 'pk')
                 target_item = self.get_queryset().filter(pk=target_id).first() if target_id else None
                 context['inventory_item_summary_map'] = (
-                    get_inventory_item_summary_map([target_item]) if target_item is not None else {}
+                    get_inventory_item_summary_map(
+                        [target_item],
+                        stock_location=stock_location,
+                        stock_locations=stock_locations,
+                    ) if target_item is not None else {}
                 )
             except Exception:
                 context['inventory_item_summary_map'] = {}
@@ -247,6 +591,7 @@ class InventoryItemViewSet(BaseInventoryViewSetMixin):
     def get_queryset(self):
         queryset = super().get_queryset()
         location = self.request.query_params.get('location')
+        _, stock_locations = self._get_inventory_scope()
         purchase_order = self.request.query_params.get('purchase_order')
         sales_order = self.request.query_params.get('sales_order')
         product_variant = self.request.query_params.get('product_variant')
@@ -258,7 +603,17 @@ class InventoryItemViewSet(BaseInventoryViewSetMixin):
         if category_id:
             queryset = queryset.filter(inventory_category_id=category_id)
         if location:
-            queryset = filter_inventory_items_for_location(queryset, location)
+            queryset = filter_inventory_items_for_location(queryset, location, profile_id=get_request_profile_id(self.request, as_str=False))
+        elif stock_locations:
+            scoped_location_ids = get_location_scope_ids_for_locations(
+                profile_id=get_request_profile_id(self.request, required=True, as_str=False),
+                stock_locations=stock_locations,
+            )
+            queryset = (
+                queryset.filter(stock_balances__stock_location_id__in=scoped_location_ids).distinct()
+                if scoped_location_ids
+                else queryset.none()
+            )
         if purchase_order:
             queryset = filter_inventory_items_for_purchase_order(queryset, purchase_order)
         if sales_order:
@@ -277,13 +632,19 @@ class InventoryItemViewSet(BaseInventoryViewSetMixin):
 
         quantity_filter = self.request.query_params.get('quantity_filter')
         if quantity_filter in {'zero', 'low'}:
-            summary_map = get_inventory_item_summary_map(list(queryset))
+            stock_location, stock_locations = self._get_inventory_scope()
+            summary_map = get_inventory_item_summary_map(
+                list(queryset),
+                stock_location=stock_location,
+                stock_locations=stock_locations,
+            )
             matching_ids = []
             for item in queryset:
                 quantity = summary_map.get(item.id, {}).get('quantity', Decimal('0'))
                 if quantity_filter == 'zero' and quantity <= 0:
                     matching_ids.append(item.id)
-                elif quantity_filter == 'low' and quantity <= Decimal(str(item.minimum_stock_level or 0)):
+                minimum_stock_level = Decimal(str(item.minimum_stock_level or 0))
+                if quantity_filter == 'low' and minimum_stock_level > 0 and Decimal('0') < quantity <= minimum_stock_level:
                     matching_ids.append(item.id)
             queryset = queryset.filter(id__in=matching_ids) if matching_ids else queryset.none()
 
@@ -302,6 +663,7 @@ class InventoryItemViewSet(BaseInventoryViewSetMixin):
     @action(detail=True, methods=['post'])
     def update_status(self, request, pk=None):
         inventory_item = self.get_object()
+        before = serialize_inventory_item(inventory_item)
         new_status = request.data.get('status')
         reason = request.data.get('reason', '')
         if not new_status:
@@ -323,6 +685,37 @@ class InventoryItemViewSet(BaseInventoryViewSetMixin):
             notes=f"Status changed from {old_status} to {new_status}. Reason: {reason}",
             created_by_user_id=get_request_user_id(request, as_str=False),
             updated_by_user_id=get_request_user_id(request, as_str=False),
+        )
+
+        after = serialize_inventory_item(inventory_item)
+        publish_inventory_admin_event(
+            event_name='inventory.item.status.updated',
+            payload=after,
+            actor=_audit_actor_from_request(request),
+            target={
+                'type': 'inventory_item',
+                'id': after['inventory_item_id'],
+                'label': after['name_snapshot'],
+                'barcode': after['barcode_snapshot'],
+                'sku': after['sku_snapshot'],
+            },
+            summary=f"Inventory item status updated for {after['name_snapshot']}.",
+            metadata={
+                'reason': reason,
+                'old_status': old_status,
+                'new_status': new_status,
+            },
+            before=before,
+            after=after,
+            severity='warning' if new_status in {'archived', 'discontinued'} else 'info',
+            feature_area='inventory_master',
+            reference_number=after['sku_snapshot'] or after['barcode_snapshot'],
+            notification_category='stock_alert',
+            notification_title=f"Inventory item {after['name_snapshot']} status changed",
+            notification_message=(
+                f"Inventory item {after['name_snapshot']} moved from {old_status} to {new_status}."
+            ),
+            notification_action_url='/inventory',
         )
 
         return Response({'message': 'Status updated successfully', 'old_status': old_status, 'new_status': new_status})
@@ -405,6 +798,30 @@ class InventoryItemViewSet(BaseInventoryViewSetMixin):
                 updated_fields.append('updated_by_user_id')
                 inventory_item.save(update_fields=list(dict.fromkeys(updated_fields)))
 
+        payload = serialize_inventory_item(inventory_item)
+        publish_inventory_admin_event(
+            event_name='inventory.item.created_from_variant' if created else 'inventory.item.synced_from_variant',
+            payload=payload,
+            actor=_audit_actor_from_request(request),
+            target={
+                'type': 'inventory_item',
+                'id': payload['inventory_item_id'],
+                'label': payload['name_snapshot'],
+                'barcode': payload['barcode_snapshot'],
+                'sku': payload['sku_snapshot'],
+            },
+            summary=(
+                f"Inventory item {'created' if created else 'synchronized'} from catalog variant for {payload['name_snapshot']}."
+            ),
+            metadata={
+                'product_variant_id': payload['product_variant_id'],
+                'product_template_id': payload['product_template_id'],
+            },
+            after=payload,
+            feature_area='inventory_master',
+            reference_number=payload['sku_snapshot'] or payload['barcode_snapshot'],
+        )
+
         serializer = self.get_serializer(inventory_item)
         return Response(serializer.data, status=status.HTTP_200_OK)
 
@@ -418,12 +835,25 @@ class InventoryItemViewSet(BaseInventoryViewSetMixin):
     @action(detail=False, methods=['get'])
     def analytics(self, request):
         profile_id = get_request_profile_id(request, required=True, as_str=False)
-        serializer = StockAnalyticsSerializer(get_profile_stock_analytics(profile_id=profile_id), context={'request': request})
+        stock_location, stock_locations = self._get_inventory_scope()
+        serializer = StockAnalyticsSerializer(
+            get_profile_stock_analytics(
+                profile_id=profile_id,
+                stock_location=stock_location,
+                stock_locations=stock_locations,
+            ),
+            context={'request': request},
+        )
         return Response(serializer.data)
 
     @action(detail=False, methods=['get'])
     def low_stock(self, request):
-        rows = get_low_stock_rows(self.get_queryset())
+        stock_location, stock_locations = self._get_inventory_scope()
+        rows = get_low_stock_rows(
+            self.get_queryset(),
+            stock_location=stock_location,
+            stock_locations=stock_locations,
+        )
         page = self.paginate_queryset(rows)
         if page is not None:
             serializer = LowStockBalanceSerializer(page, many=True, context={'request': request})
@@ -440,6 +870,19 @@ class StockBalanceViewSet(BaseInventoryReadOnlyViewSetMixin):
     search_fields = ['inventory_item__name_snapshot', 'stock_location__name', 'stock_lot__lot_number']
     ordering_fields = ['quantity_on_hand', 'quantity_reserved', 'quantity_available', 'created_at', 'stock_location__name']
     ordering = ['stock_location__name', 'inventory_item__name_snapshot']
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        profile_id = get_request_profile_id(self.request, as_str=False)
+        stock_location_id = _get_scope_location_param(self.request)
+        if profile_id and stock_location_id:
+            queryset = _apply_location_scope_filter(
+                queryset,
+                field_name='stock_location_id',
+                profile_id=profile_id,
+                location_id=stock_location_id,
+            )
+        return queryset
 
 
 class StockLotViewSet(BaseInventoryReadOnlyViewSetMixin):
@@ -460,6 +903,19 @@ class StockSerialViewSet(BaseInventoryReadOnlyViewSetMixin):
     search_fields = ['serial_number', 'inventory_item__name_snapshot', 'stock_location__name', 'stock_lot__lot_number']
     ordering_fields = ['serial_number', 'created_at', 'stock_location__name']
     ordering = ['serial_number']
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        profile_id = get_request_profile_id(self.request, as_str=False)
+        stock_location_id = _get_scope_location_param(self.request)
+        if profile_id and stock_location_id:
+            queryset = _apply_location_scope_filter(
+                queryset,
+                field_name='stock_location_id',
+                profile_id=profile_id,
+                location_id=stock_location_id,
+            )
+        return queryset
 
 
 class StockMovementViewSet(BaseInventoryReadOnlyViewSetMixin):
@@ -482,10 +938,14 @@ class StockMovementViewSet(BaseInventoryReadOnlyViewSetMixin):
 
     def get_queryset(self):
         queryset = super().get_queryset()
-        stock_location_id = self.request.query_params.get('stock_location')
-        if stock_location_id:
+        profile_id = get_request_profile_id(self.request, as_str=False)
+        stock_location_id = _get_scope_location_param(self.request)
+        if profile_id and stock_location_id:
+            scoped_location_ids = _resolve_location_scope_ids(profile_id=profile_id, location_id=stock_location_id)
+            if not scoped_location_ids:
+                return queryset.none()
             queryset = queryset.filter(
-                Q(from_location_id=stock_location_id) | Q(to_location_id=stock_location_id)
+                Q(from_location_id__in=scoped_location_ids) | Q(to_location_id__in=scoped_location_ids)
             )
         return queryset
 
@@ -515,6 +975,14 @@ class StockReservationViewSet(BaseCachePermissionViewset):
         inventory_item_id = self.request.query_params.get('inventory_item')
         if inventory_item_id:
             queryset = queryset.filter(inventory_item_id=inventory_item_id)
+        stock_location_id = _get_scope_location_param(self.request)
+        if profile_id and stock_location_id:
+            queryset = _apply_location_scope_filter(
+                queryset,
+                field_name='stock_location_id',
+                profile_id=profile_id,
+                location_id=stock_location_id,
+            )
         return queryset
 
     def create(self, request, *args, **kwargs):
@@ -535,6 +1003,13 @@ class StockReservationViewSet(BaseCachePermissionViewset):
         ).first()
         if stock_location is None:
             return Response({'error': 'Stock location not found'}, status=status.HTTP_404_NOT_FOUND)
+        structural_scope_location_id = data.get('structural_location_id') or request.query_params.get('structural_location_id')
+        if structural_scope_location_id:
+            scoped_location_ids = _resolve_location_scope_ids(profile_id=profile_id, location_id=structural_scope_location_id)
+            if not scoped_location_ids:
+                return Response({'error': 'The selected structural location scope is unavailable'}, status=status.HTTP_400_BAD_REQUEST)
+            if stock_location.id not in scoped_location_ids:
+                return Response({'error': 'Stock location is outside the selected structural location scope'}, status=status.HTTP_400_BAD_REQUEST)
 
         stock_lot = None
         if data.get('stock_lot_id'):
@@ -566,7 +1041,43 @@ class StockReservationViewSet(BaseCachePermissionViewset):
         except StockDomainError as exc:
             return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
-        output = StockReservationSerializer(result['reservation'], context=self.get_serializer_context())
+        reservation = result['reservation']
+        reservation_payload = serialize_stock_reservation(reservation)
+        publish_inventory_admin_event(
+            event_name='inventory.stock_reservation.created',
+            payload=reservation_payload,
+            actor=_audit_actor_from_request(request),
+            target={
+                'type': 'stock_reservation',
+                'id': reservation_payload['stock_reservation_id'],
+                'label': f"{reservation_payload['inventory_name']} reservation",
+                'barcode': reservation_payload['inventory_barcode'],
+                'sku': reservation_payload['inventory_sku'],
+            },
+            summary=(
+                f"Reserved {reservation_payload['reserved_quantity']} of {reservation_payload['inventory_name']} "
+                f"at {reservation_payload['stock_location_name']}."
+            ),
+            metadata={
+                'external_order_type': reservation_payload['external_order_type'],
+                'external_order_id': reservation_payload['external_order_id'],
+                'stock_location_name': reservation_payload['stock_location_name'],
+                'lot_number': reservation_payload['lot_number'],
+                'serial_number': reservation_payload['serial_number'],
+            },
+            after=reservation_payload,
+            feature_area='stock_control',
+            reference_number=reservation_payload['inventory_sku'] or reservation_payload['inventory_barcode'],
+            notification_category='stock_alert',
+            notification_title=f"Stock reserved for {reservation_payload['inventory_name']}",
+            notification_message=(
+                f"{reservation_payload['reserved_quantity']} unit(s) of {reservation_payload['inventory_name']} "
+                f"were reserved at {reservation_payload['stock_location_name']}."
+            ),
+            notification_action_url='/inventory',
+        )
+
+        output = StockReservationSerializer(reservation, context=self.get_serializer_context())
         return Response(output.data, status=status.HTTP_201_CREATED)
 
     @action(detail=True, methods=['post'])
@@ -574,6 +1085,7 @@ class StockReservationViewSet(BaseCachePermissionViewset):
         reservation = self.get_object()
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
+        before = serialize_stock_reservation(reservation)
         try:
             result = StockDomainService.release_reservation(
                 reservation=reservation,
@@ -583,7 +1095,42 @@ class StockReservationViewSet(BaseCachePermissionViewset):
             )
         except StockDomainError as exc:
             return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
-        output = StockReservationSerializer(result['reservation'], context=self.get_serializer_context())
+        released_reservation = result['reservation']
+        after = serialize_stock_reservation(released_reservation)
+        release_quantity = serializer.validated_data.get('quantity')
+        publish_inventory_admin_event(
+            event_name='inventory.stock_reservation.released',
+            payload=after,
+            actor=_audit_actor_from_request(request),
+            target={
+                'type': 'stock_reservation',
+                'id': after['stock_reservation_id'],
+                'label': f"{after['inventory_name']} reservation",
+                'barcode': after['inventory_barcode'],
+                'sku': after['inventory_sku'],
+            },
+            summary=(
+                f"Released {release_quantity or after['remaining_quantity']} of {after['inventory_name']} "
+                f"from reservation at {after['stock_location_name']}."
+            ),
+            metadata={
+                'external_order_type': after['external_order_type'],
+                'external_order_id': after['external_order_id'],
+                'released_quantity': str(release_quantity or ''),
+                'stock_location_name': after['stock_location_name'],
+            },
+            before=before,
+            after=after,
+            feature_area='stock_control',
+            reference_number=after['inventory_sku'] or after['inventory_barcode'],
+            notification_category='stock_alert',
+            notification_title=f"Reservation released for {after['inventory_name']}",
+            notification_message=(
+                f"Reserved stock for {after['inventory_name']} was released at {after['stock_location_name']}."
+            ),
+            notification_action_url='/inventory',
+        )
+        output = StockReservationSerializer(released_reservation, context=self.get_serializer_context())
         return Response(output.data)
 
     @action(detail=True, methods=['post'])
@@ -591,6 +1138,7 @@ class StockReservationViewSet(BaseCachePermissionViewset):
         reservation = self.get_object()
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
+        before = serialize_stock_reservation(reservation)
         try:
             result = StockDomainService.fulfill_reservation(
                 reservation=reservation,
@@ -600,5 +1148,40 @@ class StockReservationViewSet(BaseCachePermissionViewset):
             )
         except StockDomainError as exc:
             return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
-        output = StockReservationSerializer(result['reservation'], context=self.get_serializer_context())
+        fulfilled_reservation = result['reservation']
+        after = serialize_stock_reservation(fulfilled_reservation)
+        fulfilled_quantity = serializer.validated_data.get('quantity')
+        publish_inventory_admin_event(
+            event_name='inventory.stock_reservation.fulfilled',
+            payload=after,
+            actor=_audit_actor_from_request(request),
+            target={
+                'type': 'stock_reservation',
+                'id': after['stock_reservation_id'],
+                'label': f"{after['inventory_name']} reservation",
+                'barcode': after['inventory_barcode'],
+                'sku': after['inventory_sku'],
+            },
+            summary=(
+                f"Fulfilled {fulfilled_quantity or after['fulfilled_quantity']} of {after['inventory_name']} "
+                f"from reservation at {after['stock_location_name']}."
+            ),
+            metadata={
+                'external_order_type': after['external_order_type'],
+                'external_order_id': after['external_order_id'],
+                'fulfilled_quantity': str(fulfilled_quantity or ''),
+                'stock_location_name': after['stock_location_name'],
+            },
+            before=before,
+            after=after,
+            feature_area='stock_control',
+            reference_number=after['inventory_sku'] or after['inventory_barcode'],
+            notification_category='stock_alert',
+            notification_title=f"Reservation fulfilled for {after['inventory_name']}",
+            notification_message=(
+                f"Reserved stock for {after['inventory_name']} was fulfilled from {after['stock_location_name']}."
+            ),
+            notification_action_url='/inventory',
+        )
+        output = StockReservationSerializer(fulfilled_reservation, context=self.get_serializer_context())
         return Response(output.data)

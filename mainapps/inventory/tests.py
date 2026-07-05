@@ -1,16 +1,23 @@
+from io import StringIO
 from decimal import Decimal
 from unittest.mock import MagicMock, patch
+import json
+import tempfile
 
+from django.core.management import call_command
 from django.db import IntegrityError, transaction
 from django.test import SimpleTestCase, TestCase
 from rest_framework.test import APIRequestFactory, force_authenticate
 
-from mainapps.inventory.models import InventoryCategory, InventoryItem
+from mainapps.inventory.models import InventoryCategory, InventoryItem, InventoryPlacement
 from mainapps.projections.models import CatalogProductProjection, CatalogVariantProjection
+from mainapps.stock.models import StockBalance, StockLocation
 from mainapps.inventory.views import InventoryItemViewSet, get_inventory_setup_summary
 from subapps.kafka.consumers.catalog import handle_catalog_variant_event
 from subapps.kafka.producers.inventory import _resolve_catalog_variant
+from subapps.services.location_scope import ensure_inventory_item_placement, get_workspace_default_structural_location
 from subapps.services.inventory_read_model import get_inventory_item_summary_map, get_low_stock_rows
+from subapps.services.inventory_variant_cleanup import delete_inventory_item_if_safe
 from subapps.utils.request_context import scope_queryset_by_identity
 
 
@@ -84,11 +91,17 @@ class CatalogVariantInventoryLinkTests(TestCase):
 
     @patch("subapps.kafka.consumers.catalog.publish_inventory_availability_upserted")
     def test_catalog_variant_event_creates_linked_inventory_item(self, publish_availability):
+        StockLocation.objects.create(
+            profile_id=7,
+            name="Main Warehouse",
+            structural=True,
+        )
         with self.captureOnCommitCallbacks(execute=True):
             self.assertTrue(handle_catalog_variant_event(self._event()))
 
         variant = CatalogVariantProjection.objects.get()
         item = InventoryItem.objects.get(profile_id=7, product_variant_id=variant.variant_id)
+        placement = InventoryPlacement.objects.get(inventory_item=item)
 
         self.assertEqual(item.product_template_id, variant.product_id)
         self.assertEqual(item.name_snapshot, "Phone - Black")
@@ -99,6 +112,8 @@ class CatalogVariantInventoryLinkTests(TestCase):
         self.assertTrue(item.track_stock)
         self.assertEqual(item.status, "active")
         self.assertEqual(item.metadata["source"], "catalog_variant_projection")
+        self.assertTrue(placement.structural_location.structural)
+        self.assertEqual(placement.structural_location.profile_id, 7)
         publish_availability.assert_called_once_with(inventory_item_id=item.id)
 
     @patch("subapps.kafka.consumers.catalog.publish_inventory_availability_upserted")
@@ -129,6 +144,119 @@ class CatalogVariantInventoryLinkTests(TestCase):
 
         self.assertEqual(InventoryItem.objects.count(), 0)
         publish_availability.assert_not_called()
+
+    @patch("subapps.kafka.consumers.catalog.publish_inventory_availability_upserted")
+    def test_catalog_variant_deleted_event_removes_zero_stock_inventory_item(self, publish_availability):
+        stock_location = StockLocation.objects.create(
+            profile_id=7,
+            name="Main Warehouse",
+            structural=True,
+        )
+        with self.captureOnCommitCallbacks(execute=True):
+            handle_catalog_variant_event(self._event())
+
+        item = InventoryItem.objects.get(profile_id=7, product_variant_id="11111111-1111-1111-1111-111111111111")
+        StockBalance.objects.create(
+            profile_id=7,
+            inventory_item=item,
+            stock_location=stock_location,
+            quantity_on_hand=Decimal("0"),
+            quantity_reserved=Decimal("0"),
+            quantity_available=Decimal("0"),
+        )
+
+        self.assertTrue(handle_catalog_variant_event(self._event(event_name="catalog.variant.deleted")))
+        self.assertFalse(InventoryItem.objects.filter(id=item.id).exists())
+        publish_availability.assert_called_once()
+
+    @patch("subapps.kafka.consumers.catalog.publish_inventory_availability_upserted")
+    def test_catalog_variant_deleted_event_keeps_inventory_item_with_non_zero_stock(self, publish_availability):
+        stock_location = StockLocation.objects.create(
+            profile_id=7,
+            name="Main Warehouse",
+            structural=True,
+        )
+        with self.captureOnCommitCallbacks(execute=True):
+            handle_catalog_variant_event(self._event())
+
+        item = InventoryItem.objects.get(profile_id=7, product_variant_id="11111111-1111-1111-1111-111111111111")
+        StockBalance.objects.create(
+            profile_id=7,
+            inventory_item=item,
+            stock_location=stock_location,
+            quantity_on_hand=Decimal("5"),
+            quantity_reserved=Decimal("1"),
+            quantity_available=Decimal("4"),
+        )
+
+        self.assertTrue(handle_catalog_variant_event(self._event(event_name="catalog.variant.deleted")))
+        self.assertTrue(InventoryItem.objects.filter(id=item.id).exists())
+        publish_availability.assert_called_once()
+
+    def test_delete_inventory_item_if_safe_keeps_item_with_protected_relations(self):
+        stock_location = StockLocation.objects.create(
+            profile_id=7,
+            name="Main Warehouse",
+            structural=True,
+        )
+        with self.captureOnCommitCallbacks(execute=True):
+            handle_catalog_variant_event(self._event())
+
+        item = InventoryItem.objects.get(profile_id=7, product_variant_id="11111111-1111-1111-1111-111111111111")
+        StockBalance.objects.create(
+            profile_id=7,
+            inventory_item=item,
+            stock_location=stock_location,
+            quantity_on_hand=Decimal("0"),
+            quantity_reserved=Decimal("0"),
+            quantity_available=Decimal("0"),
+        )
+
+        with patch(
+            "subapps.services.inventory_variant_cleanup.get_inventory_item_delete_blockers",
+            return_value={"purchase_order_lines": 1},
+        ):
+            outcome = delete_inventory_item_if_safe(item)
+
+        self.assertFalse(outcome.deleted)
+        self.assertEqual(outcome.blocked_relations["purchase_order_lines"], 1)
+        self.assertTrue(InventoryItem.objects.filter(id=item.id).exists())
+
+    def test_cleanup_orphan_inventory_items_command_deletes_zero_stock_orphans(self):
+        stock_location = StockLocation.objects.create(
+            profile_id=7,
+            name="Main Warehouse",
+            structural=True,
+        )
+        with self.captureOnCommitCallbacks(execute=True):
+            handle_catalog_variant_event(self._event())
+
+        item = InventoryItem.objects.get(profile_id=7, product_variant_id="11111111-1111-1111-1111-111111111111")
+        StockBalance.objects.create(
+            profile_id=7,
+            inventory_item=item,
+            stock_location=stock_location,
+            quantity_on_hand=Decimal("0"),
+            quantity_reserved=Decimal("0"),
+            quantity_available=Decimal("0"),
+        )
+
+        variant_file = tempfile.NamedTemporaryFile(mode="w+", suffix=".json", delete=False)
+        variant_file.write(json.dumps([]))
+        variant_file.flush()
+        variant_file.close()
+
+        out = StringIO()
+        call_command(
+            "cleanup_orphan_inventory_items",
+            profile_id=7,
+            valid_variant_ids_file=variant_file.name,
+            apply=True,
+            stdout=out,
+        )
+
+        self.assertFalse(InventoryItem.objects.filter(id=item.id).exists())
+        self.assertIn("deleted=1", out.getvalue())
 
     def test_scope_queryset_keeps_legacy_lookup_when_model_still_has_profile_field(self):
         matching_category = InventoryCategory.objects.create(name="Consumables", profile_id=1)
@@ -165,6 +293,27 @@ class CatalogVariantInventoryLinkTests(TestCase):
         )
 
         self.assertEqual(list(scoped.values_list("id", flat=True)), [matching_item.id])
+
+
+class InventoryPlacementRepairCommandTests(TestCase):
+    def test_repair_inventory_placements_creates_missing_workspace_placement(self):
+        structural_root = StockLocation.objects.create(
+            profile_id=1,
+            name="Main Warehouse",
+            structural=True,
+        )
+        item = InventoryItem.objects.create(
+            profile_id=1,
+            name_snapshot="Copper Wire",
+        )
+
+        output = StringIO()
+        call_command("repair_inventory_placements", profile_id=1, apply=True, stdout=output)
+
+        placement = InventoryPlacement.objects.get(inventory_item=item)
+        self.assertEqual(placement.structural_location_id, structural_root.id)
+        self.assertTrue(placement.active)
+        self.assertIn("Applied 1 inventory placement repair(s).", output.getvalue())
 
 
 class InventoryItemSummaryTests(SimpleTestCase):
@@ -291,8 +440,416 @@ class InventorySetupSummaryTests(SimpleTestCase):
         self.assertEqual(summary["total_stock_value"], Decimal("9850.50"))
         self.assertEqual(summary["low_stock_count"], 2)
         self.assertEqual(scope_queryset.call_count, 3)
-        stock_analytics.assert_called_once_with(profile_id=9)
-        low_stock_rows.assert_called_once_with(inventory_queryset)
+        stock_analytics.assert_called_once_with(
+            profile_id=9,
+            stock_location=None,
+            stock_locations=None,
+        )
+        low_stock_rows.assert_called_once_with(
+            inventory_queryset,
+            stock_location=None,
+            stock_locations=None,
+        )
+
+
+class InventoryPlacementScopeTests(TestCase):
+    def setUp(self):
+        self.structural_root = StockLocation.objects.create(
+            profile_id=1,
+            name="Main Warehouse",
+            structural=True,
+        )
+        self.non_structural_child = StockLocation.objects.create(
+            profile_id=1,
+            name="Shelf A1",
+            structural=False,
+            parent=self.structural_root,
+        )
+        self.secondary_structural_root = StockLocation.objects.create(
+            profile_id=1,
+            name="Airport Store",
+            structural=True,
+        )
+        self.secondary_child = StockLocation.objects.create(
+            profile_id=1,
+            name="Shelf B1",
+            structural=False,
+            parent=self.secondary_structural_root,
+        )
+
+    def test_workspace_default_structural_location_prefers_structural_root(self):
+        resolved = get_workspace_default_structural_location(profile_id=1)
+        self.assertEqual(resolved.id, self.structural_root.id)
+
+    def test_ensure_inventory_item_placement_uses_category_default_location_structural_ancestor(self):
+        category = InventoryCategory.objects.create(
+            profile_id=1,
+            name="Perfumes",
+            default_location=self.non_structural_child,
+        )
+        item = InventoryItem.objects.create(
+            profile_id=1,
+            name_snapshot="9PM Perfume",
+            inventory_category=category,
+        )
+
+        result = ensure_inventory_item_placement(item)
+
+        self.assertIsNotNone(result.placement)
+        self.assertTrue(result.created)
+        self.assertEqual(result.structural_location.id, self.structural_root.id)
+        self.assertEqual(result.placement.structural_location_id, self.structural_root.id)
+        self.assertEqual(result.placement.location_name_snapshot, "Main Warehouse")
+
+    def test_ensure_inventory_item_placement_is_idempotent(self):
+        item = InventoryItem.objects.create(
+            profile_id=1,
+            name_snapshot="Night Spray",
+        )
+
+        first = ensure_inventory_item_placement(item)
+        second = ensure_inventory_item_placement(item)
+
+        self.assertTrue(first.created)
+        self.assertFalse(second.created)
+        self.assertEqual(
+            InventoryPlacement.objects.filter(inventory_item=item, structural_location=self.structural_root).count(),
+            1,
+        )
+
+    def test_inventory_summary_can_scope_to_structural_location_descendants(self):
+        item = InventoryItem.objects.create(
+            profile_id=1,
+            name_snapshot="Night Spray",
+        )
+        StockBalance.objects.create(
+            profile_id=1,
+            inventory_item=item,
+            stock_location=self.non_structural_child,
+            quantity_on_hand=Decimal("9"),
+            quantity_reserved=Decimal("1"),
+            quantity_available=Decimal("8"),
+        )
+
+        summary_map = get_inventory_item_summary_map([item], stock_location=self.structural_root)
+
+        self.assertEqual(summary_map[item.id]["quantity"], Decimal("9"))
+        self.assertEqual(summary_map[item.id]["quantity_available"], Decimal("8"))
+        self.assertEqual(summary_map[item.id]["location_name"], "Main Warehouse")
+        self.assertEqual(summary_map[item.id]["location_breakdown"][0]["structural_location_name"], "Main Warehouse")
+
+    def test_inventory_summary_groups_leaf_locations_under_one_structural_store(self):
+        item = InventoryItem.objects.create(
+            profile_id=1,
+            name_snapshot="Cocoa Butter",
+        )
+        second_child = StockLocation.objects.create(
+            profile_id=1,
+            name="Shelf A2",
+            structural=False,
+            parent=self.structural_root,
+        )
+        StockBalance.objects.create(
+            profile_id=1,
+            inventory_item=item,
+            stock_location=self.non_structural_child,
+            quantity_on_hand=Decimal("4"),
+            quantity_reserved=Decimal("1"),
+            quantity_available=Decimal("3"),
+        )
+        StockBalance.objects.create(
+            profile_id=1,
+            inventory_item=item,
+            stock_location=second_child,
+            quantity_on_hand=Decimal("6"),
+            quantity_reserved=Decimal("0"),
+            quantity_available=Decimal("6"),
+        )
+
+        summary = get_inventory_item_summary_map([item])[item.id]
+
+        self.assertEqual(summary["location_count"], 1)
+        self.assertEqual(summary["location_name"], "Main Warehouse")
+        self.assertEqual(summary["location_breakdown"][0]["quantity"], Decimal("10"))
+        self.assertEqual(summary["location_breakdown"][0]["leaf_location_count"], 2)
+
+    def test_inventory_summary_can_scope_to_multiple_structural_locations(self):
+        item = InventoryItem.objects.create(
+            profile_id=1,
+            name_snapshot="Nivea Lotion",
+        )
+        StockBalance.objects.create(
+            profile_id=1,
+            inventory_item=item,
+            stock_location=self.non_structural_child,
+            quantity_on_hand=Decimal("4"),
+            quantity_reserved=Decimal("1"),
+            quantity_available=Decimal("3"),
+        )
+        StockBalance.objects.create(
+            profile_id=1,
+            inventory_item=item,
+            stock_location=self.secondary_child,
+            quantity_on_hand=Decimal("6"),
+            quantity_reserved=Decimal("2"),
+            quantity_available=Decimal("4"),
+        )
+
+        summary = get_inventory_item_summary_map(
+            [item],
+            stock_locations=[self.structural_root, self.secondary_structural_root],
+        )[item.id]
+
+        self.assertEqual(summary["quantity"], Decimal("10"))
+        self.assertEqual(summary["quantity_reserved"], Decimal("3"))
+        self.assertEqual(summary["quantity_available"], Decimal("7"))
+        self.assertEqual(summary["location_count"], 2)
+        self.assertEqual(
+            {entry["structural_location_name"] for entry in summary["location_breakdown"]},
+            {"Main Warehouse", "Airport Store"},
+        )
+
+    def test_inventory_setup_summary_can_scope_to_multiple_structural_locations(self):
+        item_a = InventoryItem.objects.create(
+            profile_id=1,
+            name_snapshot="Nivea Lotion",
+            minimum_stock_level=Decimal("5"),
+        )
+        item_b = InventoryItem.objects.create(
+            profile_id=1,
+            name_snapshot="Body Spray",
+            minimum_stock_level=Decimal("5"),
+        )
+        StockBalance.objects.create(
+            profile_id=1,
+            inventory_item=item_a,
+            stock_location=self.non_structural_child,
+            quantity_on_hand=Decimal("4"),
+            quantity_reserved=Decimal("0"),
+            quantity_available=Decimal("4"),
+        )
+        StockBalance.objects.create(
+            profile_id=1,
+            inventory_item=item_b,
+            stock_location=self.secondary_child,
+            quantity_on_hand=Decimal("8"),
+            quantity_reserved=Decimal("0"),
+            quantity_available=Decimal("8"),
+        )
+
+        summary = get_inventory_setup_summary(
+            profile_id=1,
+            stock_locations=[self.structural_root],
+        )
+
+        self.assertEqual(summary["total_inventory_items"], 1)
+        self.assertEqual(summary["low_stock_count"], 1)
+        self.assertEqual(summary["total_stock_value"], Decimal("0"))
+
+
+class InventoryReorderQueueViewTests(TestCase):
+    def setUp(self):
+        self.factory = APIRequestFactory()
+        self.location = StockLocation.objects.create(
+            profile_id=1,
+            name="Main Warehouse",
+            structural=True,
+        )
+        self.needs_reorder_item = InventoryItem.objects.create(
+            profile_id=1,
+            name_snapshot="Needs Reorder",
+            reorder_point=Decimal("40"),
+            reorder_quantity=Decimal("120"),
+            minimum_stock_level=Decimal("10"),
+        )
+        self.healthy_item = InventoryItem.objects.create(
+            profile_id=1,
+            name_snapshot="Healthy Stock",
+            reorder_point=Decimal("40"),
+            reorder_quantity=Decimal("120"),
+            minimum_stock_level=Decimal("10"),
+        )
+        self.zero_reorder_threshold_item = InventoryItem.objects.create(
+            profile_id=1,
+            name_snapshot="Zero Reorder Threshold",
+            reorder_point=Decimal("0"),
+            reorder_quantity=Decimal("120"),
+            minimum_stock_level=Decimal("10"),
+        )
+        self.out_of_stock_item = InventoryItem.objects.create(
+            profile_id=1,
+            name_snapshot="Out Of Stock",
+            reorder_point=Decimal("40"),
+            reorder_quantity=Decimal("120"),
+            minimum_stock_level=Decimal("10"),
+        )
+        StockBalance.objects.create(
+            profile_id=1,
+            inventory_item=self.needs_reorder_item,
+            stock_location=self.location,
+            quantity_on_hand=Decimal("20"),
+            quantity_reserved=Decimal("0"),
+            quantity_available=Decimal("20"),
+        )
+        StockBalance.objects.create(
+            profile_id=1,
+            inventory_item=self.healthy_item,
+            stock_location=self.location,
+            quantity_on_hand=Decimal("3000"),
+            quantity_reserved=Decimal("0"),
+            quantity_available=Decimal("3000"),
+        )
+        StockBalance.objects.create(
+            profile_id=1,
+            inventory_item=self.zero_reorder_threshold_item,
+            stock_location=self.location,
+            quantity_on_hand=Decimal("0"),
+            quantity_reserved=Decimal("0"),
+            quantity_available=Decimal("0"),
+        )
+        StockBalance.objects.create(
+            profile_id=1,
+            inventory_item=self.out_of_stock_item,
+            stock_location=self.location,
+            quantity_on_hand=Decimal("0"),
+            quantity_reserved=Decimal("0"),
+            quantity_available=Decimal("0"),
+        )
+
+    def _authenticated_request(self, path):
+        request = self.factory.get(path)
+        force_authenticate(
+            request,
+            user=type("User", (), {"id": 1, "is_authenticated": True})(),
+            token={
+                "profile_id": "1",
+                "user_id": "1",
+                "owner_id": "1",
+                "permissions": ["read_inventory_item"],
+            },
+        )
+        return request
+
+    def test_needs_reorder_action_returns_only_items_below_positive_reorder_point(self):
+        request = self._authenticated_request("/inventory_api/items/needs_reorder/")
+
+        response = InventoryItemViewSet.as_view({"get": "needs_reorder"})(request)
+
+        self.assertEqual(response.status_code, 200)
+        returned_ids = {str(item["id"]) for item in response.data}
+        self.assertIn(str(self.needs_reorder_item.id), returned_ids)
+        self.assertNotIn(str(self.healthy_item.id), returned_ids)
+        self.assertNotIn(str(self.zero_reorder_threshold_item.id), returned_ids)
+
+    def test_low_stock_action_excludes_zero_stock_and_zero_threshold_items(self):
+        request = self._authenticated_request("/inventory_api/items/low_stock/")
+
+        response = InventoryItemViewSet.as_view({"get": "low_stock"})(request)
+
+        self.assertEqual(response.status_code, 200)
+        returned_ids = {str(item["id"]) for item in response.data}
+        self.assertNotIn(str(self.out_of_stock_item.id), returned_ids)
+        self.assertNotIn(str(self.zero_reorder_threshold_item.id), returned_ids)
+
+
+class InventoryAdjustStockScopeTests(TestCase):
+    def setUp(self):
+        self.factory = APIRequestFactory()
+        self.structural_root = StockLocation.objects.create(
+            profile_id=1,
+            name="Main Warehouse",
+            structural=True,
+        )
+        self.structural_child = StockLocation.objects.create(
+            profile_id=1,
+            name="Shelf A1",
+            structural=False,
+            parent=self.structural_root,
+        )
+        self.secondary_root = StockLocation.objects.create(
+            profile_id=1,
+            name="Airport Store",
+            structural=True,
+        )
+        self.secondary_child = StockLocation.objects.create(
+            profile_id=1,
+            name="Shelf B1",
+            structural=False,
+            parent=self.secondary_root,
+        )
+        self.inventory_item = InventoryItem.objects.create(
+            profile_id=1,
+            name_snapshot="Scoped Lotion",
+        )
+
+    def _authenticate(self, request):
+        force_authenticate(
+            request,
+            user=None,
+            token={"profile_id": 1, "user_id": 1, "owner_id": 1, "permissions": ["manage_inventory_item_settings"]},
+        )
+
+    @patch("mainapps.inventory.views.StockDomainService.adjust_stock")
+    def test_adjust_stock_rejects_location_outside_selected_structural_scope(self, adjust_stock):
+        request = self.factory.post(
+            f"/inventory/items/{self.inventory_item.id}/adjust_stock/",
+            {
+                "location_id": str(self.secondary_child.id),
+                "structural_location_id": str(self.structural_root.id),
+                "quantity_change": "2",
+                "reason": "Manual correction",
+            },
+            format="json",
+        )
+        self._authenticate(request)
+
+        response = InventoryItemViewSet.as_view({"post": "adjust_stock"})(request, pk=self.inventory_item.id)
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data["error"], "Stock location is outside the selected structural location scope")
+        adjust_stock.assert_not_called()
+
+    @patch("mainapps.inventory.views.StockDomainService.adjust_stock")
+    def test_adjust_stock_accepts_location_inside_selected_structural_scope(self, adjust_stock):
+        adjust_stock.return_value = {
+            "old_quantity": Decimal("4"),
+            "new_quantity": Decimal("6"),
+        }
+        request = self.factory.post(
+            f"/inventory/items/{self.inventory_item.id}/adjust_stock/",
+            {
+                "location_id": str(self.structural_child.id),
+                "structural_location_id": str(self.structural_root.id),
+                "quantity_change": "2",
+                "reason": "Manual correction",
+            },
+            format="json",
+        )
+        self._authenticate(request)
+
+        response = InventoryItemViewSet.as_view({"post": "adjust_stock"})(request, pk=self.inventory_item.id)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["new_quantity"], Decimal("6"))
+        adjust_stock.assert_called_once()
+
+    def test_adjust_stock_rejects_unknown_structural_scope(self):
+        request = self.factory.post(
+            f"/inventory/items/{self.inventory_item.id}/adjust_stock/",
+            {
+                "location_id": str(self.structural_child.id),
+                "structural_location_id": "00000000-0000-0000-0000-000000000000",
+                "quantity_change": "2",
+                "reason": "Manual correction",
+            },
+            format="json",
+        )
+        self._authenticate(request)
+
+        response = InventoryItemViewSet.as_view({"post": "adjust_stock"})(request, pk=self.inventory_item.id)
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data["error"], "The selected structural location scope is unavailable")
 
 
 class InventoryBulkUpdateControlsTests(TestCase):

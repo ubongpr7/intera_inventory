@@ -56,6 +56,9 @@ class InventoryListSerializer(InventoryItemSummaryMixin, serializers.ModelSerial
     total_stock_value = serializers.SerializerMethodField()
     current_stock_level = serializers.SerializerMethodField()
     quantity_available = serializers.SerializerMethodField()
+    location_name = serializers.SerializerMethodField()
+    location_count = serializers.SerializerMethodField()
+    location_breakdown = serializers.SerializerMethodField()
 
     class Meta:
         model = InventoryItem
@@ -74,6 +77,9 @@ class InventoryListSerializer(InventoryItemSummaryMixin, serializers.ModelSerial
             'current_stock_level',
             'quantity_available',
             'total_stock_value',
+            'location_name',
+            'location_count',
+            'location_breakdown',
             'minimum_stock_level',
             'reorder_point',
             'reorder_quantity',
@@ -91,6 +97,15 @@ class InventoryListSerializer(InventoryItemSummaryMixin, serializers.ModelSerial
 
     def get_quantity_available(self, obj):
         return self._get_summary(obj).get('quantity_available', Decimal('0'))
+
+    def get_location_name(self, obj):
+        return self._get_summary(obj).get('location_name', '')
+
+    def get_location_count(self, obj):
+        return self._get_summary(obj).get('location_count', 0)
+
+    def get_location_breakdown(self, obj):
+        return self._get_summary(obj).get('location_breakdown', [])
 
 
 class InventoryDetailSerializer(InventoryItemSummaryMixin, UserDetailMixin, serializers.ModelSerializer):

@@ -7,12 +7,25 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 
 from mainapps.stock.models import StockLocation
+from subapps.kafka.producers.inventory_admin import (
+    publish_inventory_admin_event,
+    serialize_inventory_category,
+    serialize_inventory_item,
+)
 from subapps.permissions.constants import UNIFIED_PERMISSION_DICT
 from subapps.permissions.microservice_permissions import BaseCachePermissionViewset
 from subapps.services.inventory_read_model import (
+    get_inventory_ids_for_stock_filter,
     get_inventory_item_summary_map,
     get_low_stock_rows,
     get_profile_stock_analytics,
+)
+from subapps.services.location_scope import (
+    ensure_inventory_item_placement,
+    get_location_scope_ids,
+    get_location_scope_ids_for_locations,
+    resolve_structural_location,
+    resolve_structural_locations,
 )
 from subapps.services.stock_domain import StockDomainError, StockDomainService
 from subapps.utils.request_context import (
@@ -31,7 +44,7 @@ from .serializers import (
 )
 
 
-def get_inventory_setup_summary(*, profile_id):
+def get_inventory_setup_summary(*, profile_id, stock_location=None, stock_locations=None):
     category_queryset = scope_queryset_by_identity(
         InventoryCategory.objects.all(),
         canonical_field='profile_id',
@@ -50,14 +63,34 @@ def get_inventory_setup_summary(*, profile_id):
         legacy_field='profile',
         value=profile_id,
     )
-    stock_analytics = get_profile_stock_analytics(profile_id=profile_id)
+    if stock_location is not None or stock_locations:
+        scoped_location_ids = get_location_scope_ids_for_locations(
+            profile_id=profile_id,
+            stock_locations=stock_locations or ([stock_location] if stock_location is not None else []),
+        )
+        inventory_queryset = (
+            inventory_queryset.filter(stock_balances__stock_location_id__in=scoped_location_ids).distinct()
+            if scoped_location_ids
+            else inventory_queryset.none()
+        )
+    stock_analytics = get_profile_stock_analytics(
+        profile_id=profile_id,
+        stock_location=stock_location,
+        stock_locations=stock_locations,
+    )
 
     return {
         'total_locations': location_queryset.count(),
         'total_categories': category_queryset.count(),
         'total_inventory_items': inventory_queryset.count(),
         'total_stock_value': stock_analytics.get('total_stock_value', Decimal('0')),
-        'low_stock_count': len(get_low_stock_rows(inventory_queryset)),
+        'low_stock_count': len(
+            get_low_stock_rows(
+                inventory_queryset,
+                stock_location=stock_location,
+                stock_locations=stock_locations,
+            )
+        ),
     }
 
 
@@ -71,6 +104,17 @@ _CONTROL_FIELDS = (
     'track_expiry',
     'allow_negative_stock',
 )
+
+
+def _resolve_structural_scope_location_from_request(request, *, profile_id):
+    raw_location_id = (
+        request.data.get('structural_location_id')
+        or request.query_params.get('structural_location_id')
+        or request.query_params.get('stock_location_id')
+    )
+    if not raw_location_id:
+        return None
+    return resolve_structural_location(profile_id=profile_id, stock_location_id=raw_location_id)
 
 
 def _all_replenishment_thresholds_zero(inventory_item):
@@ -96,6 +140,12 @@ def _bulk_control_result(*, inventory_item, updated_fields=None, skipped=False, 
         'track_serial': inventory_item.track_serial,
         'track_expiry': inventory_item.track_expiry,
         'allow_negative_stock': inventory_item.allow_negative_stock,
+    }
+
+
+def _audit_actor_from_request(request) -> dict[str, str]:
+    return {
+        'user_id': str(get_request_user_id(request, required=True) or '').strip(),
     }
 
 
@@ -133,6 +183,77 @@ class InventoryCategoryViewSet(BaseInventoryViewSet):
     ordering_fields = ['name', 'created_at']
     ordering = ['name']
     serializer_class = InventoryCategoryDetailSerializer
+
+    def perform_create(self, serializer):
+        super().perform_create(serializer)
+        payload = serialize_inventory_category(serializer.instance)
+        publish_inventory_admin_event(
+            event_name='inventory.category.created',
+            payload=payload,
+            actor=_audit_actor_from_request(self.request),
+            target={
+                'type': 'inventory_category',
+                'id': payload['inventory_category_id'],
+                'label': payload['name'],
+            },
+            summary=f"Inventory category created: {payload['name']}.",
+            metadata={
+                'structural': payload['structural'],
+                'is_active': payload['is_active'],
+                'parent_name': payload['parent_name'],
+            },
+            after=payload,
+            feature_area='inventory_master',
+        )
+
+    def perform_update(self, serializer):
+        before = serialize_inventory_category(self.get_object())
+        super().perform_update(serializer)
+        payload = serialize_inventory_category(serializer.instance)
+        publish_inventory_admin_event(
+            event_name='inventory.category.updated',
+            payload=payload,
+            actor=_audit_actor_from_request(self.request),
+            target={
+                'type': 'inventory_category',
+                'id': payload['inventory_category_id'],
+                'label': payload['name'],
+            },
+            summary=f"Inventory category updated: {payload['name']}.",
+            metadata={
+                'structural': payload['structural'],
+                'is_active': payload['is_active'],
+                'parent_name': payload['parent_name'],
+            },
+            before=before,
+            after=payload,
+            feature_area='inventory_master',
+        )
+
+    def destroy(self, request, *args, **kwargs):
+        category = self.get_object()
+        before = serialize_inventory_category(category)
+        response = super().destroy(request, *args, **kwargs)
+        publish_inventory_admin_event(
+            event_name='inventory.category.deleted',
+            payload=before,
+            actor=_audit_actor_from_request(request),
+            target={
+                'type': 'inventory_category',
+                'id': before['inventory_category_id'],
+                'label': before['name'],
+            },
+            summary=f"Inventory category deleted: {before['name']}.",
+            metadata={
+                'structural': before['structural'],
+                'parent_name': before['parent_name'],
+            },
+            before=before,
+            after={},
+            severity='warning',
+            feature_area='inventory_master',
+        )
+        return response
 
     @action(detail=False, methods=['get'])
     def tree(self, request):
@@ -172,38 +293,226 @@ class InventoryItemViewSet(BaseInventoryViewSet):
             return InventoryListSerializer
         return InventoryDetailSerializer
 
+    def _get_requested_structural_location(self):
+        profile_id = get_request_profile_id(self.request, as_str=False)
+        if not profile_id:
+            return None
+        location_id = self.request.query_params.get('structural_location_id') or self.request.query_params.get('stock_location_id')
+        if not location_id:
+            return None
+        return resolve_structural_location(profile_id=profile_id, stock_location_id=location_id)
+
+    def _get_requested_structural_locations(self):
+        profile_id = get_request_profile_id(self.request, as_str=False)
+        if not profile_id:
+            return []
+
+        raw_ids: list[str] = []
+        for key in ('structural_location_ids', 'stock_location_ids'):
+            raw_ids.extend(self.request.query_params.getlist(key))
+        for key in ('structural_location_ids', 'stock_location_ids'):
+            csv_value = self.request.query_params.get(key)
+            if csv_value:
+                raw_ids.extend([part.strip() for part in csv_value.split(',') if part.strip()])
+
+        singular_location = self._get_requested_structural_location()
+        if singular_location is not None:
+            return [singular_location] + [
+                location
+                for location in resolve_structural_locations(profile_id=profile_id, stock_location_ids=raw_ids)
+                if location.id != singular_location.id
+            ]
+
+        return resolve_structural_locations(profile_id=profile_id, stock_location_ids=raw_ids)
+
+    def _get_scope_mode(self):
+        value = (self.request.query_params.get('scope') or '').strip().lower()
+        if value == 'all':
+            return 'all_locations'
+        return value
+
+    def _get_inventory_scope(self):
+        scope_mode = self._get_scope_mode()
+        structural_locations = self._get_requested_structural_locations()
+        if scope_mode == 'all_locations':
+            return None, []
+        if structural_locations:
+            return structural_locations[0], structural_locations
+        return None, []
+
     def get_serializer_context(self):
         context = super().get_serializer_context()
+        stock_location, stock_locations = self._get_inventory_scope()
         queryset = list(self.filter_queryset(self.get_queryset())) if self.action in {'list', 'low_stock', 'needs_reorder'} else []
         if self.action in {'retrieve', 'minimal_item', 'stock_summary'} and getattr(self, 'kwargs', {}).get('pk'):
             try:
                 queryset = [self.get_object()]
             except Exception:
                 queryset = []
-        context['inventory_item_summary_map'] = get_inventory_item_summary_map(queryset) if queryset else {}
+        context['inventory_item_summary_map'] = (
+            get_inventory_item_summary_map(
+                queryset,
+                stock_location=stock_location,
+                stock_locations=stock_locations,
+            )
+            if queryset else {}
+        )
         return context
 
     def get_queryset(self):
         queryset = super().get_queryset()
+        _, stock_locations = self._get_inventory_scope()
         stock_status = self.request.query_params.get('stock_status')
+        if stock_locations:
+            scoped_location_ids = get_location_scope_ids_for_locations(
+                profile_id=get_request_profile_id(self.request, required=True, as_str=False),
+                stock_locations=stock_locations,
+            )
+            queryset = (
+                queryset.filter(stock_balances__stock_location_id__in=scoped_location_ids).distinct()
+                if scoped_location_ids
+                else queryset.none()
+            )
         if stock_status:
-            summary_map = get_inventory_item_summary_map(list(queryset))
+            stock_location, stock_locations = self._get_inventory_scope()
+            summary_map = get_inventory_item_summary_map(
+                list(queryset),
+                stock_location=stock_location,
+                stock_locations=stock_locations,
+            )
             matching_ids = []
             for item in queryset:
                 summary = summary_map.get(item.id, {})
                 quantity = Decimal(str(summary.get('quantity', 0)))
-                if stock_status == 'low_stock' and quantity <= Decimal(str(item.minimum_stock_level or 0)):
+                minimum_stock_level = Decimal(str(item.minimum_stock_level or 0))
+                reorder_point = Decimal(str(item.reorder_point or 0))
+                if stock_status == 'low_stock' and minimum_stock_level > 0 and Decimal('0') < quantity <= minimum_stock_level:
                     matching_ids.append(item.id)
-                elif stock_status == 'needs_reorder' and quantity <= Decimal(str(item.reorder_point or 0)):
+                elif stock_status == 'needs_reorder' and reorder_point > 0 and quantity <= reorder_point:
                     matching_ids.append(item.id)
                 elif stock_status == 'out_of_stock' and quantity <= 0:
                     matching_ids.append(item.id)
             queryset = queryset.filter(id__in=matching_ids) if matching_ids else queryset.none()
         return queryset
 
+    def _get_stock_filtered_queryset(self, filter_name: str):
+        queryset = self.get_queryset()
+        stock_location, stock_locations = self._get_inventory_scope()
+        matching_ids = get_inventory_ids_for_stock_filter(
+            list(queryset),
+            filter_name=filter_name,
+            stock_location=stock_location,
+            stock_locations=stock_locations,
+        )
+        return queryset.filter(id__in=matching_ids) if matching_ids else queryset.none()
+
+    def perform_create(self, serializer):
+        profile_id = get_request_profile_id(self.request, required=True, as_str=False)
+        user_id = get_request_user_id(self.request, required=True, as_str=False)
+        inventory_item = serializer.save(
+            profile_id=profile_id,
+            created_by_user_id=user_id,
+            updated_by_user_id=user_id,
+        )
+        ensure_inventory_item_placement(
+            inventory_item,
+            stock_location_id=self.request.data.get('stock_location_id') or self.request.data.get('structural_location_id'),
+            created_by_user_id=user_id,
+            updated_by_user_id=user_id,
+        )
+        payload = serialize_inventory_item(inventory_item)
+        publish_inventory_admin_event(
+            event_name='inventory.item.created',
+            payload=payload,
+            actor=_audit_actor_from_request(self.request),
+            target={
+                'type': 'inventory_item',
+                'id': payload['inventory_item_id'],
+                'label': payload['name_snapshot'],
+                'barcode': payload['barcode_snapshot'],
+                'sku': payload['sku_snapshot'],
+            },
+            summary=f"Inventory item created: {payload['name_snapshot']}.",
+            metadata={
+                'inventory_type': payload['inventory_type'],
+                'status': payload['status'],
+                'category_name': payload['inventory_category_name'],
+            },
+            after=payload,
+            feature_area='inventory_master',
+            reference_number=payload['sku_snapshot'] or payload['barcode_snapshot'],
+            notification_category='stock_alert',
+            notification_title=f"Inventory item {payload['name_snapshot']} created",
+            notification_message=f"Inventory item {payload['name_snapshot']} was added to the workspace catalog.",
+            notification_action_url='/inventory',
+        )
+
+    def perform_update(self, serializer):
+        before = serialize_inventory_item(self.get_object())
+        user_id = get_request_user_id(self.request, as_str=False)
+        inventory_item = serializer.save(updated_by_user_id=user_id)
+        if 'stock_location_id' in self.request.data or 'structural_location_id' in self.request.data:
+            ensure_inventory_item_placement(
+                inventory_item,
+                stock_location_id=self.request.data.get('stock_location_id') or self.request.data.get('structural_location_id'),
+                updated_by_user_id=user_id,
+            )
+        payload = serialize_inventory_item(inventory_item)
+        publish_inventory_admin_event(
+            event_name='inventory.item.updated',
+            payload=payload,
+            actor=_audit_actor_from_request(self.request),
+            target={
+                'type': 'inventory_item',
+                'id': payload['inventory_item_id'],
+                'label': payload['name_snapshot'],
+                'barcode': payload['barcode_snapshot'],
+                'sku': payload['sku_snapshot'],
+            },
+            summary=f"Inventory item updated: {payload['name_snapshot']}.",
+            metadata={
+                'inventory_type': payload['inventory_type'],
+                'status': payload['status'],
+                'category_name': payload['inventory_category_name'],
+            },
+            before=before,
+            after=payload,
+            feature_area='inventory_master',
+            reference_number=payload['sku_snapshot'] or payload['barcode_snapshot'],
+        )
+
+    def destroy(self, request, *args, **kwargs):
+        inventory_item = self.get_object()
+        before = serialize_inventory_item(inventory_item)
+        response = super().destroy(request, *args, **kwargs)
+        publish_inventory_admin_event(
+            event_name='inventory.item.deleted',
+            payload=before,
+            actor=_audit_actor_from_request(request),
+            target={
+                'type': 'inventory_item',
+                'id': before['inventory_item_id'],
+                'label': before['name_snapshot'],
+                'barcode': before['barcode_snapshot'],
+                'sku': before['sku_snapshot'],
+            },
+            summary=f"Inventory item deleted: {before['name_snapshot']}.",
+            metadata={
+                'inventory_type': before['inventory_type'],
+                'status': before['status'],
+                'category_name': before['inventory_category_name'],
+            },
+            before=before,
+            after={},
+            severity='warning',
+            feature_area='inventory_master',
+            reference_number=before['sku_snapshot'] or before['barcode_snapshot'],
+        )
+        return response
+
     @action(detail=False, methods=['get'])
     def low_stock(self, request):
-        queryset = self.get_queryset()
+        queryset = self._get_stock_filtered_queryset('low_stock')
         page = self.paginate_queryset(queryset)
         if page is not None:
             serializer = self.get_serializer(page, many=True)
@@ -213,14 +522,24 @@ class InventoryItemViewSet(BaseInventoryViewSet):
 
     @action(detail=False, methods=['get'])
     def needs_reorder(self, request):
-        serializer = self.get_serializer(self.get_queryset(), many=True)
+        queryset = self._get_stock_filtered_queryset('needs_reorder')
+        page = self.paginate_queryset(queryset)
+        if page is not None:
+            serializer = self.get_serializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+        serializer = self.get_serializer(queryset, many=True)
         return Response(serializer.data)
 
     @action(detail=False, methods=['get'])
     def summary(self, request):
         profile_id = get_request_profile_id(request, required=True, as_str=False)
+        stock_location, stock_locations = self._get_inventory_scope()
         serializer = InventorySetupSummarySerializer(
-            get_inventory_setup_summary(profile_id=profile_id),
+            get_inventory_setup_summary(
+                profile_id=profile_id,
+                stock_location=stock_location,
+                stock_locations=stock_locations,
+            ),
             context=self.get_serializer_context(),
         )
         return Response(serializer.data)
@@ -294,6 +613,7 @@ class InventoryItemViewSet(BaseInventoryViewSet):
                         )
                         continue
 
+                    before = serialize_inventory_item(inventory_item)
                     for field, value in controls.items():
                         setattr(inventory_item, field, value)
                     metadata = dict(inventory_item.metadata or {})
@@ -306,6 +626,28 @@ class InventoryItemViewSet(BaseInventoryViewSet):
                     save_fields = list(controls.keys()) + ['metadata', 'updated_by_user_id', 'updated_at']
                     inventory_item.save(update_fields=save_fields)
                     updated_count += 1
+                    after = serialize_inventory_item(inventory_item)
+                    publish_inventory_admin_event(
+                        event_name='inventory.item.controls.bulk_updated',
+                        payload=after,
+                        actor=_audit_actor_from_request(request),
+                        target={
+                            'type': 'inventory_item',
+                            'id': after['inventory_item_id'],
+                            'label': after['name_snapshot'],
+                            'barcode': after['barcode_snapshot'],
+                            'sku': after['sku_snapshot'],
+                        },
+                        summary=f"Inventory controls bulk-updated for {after['name_snapshot']}.",
+                        metadata={
+                            'reason': reason,
+                            'updated_fields': list(controls.keys()),
+                        },
+                        before=before,
+                        after=after,
+                        feature_area='inventory_policy',
+                        reference_number=after['sku_snapshot'] or after['barcode_snapshot'],
+                    )
                     results.append(
                         _bulk_control_result(
                             inventory_item=inventory_item,
@@ -324,7 +666,12 @@ class InventoryItemViewSet(BaseInventoryViewSet):
     @action(detail=True, methods=['get'])
     def stock_summary(self, request, pk=None):
         inventory_item = self.get_object()
-        summary = get_inventory_item_summary_map([inventory_item]).get(inventory_item.id, {})
+        stock_location, stock_locations = self._get_inventory_scope()
+        summary = get_inventory_item_summary_map(
+            [inventory_item],
+            stock_location=stock_location,
+            stock_locations=stock_locations,
+        ).get(inventory_item.id, {})
         return Response({
             'total_quantity': summary.get('quantity', Decimal('0')),
             'quantity_reserved': summary.get('quantity_reserved', Decimal('0')),
@@ -371,6 +718,30 @@ class InventoryItemViewSet(BaseInventoryViewSet):
         if stock_location is None:
             return Response({'error': 'Stock location not found'}, status=status.HTTP_404_NOT_FOUND)
 
+        structural_scope_location = _resolve_structural_scope_location_from_request(
+            request,
+            profile_id=profile_id,
+        )
+        if (
+            request.data.get('structural_location_id')
+            or request.query_params.get('structural_location_id')
+            or request.query_params.get('stock_location_id')
+        ) and structural_scope_location is None:
+            return Response(
+                {'error': 'The selected structural location scope is unavailable'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if structural_scope_location is not None:
+            scoped_location_ids = get_location_scope_ids(
+                profile_id=profile_id,
+                stock_location=structural_scope_location,
+            ) or [structural_scope_location.id]
+            if stock_location.id not in scoped_location_ids:
+                return Response(
+                    {'error': 'Stock location is outside the selected structural location scope'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
         try:
             adjustment_result = StockDomainService.adjust_stock(
                 inventory_item=inventory_item,
@@ -381,6 +752,50 @@ class InventoryItemViewSet(BaseInventoryViewSet):
             )
         except StockDomainError as exc:
             return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        payload = serialize_inventory_item(inventory_item)
+        publish_inventory_admin_event(
+            event_name='inventory.stock.adjusted',
+            payload={
+                **payload,
+                'stock_location_id': str(stock_location.id),
+                'stock_location_name': stock_location.name,
+                'quantity_change': float(quantity_change),
+                'old_quantity': float(adjustment_result['old_quantity']),
+                'new_quantity': float(adjustment_result['new_quantity']),
+                'reason': reason,
+            },
+            actor=_audit_actor_from_request(request),
+            target={
+                'type': 'inventory_item',
+                'id': payload['inventory_item_id'],
+                'label': payload['name_snapshot'],
+                'barcode': payload['barcode_snapshot'],
+                'sku': payload['sku_snapshot'],
+                'location_id': str(stock_location.id),
+            },
+            summary=f"Stock adjusted for {payload['name_snapshot']} at {stock_location.name}.",
+            metadata={
+                'stock_location_name': stock_location.name,
+                'quantity_change': float(quantity_change),
+                'reason': reason,
+            },
+            before={
+                'quantity_on_hand': float(adjustment_result['old_quantity']),
+            },
+            after={
+                'quantity_on_hand': float(adjustment_result['new_quantity']),
+            },
+            severity='warning' if quantity_change < 0 else 'info',
+            feature_area='stock_control',
+            reference_number=payload['sku_snapshot'] or payload['barcode_snapshot'],
+            notification_category='stock_alert',
+            notification_title=f"Stock adjusted for {payload['name_snapshot']}",
+            notification_message=(
+                f"Stock for {payload['name_snapshot']} at {stock_location.name} changed by {float(quantity_change)}."
+            ),
+            notification_action_url='/inventory',
+        )
 
         return Response({
             'message': 'Stock adjusted successfully',

@@ -10,8 +10,10 @@ from starlette.testclient import TestClient
 from mainapps.inventory.models import InventoryItem
 from mcp_server.server import (
     InventoryMcpPrincipal,
+    _adjust_inventory_item_stock_via_view_sync,
     _build_principal_from_token,
     _build_transport_security_settings,
+    _create_stock_reservation_via_view_sync,
     _extract_bearer_token,
     _inventory_item_payload,
     _invoke_view_action_sync,
@@ -128,6 +130,99 @@ class InventoryMcpToolTests(SimpleTestCase):
                 asyncio.run(search_inventory_items(query="warehouse"))
         finally:
             _principal_var.reset(token)
+
+    @patch("mcp_server.server._search_inventory_items_sync")
+    def test_search_inventory_items_forwards_structural_location_scope(self, search_sync):
+        search_sync.return_value = {"count": 0, "results": []}
+        principal = InventoryMcpPrincipal(
+            token="jwt-token",
+            claims={},
+            user_id="1",
+            profile_id=1,
+            company_code=None,
+            permissions=set(),
+        )
+        token = _principal_var.set(principal)
+        try:
+            result = asyncio.run(
+                search_inventory_items(
+                    query="perfume",
+                    structural_location_id="6e5bb31f-0d7c-4f55-a4c6-b9730d0f6f35",
+                )
+            )
+        finally:
+            _principal_var.reset(token)
+
+        self.assertEqual(result, {"count": 0, "results": []})
+        _, kwargs = search_sync.call_args
+        self.assertEqual(kwargs["structural_location_id"], "6e5bb31f-0d7c-4f55-a4c6-b9730d0f6f35")
+
+    @patch("mcp_server.server._invoke_view_action_sync")
+    def test_adjust_inventory_item_stock_forwards_structural_location_scope(self, invoke_view_action_sync):
+        invoke_view_action_sync.return_value = {"ok": True}
+        principal = InventoryMcpPrincipal(
+            token="jwt-token",
+            claims={},
+            user_id="1",
+            profile_id=1,
+            company_code=None,
+            permissions=set(),
+        )
+
+        payload = _adjust_inventory_item_stock_via_view_sync(
+            principal=principal,
+            inventory_item_id="item-1",
+            data={
+                "adjustments": [
+                    {
+                        "stock_location_id": "location-1",
+                        "structural_location_id": "structural-1",
+                        "quantity": "5",
+                        "adjustment_type": "add",
+                    }
+                ]
+            },
+        )
+
+        self.assertEqual(payload["inventory_adjustment"], {"ok": True})
+        _, kwargs = invoke_view_action_sync.call_args
+        self.assertEqual(kwargs["data"]["location_id"], "location-1")
+        self.assertEqual(kwargs["data"]["structural_location_id"], "structural-1")
+
+    @patch("mcp_server.server._invoke_view_action_sync")
+    def test_create_stock_reservation_preserves_structural_location_scope(self, invoke_view_action_sync):
+        invoke_view_action_sync.return_value = {
+            "id": "reservation-1",
+            "inventory_item_id": "item-1",
+            "stock_location_id": "location-1",
+            "reserved_quantity": 2,
+            "fulfilled_quantity": 0,
+            "remaining_quantity": 2,
+            "status": "active",
+        }
+        principal = InventoryMcpPrincipal(
+            token="jwt-token",
+            claims={},
+            user_id="1",
+            profile_id=1,
+            company_code=None,
+            permissions=set(),
+        )
+
+        _create_stock_reservation_via_view_sync(
+            principal=principal,
+            data={
+                "inventory_item_id": "item-1",
+                "stock_location_id": "location-1",
+                "reserved_quantity": "2",
+                "structural_location_id": "structural-1",
+            },
+        )
+
+        _, kwargs = invoke_view_action_sync.call_args
+        self.assertEqual(kwargs["data"]["stock_location_id"], "location-1")
+        self.assertEqual(kwargs["data"]["location_id"], "location-1")
+        self.assertEqual(kwargs["data"]["structural_location_id"], "structural-1")
 
     @patch("mcp_server.server.APIRequestFactory.get")
     def test_invoke_view_action_sync_omits_none_query_params_from_get_request(self, factory_get):

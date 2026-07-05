@@ -170,6 +170,10 @@ class StockReservationCreateUpdatePayload(BaseModel):
     stock_lot_id: Optional[uuid.UUID] = Field(None, description="UUID of StockLot")
     stock_serial_id: Optional[uuid.UUID] = Field(None, description="UUID of StockSerial")
     stock_location_id: uuid.UUID = Field(..., description="UUID of StockLocation")
+    structural_location_id: Optional[uuid.UUID] = Field(
+        None,
+        description="UUID of the structural location scope that owns the selected stock location.",
+    )
     external_order_type: str = Field(..., max_length=50, description="Order type (e.g., SalesOrder, PurchaseOrder)")
     external_order_id: str = Field(..., max_length=100, description="Order ID/reference")
     external_order_line_id: str = Field("", max_length=100, description="Order line ID")
@@ -457,6 +461,10 @@ class InventoryAdjustmentLinePayload(McpPayloadModel):
     stock_lot_id: Optional[uuid.UUID] = Field(None, description="Stock lot identifier")
     stock_serial_id: Optional[uuid.UUID] = Field(None, description="Stock serial identifier")
     stock_location_id: Optional[uuid.UUID] = Field(None, description="Stock location identifier")
+    structural_location_id: Optional[uuid.UUID] = Field(
+        None,
+        description="Structural location scope identifier for the selected stock location.",
+    )
     quantity: Optional[Decimal] = Field(None, description="Adjustment quantity")
     unit_cost: Optional[Decimal] = Field(None, description="Unit cost")
     adjustment_type: Optional[str] = Field(None, description="Adjustment type")
@@ -465,6 +473,10 @@ class InventoryAdjustmentLinePayload(McpPayloadModel):
 
 class InventoryAdjustmentRequestPayload(McpPayloadModel):
     adjustments: List[InventoryAdjustmentLinePayload] = Field(default_factory=list, description="Inventory adjustment lines")
+    structural_location_id: Optional[uuid.UUID] = Field(
+        None,
+        description="Structural location scope identifier for the full adjustment request.",
+    )
     notes: Optional[str] = Field(None, description="Adjustment notes")
     reason: Optional[str] = Field(None, description="Business reason for the adjustment")
 
@@ -482,6 +494,10 @@ class StockTransferLinePayload(McpPayloadModel):
 
 class StockTransferRequestPayload(McpPayloadModel):
     transfers: List[StockTransferLinePayload] = Field(default_factory=list, description="Stock transfer lines")
+    structural_location_id: Optional[uuid.UUID] = Field(
+        None,
+        description="Structural location scope identifier for the transfer request.",
+    )
     notes: Optional[str] = Field(None, description="Transfer notes")
     reason: Optional[str] = Field(None, description="Business reason for the transfer")
 

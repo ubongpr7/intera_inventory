@@ -1,15 +1,40 @@
 import logging
-from django.core.mail import EmailMultiAlternatives, EmailMessage
-from django.template.loader import render_to_string
-from django.conf import settings
 import os
 from io import BytesIO
 
+from django.conf import settings
+from django.core.mail import EmailMessage, EmailMultiAlternatives
+from django.template.loader import render_to_string
+
 logger = logging.getLogger(__name__)
+
 
 class EmailService:
     """Enhanced email service matching your existing implementation"""
-    
+
+    @classmethod
+    def _resolve_from_email(cls):
+        return getattr(settings, "DEFAULT_FROM_EMAIL", None) or settings.EMAIL_HOST_USER
+
+    @classmethod
+    def _email_backend_is_local_only(cls):
+        backend = (getattr(settings, "EMAIL_BACKEND", "") or "").lower()
+        return any(
+            marker in backend
+            for marker in (
+                "console.emailbackend",
+                "locmem.emailbackend",
+                "dummy.emailbackend",
+                "filebased.emailbackend",
+            )
+        )
+
+    @classmethod
+    def _mail_is_configured(cls):
+        if cls._email_backend_is_local_only():
+            return True
+        return bool(settings.EMAIL_HOST_USER and settings.EMAIL_HOST_PASSWORD)
+
     @classmethod
     def send_purchase_order_email(cls, purchase_order, pdf_file):
         """
@@ -21,6 +46,13 @@ class EmailService:
             bool: True if email sent successfully, False otherwise
         """
         try:
+            if not cls._mail_is_configured():
+                logger.error(
+                    "Inventory email settings are incomplete. "
+                    "Set EMAIL_HOST_USER / EMAIL_HOST_PASSWORD (or use a local-only EMAIL_BACKEND)."
+                )
+                return False
+
             # Check if contact exists and has email
             if not purchase_order.contact or not purchase_order.contact.email:
                 logger.error(f"No contact or email for Purchase Order #{purchase_order.reference}")
@@ -28,7 +60,7 @@ class EmailService:
 
             contact_email = purchase_order.contact.email
             subject = f"Purchase Order #{purchase_order.reference} from {purchase_order.profile.name}"
-            from_email = settings.DEFAULT_FROM_EMAIL
+            from_email = cls._resolve_from_email()
             to = [contact_email]
 
             # Add CC recipients if needed
@@ -68,7 +100,7 @@ class EmailService:
                 return False
 
             # Send email
-            email.send()
+            email.send(fail_silently=False)
             logger.info(f"Email sent to {contact_email} for Purchase Order #{purchase_order.reference}")
             return True
 
@@ -86,6 +118,13 @@ class EmailService:
             return_pdf: BytesIO object containing return order PDF
         """
         try:
+            if not cls._mail_is_configured():
+                logger.error(
+                    "Inventory email settings are incomplete. "
+                    "Set EMAIL_HOST_USER / EMAIL_HOST_PASSWORD (or use a local-only EMAIL_BACKEND)."
+                )
+                return False
+
             purchase_order = return_order.purchase_order
             
             # Validate email recipients
@@ -158,7 +197,7 @@ class EmailService:
                 logger.error(f"Failed to attach PDFs to return order email: {str(e)}")
                 return False
             
-            email.send()
+            email.send(fail_silently=False)
             logger.info(f"Return order email sent for {return_order.reference}")
             return True
             
@@ -176,6 +215,13 @@ class EmailService:
             additional_context: dict with additional template context
         """
         try:
+            if not cls._mail_is_configured():
+                logger.error(
+                    "Inventory email settings are incomplete. "
+                    "Set EMAIL_HOST_USER / EMAIL_HOST_PASSWORD (or use a local-only EMAIL_BACKEND)."
+                )
+                return False
+
             if not purchase_order.contact or not purchase_order.contact.email:
                 logger.warning(f"No contact email for PO status notification: {purchase_order.reference}")
                 return False
@@ -197,11 +243,11 @@ class EmailService:
             email = EmailMultiAlternatives(
                 subject,
                 "",
-                settings.DEFAULT_FROM_EMAIL,
+                cls._resolve_from_email(),
                 [purchase_order.contact.email]
             )
             email.attach_alternative(html_content, "text/html")
-            email.send()
+            email.send(fail_silently=False)
             
             logger.info(f"Status notification sent for PO {purchase_order.reference}: {status_change['to_status']}")
             return True

@@ -26,6 +26,7 @@ from mainapps.stock.models import (
     StockReservationStatus,
     TrackingType,
 )
+from subapps.services.location_scope import ensure_inventory_item_placement
 
 
 class StockDomainError(ValueError):
@@ -73,6 +74,12 @@ def _normalize_serial_numbers(serial_numbers) -> list[str]:
 
 class StockDomainService:
     @classmethod
+    def _ensure_operational_stock_location(cls, stock_location: StockLocation, *, label: str = "Stock location") -> StockLocation:
+        if getattr(stock_location, "structural", False) is True:
+            raise StockDomainError(f"{label} must be a concrete operating location, not a structural root.")
+        return stock_location
+
+    @classmethod
     def create_goods_receipt(
         cls,
         *,
@@ -101,6 +108,7 @@ class StockDomainService:
         line_item: PurchaseOrderLineItem,
         stock_location: StockLocation,
         quantity_received,
+        unit_cost=None,
         actor_user_id=None,
         goods_receipt: GoodsReceipt | None = None,
         lot_number: str = "",
@@ -109,9 +117,13 @@ class StockDomainService:
         serial_numbers=None,
         notes: str = "",
     ):
+        stock_location = cls._ensure_operational_stock_location(stock_location, label="Receiving location")
         quantity_received = _to_decimal(quantity_received)
         if quantity_received <= 0:
             raise StockDomainError("Received quantity must be greater than zero.")
+        resolved_unit_cost = _to_decimal(unit_cost if unit_cost is not None else line_item.unit_price)
+        if resolved_unit_cost < 0:
+            raise StockDomainError("Unit cost cannot be negative.")
 
         if line_item.quantity_received + quantity_received > line_item.quantity:
             raise StockDomainError(
@@ -122,6 +134,12 @@ class StockDomainService:
         inventory_item = cls.ensure_inventory_item(
             purchase_order_line=line_item,
             actor_user_id=actor_user_id,
+        )
+        ensure_inventory_item_placement(
+            inventory_item,
+            stock_location=stock_location,
+            created_by_user_id=actor_user_id,
+            updated_by_user_id=actor_user_id,
         )
 
         if goods_receipt is None:
@@ -158,7 +176,7 @@ class StockDomainService:
             inventory_item=inventory_item,
             stock_location=stock_location,
             received_quantity=quantity_received,
-            unit_cost=line_item.unit_price,
+            unit_cost=resolved_unit_cost,
             lot_number=line_lot_number,
             manufactured_date=line_manufactured_date,
             expiry_date=line_expiry_date,
@@ -177,7 +195,7 @@ class StockDomainService:
                 lot_number=line_lot_number,
                 manufactured_date=line_manufactured_date,
                 expiry_date=line_expiry_date,
-                unit_cost=line_item.unit_price,
+                unit_cost=resolved_unit_cost,
                 currency_code=purchase_order.order_currency or "",
                 received_quantity=quantity_received,
                 remaining_quantity=quantity_received,
@@ -223,7 +241,7 @@ class StockDomainService:
                     to_location=stock_location,
                     movement_type=StockMovementType.RECEIPT,
                     quantity=Decimal("1"),
-                    unit_cost=line_item.unit_price,
+                    unit_cost=resolved_unit_cost,
                     reference_type="goods_receipt_line",
                     reference_id=str(goods_receipt_line.id),
                     actor_user_id=actor_user_id,
@@ -239,7 +257,7 @@ class StockDomainService:
                 to_location=stock_location,
                 movement_type=StockMovementType.RECEIPT,
                 quantity=quantity_received,
-                unit_cost=line_item.unit_price,
+                unit_cost=resolved_unit_cost,
                 reference_type="goods_receipt_line",
                 reference_id=str(goods_receipt_line.id),
                 actor_user_id=actor_user_id,
@@ -272,6 +290,8 @@ class StockDomainService:
         serial_number: str = "",
         notes: str = "",
     ):
+        from_location = cls._ensure_operational_stock_location(from_location, label="Source location")
+        to_location = cls._ensure_operational_stock_location(to_location, label="Destination location")
         quantity = _to_decimal(quantity)
         if quantity <= 0:
             raise StockDomainError("Transfer quantity must be greater than zero.")
@@ -350,6 +370,12 @@ class StockDomainService:
         destination_balance.quantity_on_hand = _to_decimal(destination_balance.quantity_on_hand) + quantity
         destination_balance.updated_by_user_id = actor_user_id
         destination_balance.save()
+        ensure_inventory_item_placement(
+            inventory_item,
+            stock_location=to_location,
+            created_by_user_id=actor_user_id,
+            updated_by_user_id=actor_user_id,
+        )
 
         if stock_serial is not None:
             stock_serial.stock_location = to_location
@@ -395,6 +421,7 @@ class StockDomainService:
         actor_user_id=None,
         reason: str = "",
     ):
+        stock_location = cls._ensure_operational_stock_location(stock_location)
         quantity_change = _to_decimal(quantity_change)
         if quantity_change == 0:
             raise StockDomainError("Quantity change cannot be zero.")
@@ -415,6 +442,13 @@ class StockDomainService:
         balance.quantity_on_hand = next_quantity
         balance.updated_by_user_id = actor_user_id
         balance.save()
+        if quantity_change > 0:
+            ensure_inventory_item_placement(
+                inventory_item,
+                stock_location=stock_location,
+                created_by_user_id=actor_user_id,
+                updated_by_user_id=actor_user_id,
+            )
 
         StockMovement.objects.create(
             profile_id=profile_id,
@@ -507,6 +541,7 @@ class StockDomainService:
         expires_at=None,
         notes: str = "",
     ):
+        stock_location = cls._ensure_operational_stock_location(stock_location)
         quantity = _to_decimal(quantity)
         if quantity <= 0:
             raise StockDomainError("Reservation quantity must be greater than zero.")
@@ -630,6 +665,7 @@ class StockDomainService:
         movement_type: str = StockMovementType.ISSUE,
         tracking_type: int = TrackingType.SHIPPED,
     ):
+        stock_location = cls._ensure_operational_stock_location(stock_location)
         quantity = _to_decimal(quantity)
         if quantity <= 0:
             raise StockDomainError("Issue quantity must be greater than zero.")
