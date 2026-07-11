@@ -4,7 +4,7 @@ import uuid
 from datetime import date, datetime
 from typing import Optional, Literal, Dict, Any, List
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
 
 # ------------------------------------------------------------------------------
 # Enumerations (mirror Django choices)
@@ -438,7 +438,11 @@ class PurchaseOrderAnalyticsTrendPayload(McpPayloadModel):
 
 
 class PurchaseOrderSupplierPerformancePayload(McpPayloadModel):
-    supplier_name: str = Field(..., validation_alias="supplier__name", description="Supplier name")
+    supplier_name: str = Field(
+        ...,
+        validation_alias=AliasChoices("supplier__name", "supplier_name"),
+        description="Supplier name",
+    )
     order_count: int = Field(0, description="Orders attributed to the supplier")
     total_value: Optional[Decimal] = Field(None, description="Total supplier order value")
     avg_delivery_time: Optional[str] = Field(None, description="Average delivery time duration")
@@ -446,8 +450,16 @@ class PurchaseOrderSupplierPerformancePayload(McpPayloadModel):
 
 
 class PurchaseOrderTopSupplierPayload(McpPayloadModel):
-    supplier_id: str = Field(..., validation_alias="supplier__id", description="Supplier identifier")
-    supplier_name: str = Field(..., validation_alias="supplier__name", description="Supplier name")
+    supplier_id: str = Field(
+        ...,
+        validation_alias=AliasChoices("supplier__id", "supplier_id"),
+        description="Supplier identifier",
+    )
+    supplier_name: str = Field(
+        ...,
+        validation_alias=AliasChoices("supplier__name", "supplier_name"),
+        description="Supplier name",
+    )
     order_count: int = Field(0, description="Orders attributed to the supplier")
     total_value: Optional[Decimal] = Field(None, description="Total supplier order value")
 

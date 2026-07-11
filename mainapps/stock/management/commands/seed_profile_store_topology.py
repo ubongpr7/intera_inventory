@@ -28,6 +28,21 @@ STORE_SPECS = (
         "physical_address": "Agric Bus Stop, Ikorodu, Lagos",
         "description": "Neighbourhood store branch serving the Agric corridor in Ikorodu.",
     },
+    {
+        "name": "Lekki Phase 1 Store",
+        "physical_address": "Admiralty Way, Lekki Phase 1, Lagos",
+        "description": "Premium neighbourhood branch serving Lekki Phase 1 shoppers.",
+    },
+    {
+        "name": "Yaba Market Store",
+        "physical_address": "Herbert Macaulay Way, Yaba, Lagos",
+        "description": "Mid-city branch supporting Yaba foot traffic and student demand.",
+    },
+    {
+        "name": "Surulere Central Store",
+        "physical_address": "Adeniran Ogunsanya, Surulere, Lagos",
+        "description": "High-throughput Surulere branch with broad convenience assortment coverage.",
+    },
 )
 
 STORE_LAYOUT = (

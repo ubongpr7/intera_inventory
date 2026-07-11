@@ -14,5 +14,7 @@ router.register(r'reservations', StockReservationViewSet, basename='stock-reserv
 
 
 urlpatterns = [
+    path('internal/subscription-usage/', InternalSubscriptionUsageView.as_view(), name='internal-subscription-usage'),
+    path('reports/<str:report_type>/', AIReportExportView.as_view(), name='ai-report-export'),
     path('', include(router.urls)),
 ]

@@ -1,7 +1,7 @@
 import json
 import uuid
 from decimal import Decimal
-from io import StringIO
+from io import BytesIO, StringIO
 from tempfile import NamedTemporaryFile
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -16,6 +16,7 @@ from mainapps.inventory.models import InventoryItem, InventoryPlacement
 from mainapps.stock.models import StockBalance, StockLocation, StockLocationType, StockReservation, StockReservationStatus
 from mainapps.stock.serializers import InventoryItemDetailSerializer
 from mainapps.stock.views import (
+    AIReportExportView,
     StockReservationViewSet,
     filter_inventory_items_for_location,
     filter_inventory_items_for_purchase_order,
@@ -786,3 +787,75 @@ class StockReservationAuditEventTests(TestCase):
         self.assertEqual(payload["event_name"], "inventory.stock_reservation.fulfilled")
         self.assertEqual(payload["payload"]["inventory_name"], "Blue Detergent")
         self.assertEqual(payload["notification_title"], "Reservation fulfilled for Blue Detergent")
+
+
+class AIReportExportViewTests(TestCase):
+    def setUp(self):
+        self.factory = APIRequestFactory()
+
+    def _authenticate(self, request):
+        force_authenticate(
+            request,
+            user=None,
+            token={"profile_id": 1, "user_id": 1, "owner_id": 1, "permissions": ["can_view_dashboard"]},
+        )
+
+    @patch("mainapps.stock.views.PDFService.generate_ai_insight_report_pdf")
+    def test_insight_pdf_export_returns_pdf_attachment(self, generate_pdf):
+        generate_pdf.return_value = BytesIO(b"%PDF-test-insight")
+        request = self.factory.post(
+            "/stock/reports/insight-pdf/",
+            {
+                "title": "Sales analysis",
+                "payload": {
+                    "kind": "insight_response",
+                    "summary": "Sales analysis for last month",
+                    "widgets": [{"type": "metric_grid", "data": []}],
+                },
+            },
+            format="json",
+        )
+        self._authenticate(request)
+
+        response = AIReportExportView.as_view()(request, report_type="insight-pdf")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response["Content-Type"], "application/pdf")
+        self.assertIn("attachment; filename=", response["Content-Disposition"])
+        generate_pdf.assert_called_once()
+
+    @patch("mainapps.stock.views.PDFService.generate_ai_chat_report_pdf")
+    def test_chat_pdf_export_returns_pdf_attachment(self, generate_pdf):
+        generate_pdf.return_value = BytesIO(b"%PDF-test-chat")
+        request = self.factory.post(
+            "/stock/reports/chat-pdf/",
+            {
+                "title": "AI chat export",
+                "messages": [
+                    {"id": "1", "role": "user", "content": "hello", "timestamp": "2026-07-10T10:00:00Z"},
+                    {"id": "2", "role": "assistant", "content": "hi", "timestamp": "2026-07-10T10:00:02Z"},
+                ],
+            },
+            format="json",
+        )
+        self._authenticate(request)
+
+        response = AIReportExportView.as_view()(request, report_type="chat-pdf")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response["Content-Type"], "application/pdf")
+        self.assertIn("attachment; filename=", response["Content-Disposition"])
+        generate_pdf.assert_called_once()
+
+    def test_insight_pdf_requires_payload_object(self):
+        request = self.factory.post(
+            "/stock/reports/insight-pdf/",
+            {"title": "Bad request", "payload": []},
+            format="json",
+        )
+        self._authenticate(request)
+
+        response = AIReportExportView.as_view()(request, report_type="insight-pdf")
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data["detail"], "payload must be an object.")

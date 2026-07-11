@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ title }}</title>
+    <style>
+        :root {
+            --bg: #f8fafc;
+            --surface: #ffffff;
+            --surface-soft: #f8fafc;
+            --border: #dbe4f0;
+            --text: #0f172a;
+            --muted: #64748b;
+        }
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            padding: 0;
+            background: var(--bg);
+            color: var(--text);
+            font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            font-size: 13px;
+        }
+        .page {
+            display: grid;
+            gap: 18px;
+        }
+        .report-header {
+            background: linear-gradient(135deg, #eff6ff 0%, #f8fafc 100%);
+            border: 1px solid var(--border);
+            border-radius: 24px;
+            padding: 24px;
+        }
+        .eyebrow {
+            margin: 0 0 8px;
+            font-size: 11px;
+            letter-spacing: 0.24em;
+            text-transform: uppercase;
+            color: #475569;
+            font-weight: 700;
+        }
+        h1, h2, h3, h4 { margin: 0; }
+        h1 { font-size: 26px; line-height: 1.15; }
+        h2 { font-size: 20px; line-height: 1.3; }
+        h3 { font-size: 16px; line-height: 1.3; }
+        h4 { font-size: 13px; line-height: 1.4; }
+        .muted { color: var(--muted); }
+        .hero, .card, .message {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 22px;
+            padding: 18px;
+            page-break-inside: avoid;
+        }
+        .hero > p {
+            margin: 12px 0 0;
+            color: var(--muted);
+            line-height: 1.7;
+        }
+        .insight-grid {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 12px;
+            margin-top: 16px;
+        }
+        .mini-card {
+            background: var(--surface-soft);
+            border-radius: 18px;
+            padding: 14px;
+            border: 1px solid #e5edf7;
+        }
+        .mini-card p {
+            margin: 8px 0 0;
+            color: var(--muted);
+            line-height: 1.6;
+        }
+        .section-head {
+            display: flex;
+            justify-content: space-between;
+            gap: 16px;
+            align-items: flex-start;
+            margin-bottom: 14px;
+        }
+        .type-pill, .chip {
+            display: inline-flex;
+            align-items: center;
+            border-radius: 999px;
+            padding: 6px 10px;
+            font-size: 11px;
+            font-weight: 600;
+        }
+        .type-pill {
+            background: #e2e8f0;
+            color: #334155;
+        }
+        .chips {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+            margin-top: 12px;
+        }
+        .chip.warning {
+            background: #fff7ed;
+            color: #9a3412;
+        }
+        .chip.neutral {
+            background: #eef2ff;
+            color: #3730a3;
+        }
+        .table-wrap {
+            overflow: hidden;
+            border: 1px solid #e5edf7;
+            border-radius: 18px;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        th, td {
+            padding: 10px 12px;
+            text-align: left;
+            vertical-align: top;
+            border-bottom: 1px solid #e5edf7;
+            font-size: 12px;
+        }
+        th {
+            background: #f8fafc;
+            font-size: 10px;
+            letter-spacing: 0.14em;
+            text-transform: uppercase;
+            color: #64748b;
+        }
+        tbody tr:last-child td {
+            border-bottom: 0;
+        }
+        .list {
+            margin: 12px 0 0;
+            padding-left: 18px;
+            color: var(--muted);
+        }
+        .list li + li {
+            margin-top: 7px;
+        }
+        .chat-page {
+            gap: 14px;
+        }
+        .message.user {
+            background: #e0ecff;
+            border-color: #bfdbfe;
+        }
+        .message.assistant {
+            background: #ffffff;
+            border-color: #dbe4f0;
+        }
+        .message-meta {
+            display: flex;
+            justify-content: space-between;
+            gap: 12px;
+            font-size: 11px;
+            color: #64748b;
+            margin-bottom: 10px;
+        }
+        .author {
+            font-weight: 700;
+            color: #0f172a;
+        }
+        .text-block {
+            font-size: 13px;
+            line-height: 1.7;
+            color: #1e293b;
+        }
+    </style>
+</head>
+<body>
+    <main class="page {% if mode == 'chat' %}chat-page{% endif %}">
+        <header class="report-header">
+            <p class="eyebrow">Intera AI</p>
+            <h1>{{ title }}</h1>
+            <p class="muted">Generated {{ generated_at }}</p>
+        </header>
+        {{ body_html|safe }}
+    </main>
+</body>
+</html>

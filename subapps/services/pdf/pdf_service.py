@@ -1,7 +1,10 @@
 from django.template.loader import render_to_string
 from io import BytesIO
 from django.conf import settings
+from django.utils import timezone
+from html import escape
 import logging
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -13,6 +16,12 @@ class PDFServiceUnavailableError(RuntimeError):
 def _load_weasyprint():
     """Import WeasyPrint lazily so missing native libs do not break app startup."""
     try:
+        homebrew_lib = "/opt/homebrew/lib"
+        if os.path.isdir(homebrew_lib):
+            existing = [path for path in (os.environ.get("DYLD_FALLBACK_LIBRARY_PATH") or "").split(":") if path]
+            if homebrew_lib not in existing:
+                os.environ["DYLD_FALLBACK_LIBRARY_PATH"] = ":".join([homebrew_lib, *existing])
+
         from weasyprint import HTML, CSS
         return HTML, CSS
     except Exception as exc:
@@ -23,6 +32,387 @@ def _load_weasyprint():
 
 class PDFService:
     """Enhanced PDF service using WeasyPrint matching your implementation"""
+
+    @staticmethod
+    def _as_record(value):
+        return value if isinstance(value, dict) else {}
+
+    @staticmethod
+    def _as_array(value):
+        return value if isinstance(value, list) else []
+
+    @staticmethod
+    def _as_string(value):
+        return value if isinstance(value, str) else ""
+
+    @classmethod
+    def _render_badges(cls, title, values, tone):
+        if not values:
+            return ""
+        badges = "".join(
+            f'<span class="chip {escape(tone)}">{escape(cls._as_string(value))}</span>'
+            for value in values
+            if cls._as_string(value).strip()
+        )
+        if not badges:
+            return ""
+        return f"""
+        <section class="card">
+          <h3>{escape(title)}</h3>
+          <div class="chips">{badges}</div>
+        </section>
+        """
+
+    @classmethod
+    def _render_table(cls, columns, rows):
+        header_html = "".join(f"<th>{escape(column)}</th>" for column in columns)
+        body_html = "".join(
+            "<tr>"
+            + "".join(
+                f"<td>{escape('' if row.get(column) is None else str(row.get(column))) or '&nbsp;'}</td>"
+                for column in columns
+            )
+            + "</tr>"
+            for row in rows
+        )
+        return f"""
+        <div class="table-wrap">
+          <table>
+            <thead><tr>{header_html}</tr></thead>
+            <tbody>{body_html}</tbody>
+          </table>
+        </div>
+        """
+
+    @classmethod
+    def _widget_rows(cls, widget):
+        widget = cls._as_record(widget)
+        widget_type = cls._as_string(widget.get("type")) or "widget"
+        title = cls._as_string(widget.get("title"))
+        subtitle = cls._as_string(widget.get("subtitle"))
+        base = {
+            "widget_type": widget_type,
+            "widget_title": title,
+            "widget_subtitle": subtitle,
+        }
+
+        if widget_type == "metric_grid":
+            return [
+                {
+                    **base,
+                    "row_type": "metric",
+                    "label": cls._as_string(item.get("label")) or f"Metric {index + 1}",
+                    "value": item.get("value"),
+                    "unit": cls._as_string(item.get("unit")) or None,
+                    "detail": cls._as_string(item.get("detail")) or None,
+                }
+                for index, item in enumerate(cls._as_record(item) for item in cls._as_array(widget.get("data")))
+                if item
+            ]
+
+        if widget_type in {"bar_chart", "histogram", "line_chart", "donut_chart", "sparkline_metric"}:
+            x_key = cls._as_string(widget.get("x_key")) or cls._as_string(widget.get("label_key")) or "label"
+            y_key = cls._as_string(widget.get("y_key")) or cls._as_string(widget.get("value_key")) or "value"
+            return [
+                {
+                    **base,
+                    "row_type": "chart_point",
+                    "label": item.get(x_key),
+                    "value": item.get(y_key),
+                }
+                for item in (cls._as_record(entry) for entry in cls._as_array(widget.get("data")))
+                if item
+            ]
+
+        if widget_type == "ranked_list":
+            rows = []
+            for index, item in enumerate(cls._as_record(entry) for entry in cls._as_array(widget.get("items"))):
+                if not item:
+                    continue
+                meta = cls._as_record(item.get("meta"))
+                rows.append(
+                    {
+                        **base,
+                        "row_type": "ranked_item",
+                        "rank": index + 1,
+                        "label": cls._as_string(item.get("label")) or cls._as_string(item.get("title")) or f"Item {index + 1}",
+                        "value": item.get("value", item.get("count")),
+                        "secondary_value": item.get("secondary_value"),
+                        "detail": cls._as_string(item.get("detail")) or None,
+                        "barcode": cls._as_string(item.get("barcode") or meta.get("barcode")) or None,
+                        "image_url": cls._as_string(item.get("image_url")) or None,
+                    }
+                )
+            return rows
+
+        if widget_type == "risk_panel":
+            return [
+                {
+                    **base,
+                    "row_type": "risk",
+                    "label": cls._as_string(item.get("label")) or f"Risk {index + 1}",
+                    "severity": cls._as_string(item.get("severity") or widget.get("severity")) or None,
+                    "detail": cls._as_string(item.get("detail")) or None,
+                    "next_action": cls._as_string(item.get("next_action")) or None,
+                }
+                for index, item in enumerate(cls._as_record(entry) for entry in cls._as_array(widget.get("items")))
+                if item
+            ]
+
+        if widget_type == "comparison_table":
+            columns = []
+            for index, column in enumerate(cls._as_array(widget.get("columns"))):
+                record = cls._as_record(column)
+                columns.append(
+                    {
+                        "key": cls._as_string(record.get("key")) or str(column) or f"col_{index}",
+                        "label": cls._as_string(record.get("label")) or cls._as_string(record.get("key")) or str(column) or f"Column {index + 1}",
+                    }
+                )
+            rows = []
+            for row in (cls._as_record(entry) for entry in cls._as_array(widget.get("rows"))):
+                if not row:
+                    continue
+                output = {**base, "row_type": "table_row"}
+                for column in columns:
+                    output[column["label"]] = row.get(column["key"])
+                rows.append(output)
+            return rows
+
+        if widget_type == "timeline":
+            return [
+                {
+                    **base,
+                    "row_type": "timeline_event",
+                    "title": cls._as_string(item.get("title")) or cls._as_string(item.get("event_name")) or f"Event {index + 1}",
+                    "timestamp": cls._as_string(item.get("timestamp")) or cls._as_string(item.get("occurred_at")) or None,
+                    "severity": cls._as_string(item.get("severity")) or None,
+                    "detail": cls._as_string(item.get("detail")) or cls._as_string(item.get("summary")) or None,
+                }
+                for index, item in enumerate(
+                    cls._as_record(entry) for entry in cls._as_array(widget.get("events") or widget.get("items"))
+                )
+                if item
+            ]
+
+        if widget_type == "progress_tracker":
+            return [
+                {
+                    **base,
+                    "row_type": "progress_step",
+                    "label": cls._as_string(item.get("label")) or f"Step {index + 1}",
+                    "status": cls._as_string(item.get("status")) or None,
+                    "detail": cls._as_string(item.get("detail")) or None,
+                }
+                for index, item in enumerate(cls._as_record(entry) for entry in cls._as_array(widget.get("steps")))
+                if item
+            ]
+
+        if widget_type == "entity_preview":
+            entity = cls._as_record(widget.get("entity"))
+            return [
+                {
+                    **base,
+                    "row_type": "entity_preview",
+                    "title": cls._as_string(entity.get("title")) or cls._as_string(entity.get("name")) or None,
+                    "subtitle": cls._as_string(entity.get("subtitle")) or None,
+                    "kind": cls._as_string(entity.get("kind")) or None,
+                    "image_url": cls._as_string(entity.get("image_url")) or None,
+                }
+            ]
+
+        if widget_type == "action_form":
+            return [
+                {
+                    **base,
+                    "row_type": "action_field",
+                    "label": cls._as_string(item.get("label")) or cls._as_string(item.get("name")) or f"Field {index + 1}",
+                    "field_name": cls._as_string(item.get("name")) or None,
+                    "field_type": cls._as_string(item.get("type")) or None,
+                    "required": item.get("required"),
+                    "placeholder": cls._as_string(item.get("placeholder")) or None,
+                }
+                for index, item in enumerate(cls._as_record(entry) for entry in cls._as_array(widget.get("fields")))
+                if item
+            ]
+
+        if widget_type == "confirmation_card":
+            return [
+                {
+                    **base,
+                    "row_type": "confirmation",
+                    "summary": cls._as_string(widget.get("summary")) or None,
+                    "risk_level": cls._as_string(widget.get("risk_level")) or None,
+                    "action": cls._as_string(widget.get("action")) or None,
+                }
+            ]
+
+        return [{**base, "row_type": "raw_widget", "raw_json": str(widget)}]
+
+    @classmethod
+    def _render_insight_report_body_html(cls, payload):
+        payload = cls._as_record(payload)
+        summary = cls._as_string(payload.get("summary")).strip()
+        explanation = cls._as_string(payload.get("explanation")).strip()
+        insights = [cls._as_record(item) for item in cls._as_array(payload.get("insights")) if cls._as_record(item)]
+        widgets = [cls._as_record(item) for item in cls._as_array(payload.get("widgets")) if cls._as_record(item)]
+        actions = [cls._as_record(item) for item in cls._as_array(payload.get("suggested_actions")) if cls._as_record(item)]
+        warnings = [cls._as_string(item).strip() for item in cls._as_array(payload.get("warnings")) if cls._as_string(item).strip()]
+        permissions = [cls._as_string(item).strip() for item in cls._as_array(payload.get("permissions_checked")) if cls._as_string(item).strip()]
+        data_sources = [cls._as_record(item) for item in cls._as_array(payload.get("data_sources")) if cls._as_record(item)]
+
+        hero_html = ""
+        if summary or explanation or insights:
+            hero_html = f"""
+            <section class="hero">
+              {'<h2>' + escape(summary) + '</h2>' if summary else ''}
+              {'<p>' + escape(explanation) + '</p>' if explanation else ''}
+              {
+                '<div class="insight-grid">' + ''.join(
+                    f'''
+                    <article class="mini-card">
+                      <h4>{escape(cls._as_string(insight.get("title")) or f"Insight {index + 1}")}</h4>
+                      <p>{escape(cls._as_string(insight.get("detail")) or cls._as_string(insight.get("summary")) or cls._as_string(insight.get("description")))}</p>
+                    </article>
+                    '''
+                    for index, insight in enumerate(insights)
+                ) + '</div>'
+                if insights else ''
+              }
+            </section>
+            """
+
+        widgets_html = ""
+        for widget in widgets:
+            rows = cls._widget_rows(widget)
+            widget_type = cls._as_string(widget.get("type")) or "widget"
+            title = cls._as_string(widget.get("title")) or widget_type.replace("_", " ").title()
+            subtitle = cls._as_string(widget.get("subtitle"))
+            columns = []
+            for row in rows:
+                for key in row.keys():
+                    if key not in {"widget_type", "widget_title", "widget_subtitle"} and key not in columns:
+                        columns.append(key)
+            widgets_html += f"""
+            <section class="card">
+              <div class="section-head">
+                <div>
+                  <h3>{escape(title)}</h3>
+                  {'<p class="muted">' + escape(subtitle) + '</p>' if subtitle else ''}
+                </div>
+                <span class="type-pill">{escape(widget_type)}</span>
+              </div>
+              {cls._render_table(columns, rows)}
+            </section>
+            """
+
+        actions_html = ""
+        if actions:
+            actions_html = """
+            <section class="card">
+              <h3>Suggested actions</h3>
+              <ul class="list">
+                %s
+              </ul>
+            </section>
+            """ % "".join(
+                f"<li><strong>{escape(cls._as_string(action.get('label')) or cls._as_string(action.get('action')) or f'Action {index + 1}')}</strong>{': ' + escape(cls._as_string(action.get('prompt'))) if cls._as_string(action.get('prompt')) else ''}</li>"
+                for index, action in enumerate(actions)
+            )
+
+        data_sources_html = ""
+        if data_sources:
+            rows = [
+                {
+                    "service": cls._as_string(item.get("service")) or None,
+                    "endpoint_or_topic": cls._as_string(item.get("endpoint_or_topic")) or None,
+                    "freshness": cls._as_string(item.get("freshness")) or None,
+                }
+                for item in data_sources
+            ]
+            data_sources_html = f"""
+            <section class="card">
+              <h3>Data sources</h3>
+              {cls._render_table(["service", "endpoint_or_topic", "freshness"], rows)}
+            </section>
+            """
+
+        return (
+            hero_html
+            + widgets_html
+            + actions_html
+            + cls._render_badges("Warnings", warnings, "warning")
+            + cls._render_badges("Permissions checked", permissions, "neutral")
+            + data_sources_html
+        )
+
+    @classmethod
+    def _render_chat_report_body_html(cls, messages):
+        html = ""
+        for message in cls._as_array(messages):
+            record = cls._as_record(message)
+            role = cls._as_string(record.get("role")) or "assistant"
+            timestamp = cls._as_string(record.get("timestamp"))
+            structured_payload = cls._as_record(record.get("structuredPayload"))
+            body_html = ""
+            if cls._as_string(structured_payload.get("kind")) == "insight_response":
+                body_html = cls._render_insight_report_body_html(structured_payload)
+            else:
+                body_html = f'<div class="message-body text-block">{escape(cls._as_string(record.get("content"))).replace(chr(10), "<br />")}</div>'
+            html += f"""
+            <section class="message {'user' if role == 'user' else 'assistant'}">
+              <div class="message-meta">
+                <span class="author">{'You' if role == 'user' else 'Intera AI'}</span>
+                {'<span class="timestamp">' + escape(timestamp) + '</span>' if timestamp else ''}
+              </div>
+              {body_html}
+            </section>
+            """
+        return html
+
+    @classmethod
+    def generate_ai_insight_report_pdf(cls, payload, title="AI Insight Report"):
+        try:
+            HTML, CSS = _load_weasyprint()
+            context = {
+                "title": title,
+                "generated_at": timezone.now(),
+                "body_html": cls._render_insight_report_body_html(payload),
+                "mode": "insight",
+            }
+            html_string = render_to_string("pdf/ai_report.html", context)
+            pdf_file = BytesIO()
+            HTML(string=html_string, base_url=settings.STATIC_ROOT).write_pdf(
+                pdf_file,
+                stylesheets=[CSS(string='@page { size: A4; margin: 1.2cm; }')],
+            )
+            pdf_file.seek(0)
+            return pdf_file
+        except Exception as e:
+            logger.error("Failed to generate AI insight report PDF: %s", str(e))
+            raise
+
+    @classmethod
+    def generate_ai_chat_report_pdf(cls, messages, title="AI Chat Export"):
+        try:
+            HTML, CSS = _load_weasyprint()
+            context = {
+                "title": title,
+                "generated_at": timezone.now(),
+                "body_html": cls._render_chat_report_body_html(messages),
+                "mode": "chat",
+            }
+            html_string = render_to_string("pdf/ai_report.html", context)
+            pdf_file = BytesIO()
+            HTML(string=html_string, base_url=settings.STATIC_ROOT).write_pdf(
+                pdf_file,
+                stylesheets=[CSS(string='@page { size: A4; margin: 1.2cm; }')],
+            )
+            pdf_file.seek(0)
+            return pdf_file
+        except Exception as e:
+            logger.error("Failed to generate AI chat report PDF: %s", str(e))
+            raise
     
     @classmethod
     def generate_purchase_order_pdf(cls, purchase_order):

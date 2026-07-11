@@ -1,13 +1,18 @@
 from datetime import timedelta
 from decimal import Decimal
+import os
+import secrets
 import uuid
 
 from django.db.models import Q
+from django.http import HttpResponse
 from django.utils import timezone
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import filters, status, viewsets
 from rest_framework.decorators import action
+from rest_framework.exceptions import PermissionDenied
 from rest_framework.response import Response
+from rest_framework.views import APIView
 
 from mainapps.inventory.models import InventoryCategory, InventoryItem
 from mainapps.inventory.serializers import StockAnalyticsSerializer
@@ -44,6 +49,7 @@ from subapps.kafka.producers.inventory_admin import (
     serialize_stock_reservation,
 )
 from subapps.permissions.constants import UNIFIED_PERMISSION_DICT
+from subapps.permissions.constants import CombinedPermissions
 from subapps.permissions.microservice_permissions import BaseCachePermissionViewset, CachingMixin, PermissionRequiredMixin
 from subapps.services.inventory_read_model import (
     get_inventory_item_summary_map,
@@ -56,6 +62,7 @@ from subapps.services.location_scope import (
     resolve_structural_locations,
 )
 from subapps.services.stock_domain import StockDomainError, StockDomainService
+from subapps.services.pdf.pdf_service import PDFService, PDFServiceUnavailableError
 from subapps.utils.request_context import get_request_profile_id, get_request_user_id, scope_queryset_by_identity
 
 
@@ -99,6 +106,55 @@ def _get_scope_mode(request):
     if value == 'all':
         return 'all_locations'
     return value
+
+
+def _require_subscription_service_key(request):
+    expected = os.getenv("SUBSCRIPTION_SERVICE_KEY", "")
+    supplied = request.headers.get("X-Intera-Service-Key", "")
+    if not expected or not supplied or not secrets.compare_digest(expected, supplied):
+        raise PermissionDenied("Invalid subscription service key.")
+
+
+class InternalSubscriptionUsageView(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def get(self, request):
+        _require_subscription_service_key(request)
+        profile_id = request.query_params.get("profile_id")
+        if not profile_id:
+            return Response({"detail": "profile_id is required."}, status=status.HTTP_400_BAD_REQUEST)
+        return Response({"structural-locations": StockLocation.objects.filter(profile_id=profile_id, structural=True).count()})
+
+
+class AIReportExportView(PermissionRequiredMixin, APIView):
+    required_permission = CombinedPermissions.VIEW_DASHBOARD_REPORTS
+
+    def post(self, request, report_type: str):
+        title = (request.data.get("title") or "AI Report").strip() or "AI Report"
+        try:
+            if report_type == "insight-pdf":
+                payload = request.data.get("payload")
+                if not isinstance(payload, dict):
+                    return Response({"detail": "payload must be an object."}, status=status.HTTP_400_BAD_REQUEST)
+                pdf_file = PDFService.generate_ai_insight_report_pdf(payload, title=title)
+                filename = "ai-insight-report.pdf"
+            elif report_type == "chat-pdf":
+                messages = request.data.get("messages")
+                if not isinstance(messages, list):
+                    return Response({"detail": "messages must be a list."}, status=status.HTTP_400_BAD_REQUEST)
+                pdf_file = PDFService.generate_ai_chat_report_pdf(messages, title=title)
+                filename = "ai-chat-export.pdf"
+            else:
+                return Response({"detail": "Unsupported report type."}, status=status.HTTP_404_NOT_FOUND)
+        except PDFServiceUnavailableError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        except Exception as exc:
+            return Response({"detail": f"Unable to generate report PDF: {exc}"}, status=status.HTTP_400_BAD_REQUEST)
+
+        response = HttpResponse(pdf_file.getvalue(), content_type="application/pdf")
+        response["Content-Disposition"] = f'attachment; filename="{filename}"'
+        return response
 
 
 def filter_inventory_items_for_location(queryset, location_id, *, profile_id=None):

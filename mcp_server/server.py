@@ -5,10 +5,11 @@ import os
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 from urllib.parse import urlencode
+from uuid import UUID
 
 from pydantic import BaseModel
 
@@ -22,7 +23,7 @@ from asgiref.sync import sync_to_async
 if not apps.ready:
     django.setup()
 
-from django.db.models import Q, QuerySet
+from django.db.models import Count, Q, QuerySet, Sum
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from rest_framework.test import APIRequestFactory
@@ -35,6 +36,7 @@ from starlette.routing import Mount, Route
 import uvicorn
 
 from mainapps.inventory.models import InventoryCategory, InventoryItem
+from mainapps.orders.models import PurchaseOrder, PurchaseOrderStatus
 from mainapps.inventory.views import (
     InventoryCategoryViewSet,
     InventoryItemViewSet as InventoryCatalogItemViewSet,
@@ -104,6 +106,10 @@ def _decimal_to_float(value: Decimal | None) -> float | None:
 def _to_json_compatible(value: Any) -> Any:
     if isinstance(value, Decimal):
         return float(value)
+    if isinstance(value, UUID):
+        return str(value)
+    if isinstance(value, timedelta):
+        return str(value)
     if isinstance(value, datetime):
         return value.isoformat()
     if isinstance(value, date):
@@ -113,6 +119,22 @@ def _to_json_compatible(value: Any) -> Any:
     if isinstance(value, list):
         return [_to_json_compatible(item) for item in value]
     return value
+
+
+def _optional_iso(value: Any) -> str | None:
+    if value in (None, ""):
+        return None
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return str(value)
+
+
+def _purchase_order_target_date(order: Any) -> str | None:
+    for field_name in ("target_date", "expected_delivery_date", "delivery_date", "due_date"):
+        value = getattr(order, field_name, None)
+        if value:
+            return _optional_iso(value)
+    return None
 
 
 def _payload_to_data(value: BaseModel | dict[str, Any] | None) -> dict[str, Any] | None:
@@ -1344,46 +1366,245 @@ def _get_inventory_alerts_sync(
 ) -> dict[str, Any]:
     close_old_connections()
     try:
-        inventories = list(
-            _inventory_queryset(principal=principal).exclude(status__in=["archived", "discontinued"])
+        inventory_queryset = (
+            _inventory_queryset(principal=principal)
+            .exclude(status__in=["archived", "discontinued"])
+            .select_related("inventory_category")
         )
-        scoped_locations = _resolve_structural_scope_locations_sync(
+        inventory_rows = list(
+            inventory_queryset.values(
+                "id",
+                "minimum_stock_level",
+                "reorder_point",
+            )
+        )
+        inventory_ids = [row["id"] for row in inventory_rows if row.get("id") is not None]
+        scoped_location_ids = _resolve_scoped_leaf_location_ids_sync(
             principal=principal,
             structural_location_id=structural_location_id,
         )
-        summary_map = get_inventory_item_summary_map(
-            inventories,
-            stock_locations=scoped_locations,
-            expiring_days=expiring_days,
+        balance_queryset = _stock_balance_queryset(principal=principal).filter(
+            inventory_item_id__in=inventory_ids
         )
-        low_stock = []
-        needs_reorder = []
-        out_of_stock = []
+        if scoped_location_ids:
+            balance_queryset = balance_queryset.filter(stock_location_id__in=scoped_location_ids)
+        aggregate_rows = balance_queryset.values("inventory_item_id").annotate(
+            quantity=Sum("quantity_on_hand"),
+            quantity_reserved=Sum("quantity_reserved"),
+            quantity_available=Sum("quantity_available"),
+            location_count=Count("stock_location_id", distinct=True),
+        )
+        summary_map = {
+            row["inventory_item_id"]: {
+                "quantity": row.get("quantity") or Decimal("0"),
+                "quantity_reserved": row.get("quantity_reserved") or Decimal("0"),
+                "quantity_available": row.get("quantity_available") or Decimal("0"),
+                "location_count": int(row.get("location_count") or 0),
+            }
+            for row in aggregate_rows
+            if row.get("inventory_item_id") is not None
+        }
+        low_stock_ids: list[Any] = []
+        needs_reorder_ids: list[Any] = []
+        out_of_stock_ids: list[Any] = []
         expiring = []
 
-        for inventory in inventories:
-            summary = summary_map.get(inventory.id, {})
-            current_stock = Decimal(summary.get("quantity", Decimal("0")))
-            minimum_stock_level = Decimal(str(inventory.minimum_stock_level or 0))
-            reorder_point = Decimal(str(inventory.reorder_point or 0))
-            payload = _inventory_item_payload(inventory, summary=summary)
+        for inventory_row in inventory_rows:
+            inventory_id = inventory_row.get("id")
+            if inventory_id is None:
+                continue
+            summary = summary_map.get(
+                inventory_id,
+                {
+                    "quantity": Decimal("0"),
+                    "quantity_reserved": Decimal("0"),
+                    "quantity_available": Decimal("0"),
+                    "location_count": 0,
+                },
+            )
+            current_stock = Decimal(summary.get("quantity") or Decimal("0"))
+            minimum_stock_level = Decimal(str(inventory_row.get("minimum_stock_level") or 0))
+            reorder_point = Decimal(str(inventory_row.get("reorder_point") or 0))
             if current_stock <= 0:
-                out_of_stock.append(payload)
+                out_of_stock_ids.append(inventory_id)
             elif minimum_stock_level > 0 and current_stock <= minimum_stock_level:
-                low_stock.append(payload)
+                low_stock_ids.append(inventory_id)
             elif reorder_point > 0 and current_stock <= reorder_point:
-                needs_reorder.append(payload)
-            days_to_expiry = summary.get("days_to_expiry")
-            if days_to_expiry is not None and 0 <= int(days_to_expiry) <= expiring_days:
-                expiring.append(payload)
+                needs_reorder_ids.append(inventory_id)
+            # The alert-first MCP path intentionally skips expiry-lot traversal to keep
+            # stock-risk queries responsive; expiry-specific flows use movement/detail tools.
+
+        selected_ids = {
+            *out_of_stock_ids[:limit],
+            *low_stock_ids[:limit],
+            *needs_reorder_ids[:limit],
+        }
+        inventory_map = {
+            item.id: item
+            for item in inventory_queryset.filter(id__in=selected_ids)
+        }
+
+        def _payload_for(item_id: Any) -> dict[str, Any] | None:
+            item = inventory_map.get(item_id)
+            if item is None:
+                return None
+            return _inventory_item_payload(
+                item,
+                summary=summary_map.get(
+                    item_id,
+                    {
+                        "quantity": Decimal("0"),
+                        "quantity_reserved": Decimal("0"),
+                        "quantity_available": Decimal("0"),
+                        "location_count": 0,
+                    },
+                ),
+            )
+
+        out_of_stock = [payload for payload in (_payload_for(item_id) for item_id in out_of_stock_ids[:limit]) if payload]
+        low_stock = [payload for payload in (_payload_for(item_id) for item_id in low_stock_ids[:limit]) if payload]
+        needs_reorder = [payload for payload in (_payload_for(item_id) for item_id in needs_reorder_ids[:limit]) if payload]
 
         return {
             "profile_id": principal.profile_id,
             "expiring_days": expiring_days,
-            "low_stock": low_stock[:limit],
-            "needs_reorder": needs_reorder[:limit],
-            "out_of_stock": out_of_stock[:limit],
+            "low_stock": low_stock,
+            "needs_reorder": needs_reorder,
+            "out_of_stock": out_of_stock,
             "expiring_soon": expiring[:limit],
+        }
+    finally:
+        close_old_connections()
+
+
+def _get_stock_risk_sync(
+    *,
+    principal: InventoryMcpPrincipal,
+    limit: int,
+    expiring_days: int,
+    structural_location_id: str | None = None,
+) -> dict[str, Any]:
+    alerts = _get_inventory_alerts_sync(
+        principal=principal,
+        limit=limit,
+        expiring_days=expiring_days,
+        structural_location_id=structural_location_id,
+    )
+    return {
+        "profile_id": principal.profile_id,
+        "summary": {
+            "low_stock_count": len(alerts["low_stock"]),
+            "reorder_count": len(alerts["needs_reorder"]),
+            "out_of_stock_count": len(alerts["out_of_stock"]),
+            "expiring_count": len(alerts["expiring_soon"]),
+        },
+        "risk_items": {
+            "out_of_stock": alerts["out_of_stock"],
+            "needs_reorder": alerts["needs_reorder"],
+            "low_stock": alerts["low_stock"],
+            "expiring_soon": alerts["expiring_soon"],
+        },
+    }
+
+
+def _get_reorder_candidates_sync(
+    *,
+    principal: InventoryMcpPrincipal,
+    limit: int,
+    structural_location_id: str | None = None,
+) -> dict[str, Any]:
+    alerts = _get_inventory_alerts_sync(
+        principal=principal,
+        limit=limit,
+        expiring_days=30,
+        structural_location_id=structural_location_id,
+    )
+    candidates = [*alerts["out_of_stock"], *alerts["needs_reorder"]][:limit]
+    return {
+        "profile_id": principal.profile_id,
+        "count": len(candidates),
+        "results": candidates,
+    }
+
+
+def _get_po_pipeline_sync(*, principal: InventoryMcpPrincipal, limit: int) -> dict[str, Any]:
+    close_old_connections()
+    try:
+        queryset = scope_queryset_by_identity(
+            PurchaseOrder.objects.select_related("supplier"),
+            canonical_field="profile_id",
+            legacy_field="profile",
+            value=principal.profile_id,
+        )
+        orders = list(queryset.order_by("-created_at")[: max(1, min(limit, 50))])
+        status_counts = {
+            row["status"]: int(row["count"])
+            for row in queryset.values("status").annotate(count=Count("id")).order_by()
+        }
+        return {
+            "profile_id": principal.profile_id,
+            "status_counts": status_counts,
+            "results": [
+                {
+                    "id": str(order.id),
+                    "reference": order.reference,
+                    "status": order.status,
+                    "supplier_name": getattr(order.supplier, "name", ""),
+                    "created_at": order.created_at.isoformat() if order.created_at else None,
+                    "target_date": _purchase_order_target_date(order),
+                }
+                for order in orders
+            ],
+        }
+    finally:
+        close_old_connections()
+
+
+def _get_receiving_exceptions_sync(*, principal: InventoryMcpPrincipal, limit: int) -> dict[str, Any]:
+    close_old_connections()
+    try:
+        queryset = (
+            scope_queryset_by_identity(
+                PurchaseOrder.objects.prefetch_related("line_items"),
+                canonical_field="profile_id",
+                legacy_field="profile",
+                value=principal.profile_id,
+            )
+            .filter(status__in=[
+                PurchaseOrderStatus.APPROVED,
+                PurchaseOrderStatus.ISSUED,
+                PurchaseOrderStatus.OVERDUE,
+                PurchaseOrderStatus.RECEIVED,
+            ])
+            .order_by("-updated_at")
+        )
+        results: list[dict[str, Any]] = []
+        for order in queryset:
+            open_lines = 0
+            remaining_quantity = Decimal("0")
+            for line_item in order.line_items.all():
+                if line_item.remaining_quantity > 0:
+                    open_lines += 1
+                    remaining_quantity += Decimal(str(line_item.remaining_quantity))
+            if open_lines <= 0 and order.status != PurchaseOrderStatus.OVERDUE:
+                continue
+            results.append(
+                {
+                    "id": str(order.id),
+                    "reference": order.reference,
+                    "status": order.status,
+                    "supplier_name": getattr(order.supplier, "name", ""),
+                    "target_date": _purchase_order_target_date(order),
+                    "open_line_count": open_lines,
+                    "remaining_quantity": _decimal_to_float(remaining_quantity),
+                }
+            )
+            if len(results) >= max(1, min(limit, 50)):
+                break
+        return {
+            "profile_id": principal.profile_id,
+            "count": len(results),
+            "results": results,
         }
     finally:
         close_old_connections()
@@ -1709,6 +1930,8 @@ def _search_stock_movements_sync(
     movement_type: str | None,
     inventory_item_id: str | None,
     reference_id: str | None,
+    date_from: str | None,
+    date_to: str | None,
 ) -> dict[str, Any]:
     queryset = _stock_movement_queryset(principal=principal)
     if movement_type:
@@ -1717,6 +1940,10 @@ def _search_stock_movements_sync(
         queryset = queryset.filter(inventory_item_id=inventory_item_id)
     if reference_id:
         queryset = queryset.filter(reference_id=reference_id)
+    if date_from:
+        queryset = queryset.filter(occurred_at__date__gte=str(date_from).strip())
+    if date_to:
+        queryset = queryset.filter(occurred_at__date__lte=str(date_to).strip())
 
     search_term = str(query or "").strip()
     if search_term:
@@ -1853,6 +2080,8 @@ def _search_purchase_orders_sync(
     query: str | None,
     status: str | None,
     limit: int,
+    date_from: str | None,
+    date_to: str | None,
 ) -> dict[str, Any]:
     from mainapps.orders.views import PurchaseOrderViewSet
 
@@ -1867,6 +2096,8 @@ def _search_purchase_orders_sync(
             "search": str(query or "").strip(),
             "status": "" if status_filter else (status or ""),
             "status_filter": status_filter,
+            "date_from": str(date_from or "").strip(),
+            "date_to": str(date_to or "").strip(),
             "page_size": limit,
         },
     )
@@ -1901,7 +2132,12 @@ def _get_purchase_order_details_sync(*, principal: InventoryMcpPrincipal, purcha
     }
 
 
-def _get_purchase_order_analytics_sync(*, principal: InventoryMcpPrincipal) -> dict[str, Any]:
+def _get_purchase_order_analytics_sync(
+    *,
+    principal: InventoryMcpPrincipal,
+    date_from: str | None = None,
+    date_to: str | None = None,
+) -> dict[str, Any]:
     from mainapps.orders.views import PurchaseOrderViewSet
 
     payload = _invoke_view_action_sync(
@@ -1909,9 +2145,16 @@ def _get_purchase_order_analytics_sync(*, principal: InventoryMcpPrincipal) -> d
         viewset_cls=PurchaseOrderViewSet,
         action="analytics",
         method="get",
+        query_params={
+            "date_from": str(date_from or "").strip(),
+            "date_to": str(date_to or "").strip(),
+        },
     )
+    payload = _to_json_compatible(payload)
     return {
         "profile_id": principal.profile_id,
+        "date_from": str(date_from or "").strip() or None,
+        "date_to": str(date_to or "").strip() or None,
         "analytics": payload,
     }
 
@@ -2599,6 +2842,40 @@ async def get_inventory_alerts(
 
 
 @mcp.tool(
+    name="get_stock_risk",
+    description="Return stock-risk counts and the highest-risk inventory items for the active workspace.",
+)
+async def get_stock_risk(
+    limit: int = 10,
+    expiring_days: int = 30,
+    structural_location_id: str | None = None,
+) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    return await sync_to_async(_get_stock_risk_sync, thread_sensitive=True)(
+        principal=principal,
+        limit=max(1, min(int(limit), 25)),
+        expiring_days=max(1, min(int(expiring_days), 365)),
+        structural_location_id=str(structural_location_id).strip() if structural_location_id else None,
+    )
+
+
+@mcp.tool(
+    name="get_reorder_candidates",
+    description="Return the out-of-stock and needs-reorder items that need replenishment first.",
+)
+async def get_reorder_candidates(
+    limit: int = 10,
+    structural_location_id: str | None = None,
+) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    return await sync_to_async(_get_reorder_candidates_sync, thread_sensitive=True)(
+        principal=principal,
+        limit=max(1, min(int(limit), 25)),
+        structural_location_id=str(structural_location_id).strip() if structural_location_id else None,
+    )
+
+
+@mcp.tool(
     name="search_stock_locations",
     description="Search stock locations, including summary stock posture for each location.",
 )
@@ -2769,6 +3046,8 @@ async def search_stock_movements(
     movement_type: str | None = None,
     inventory_item_id: str | None = None,
     reference_id: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
 ) -> stock_payloads.StockMovementCollectionResponsePayload:
     principal = get_current_principal(required=True)
     limit_value = max(1, min(int(limit), 25))
@@ -2779,6 +3058,32 @@ async def search_stock_movements(
         movement_type=movement_type,
         inventory_item_id=str(inventory_item_id).strip() if inventory_item_id else None,
         reference_id=str(reference_id).strip() if reference_id else None,
+        date_from=str(date_from).strip() if date_from else None,
+        date_to=str(date_to).strip() if date_to else None,
+    )
+
+
+@mcp.tool(
+    name="get_stock_movements",
+    description="Return recent stock movements using the same filters as stock-movement search.",
+)
+async def get_stock_movements(
+    query: str | None = None,
+    limit: int = 10,
+    movement_type: str | None = None,
+    inventory_item_id: str | None = None,
+    reference_id: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+) -> stock_payloads.StockMovementCollectionResponsePayload:
+    return await search_stock_movements(
+        query=query,
+        limit=limit,
+        movement_type=movement_type,
+        inventory_item_id=inventory_item_id,
+        reference_id=reference_id,
+        date_from=date_from,
+        date_to=date_to,
     )
 
 
@@ -2803,6 +3108,8 @@ async def get_stock_analytics(
 async def search_purchase_orders(
     query: str | None = None,
     status: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
     limit: int = 10,
 ) -> orders_payloads.PurchaseOrderSearchResponsePayload:
     principal = get_current_principal(required=True)
@@ -2812,6 +3119,8 @@ async def search_purchase_orders(
         query=query,
         status=status,
         limit=limit_value,
+        date_from=str(date_from).strip() if date_from else None,
+        date_to=str(date_to).strip() if date_to else None,
     )
 
 
@@ -2836,10 +3145,43 @@ async def get_purchase_order_details(
     name="get_purchase_order_analytics",
     description="Get purchase-order analytics for the authenticated workspace.",
 )
-async def get_purchase_order_analytics() -> orders_payloads.PurchaseOrderAnalyticsResponsePayload:
+async def get_purchase_order_analytics(
+    date_from: str | None = None,
+    date_to: str | None = None,
+) -> orders_payloads.PurchaseOrderAnalyticsResponsePayload:
     principal = get_current_principal(required=True)
     return await sync_to_async(_get_purchase_order_analytics_sync, thread_sensitive=True)(
         principal=principal,
+        date_from=str(date_from).strip() if date_from else None,
+        date_to=str(date_to).strip() if date_to else None,
+    )
+
+
+@mcp.tool(
+    name="get_po_pipeline",
+    description="Return purchase-order pipeline counts and the most recent purchase orders.",
+)
+async def get_po_pipeline(
+    limit: int = 20,
+) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    return await sync_to_async(_get_po_pipeline_sync, thread_sensitive=True)(
+        principal=principal,
+        limit=max(1, min(int(limit), 50)),
+    )
+
+
+@mcp.tool(
+    name="get_receiving_exceptions",
+    description="Return open receiving exceptions across approved, issued, overdue, or partially received purchase orders.",
+)
+async def get_receiving_exceptions(
+    limit: int = 20,
+) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    return await sync_to_async(_get_receiving_exceptions_sync, thread_sensitive=True)(
+        principal=principal,
+        limit=max(1, min(int(limit), 50)),
     )
 
 
