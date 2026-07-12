@@ -23,4 +23,4 @@ COPY . /app/
 EXPOSE 7002
 
 
-CMD ["sh", "-c", "uv run manage.py migrate && uv run manage.py runserver 0.0.0.0:7002"]
+CMD ["sh", "-c", "python manage.py migrate && python manage.py runserver 0.0.0.0:7002"]
