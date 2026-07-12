@@ -1,4 +1,5 @@
 from django.contrib import admin
+from django.http import JsonResponse
 from django.urls import path,include
 from rest_framework import permissions
 from drf_yasg.views import get_schema_view
@@ -18,8 +19,13 @@ schema_view = get_schema_view(
    permission_classes=(permissions.AllowAny,),
 )
 
+
+def healthz(_request):
+    return JsonResponse({"status": "ok"})
+
 urlpatterns = [
     path('admin/', admin.site.urls),
+    path('healthz/', healthz, name='healthz'),
     # djoser urls
     # path('auth-api/', include('djoser.urls')),
     # path('', include('djoser.urls.jwt')),
