@@ -92,7 +92,17 @@ jobs:
         run: |
           aws ecr describe-repositories --repository-names "$ECR_REPOSITORY" >/dev/null
 
+      - name: Check Existing Image Tag
+        id: image_check
+        run: |
+          if aws ecr describe-images --repository-name "$ECR_REPOSITORY" --image-ids imageTag="$GITHUB_SHA" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build And Push Image
+        if: steps.image_check.outputs.exists != 'true'
         env:
           IMAGE_URI: ${{ steps.build_meta.outputs.image_uri }}
           DOCKERFILE: ${{ steps.build_meta.outputs.dockerfile }}
@@ -111,6 +121,10 @@ jobs:
           mapfile -t BUILD_ARGS < /tmp/build-args.txt
           docker build -f "$DOCKERFILE" -t "$IMAGE_URI" "${BUILD_ARGS[@]}" "$BUILD_CONTEXT"
           docker push "$IMAGE_URI"
+
+      - name: Reuse Existing Image
+        if: steps.image_check.outputs.exists == 'true'
+        run: echo "Using existing immutable image tag for ${GITHUB_SHA}"
 
       - name: Register Task Definitions And Deploy
         env:
@@ -224,9 +238,17 @@ jobs:
                   }
                   for container in task.get('containers', [])
               ]
-              failed = [item for item in container_status if item['exitCode'] not in (0, None)]
-              if failed:
+              migration_status = next((item for item in container_status if item['name'] == migration_container_name), None)
+              if migration_status is None:
+                  raise SystemExit(f'Migration container not found in task status: {json.dumps(container_status)}')
+              if migration_status['exitCode'] != 0:
                   raise SystemExit(f'Migration task failed: {json.dumps(container_status)}')
+              unexpected_failures = [
+                  item for item in container_status
+                  if item['name'] != migration_container_name and item['exitCode'] not in (0, None, 137)
+              ]
+              if unexpected_failures:
+                  raise SystemExit(f'Migration sidecar task failed unexpectedly: {json.dumps(container_status)}')
               print(f'Migration task succeeded for target {migration_target}: {task_arn}')
           else:
               print('No migration command configured; skipping one-off migration task.')
