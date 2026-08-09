@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="color-scheme" content="light dark">
+    <meta name="supported-color-schemes" content="light dark">
+    <style>
+        body { margin: 0; padding: 0; background: #f5f9ff; color: #101727; font-family: Arial, Helvetica, sans-serif; }
+        .wrap { width: 100%; padding: 36px 16px; background: linear-gradient(180deg, #f5f9ff 0%, #edf5ff 100%); }
+        .card { max-width: 720px; margin: 0 auto; overflow: hidden; background: #ffffff; border: 1px solid #d9e6ff; border-radius: 26px; box-shadow: 0 18px 48px rgba(16, 23, 39, 0.10); }
+        .header { padding: 48px 48px 52px; background: #101727; color: #ffffff; }
+        .brand-logo { display: block; width: 176px; max-width: 176px; height: auto; }
+        .header .brand-logo { margin-bottom: 58px; }
+        .brand-text { display: inline-block; min-height: 30px; padding: 8px 12px; border: 1px solid rgba(255,255,255,0.18); border-radius: 999px; color: #ffffff; font-size: 12px; font-weight: 700; letter-spacing: 0.18em; text-transform: uppercase; }
+        .eyebrow { color: #98fcc2; font-size: 13px; font-weight: 800; letter-spacing: 0.18em; text-transform: uppercase; }
+        h1 { margin: 14px 0 0; color: #ffffff; font-size: 36px; line-height: 1.12; letter-spacing: -0.03em; }
+        .content { padding: 42px 48px 28px; }
+        p { margin: 0 0 16px; color: #42526b; font-size: 16px; line-height: 1.6; }
+        a { color: #3c83f7; }
+        .cta { display: inline-block; margin: 8px 0 18px; padding: 14px 24px; border-radius: 14px; background: #3c83f7; color: #ffffff !important; text-decoration: none; font-weight: 700; }
+        .summary { margin: 22px 0; padding: 18px 20px; border: 1px solid #d9e6ff; border-radius: 18px; background: #f5f9ff; }
+        .summary-label { display: block; margin-bottom: 6px; color: #6480b3; font-size: 12px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; }
+        .summary-value { margin-bottom: 14px; color: #172033; font-size: 15px; font-weight: 600; }
+        .data-table { width: 100%; margin: 18px 0 22px; border-collapse: collapse; }
+        .data-table th, .data-table td { padding: 10px 12px; border-bottom: 1px solid #e8eefb; color: #42526b; text-align: left; font-size: 14px; }
+        .data-table th { background: #f5f9ff; color: #6480b3; font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; }
+        .code { display: inline-block; margin: 10px 0 20px; padding: 18px 24px; border-radius: 18px; background: #f5f9ff; border: 1px solid #d9e6ff; color: #101727; font-size: 32px; font-weight: 800; letter-spacing: 0.12em; }
+        .footer { padding: 0 48px 36px; color: #6b7280; font-size: 13px; line-height: 1.6; }
+        .fallback-link { display: block; margin-top: 10px; color: #3c83f7 !important; word-break: break-all; }
+        @media (prefers-color-scheme: dark) {
+            body, .wrap { background: #101727 !important; color: #f8fafc !important; }
+            .card { background: #151f33 !important; border-color: #27364f !important; }
+            .content, .summary { background: #151f33 !important; }
+            p, .data-table td { color: #d1d5db !important; }
+            .summary, .code { border-color: #27364f !important; background: #101727 !important; color: #ffffff !important; }
+            .summary-value { color: #ffffff !important; }
+            .data-table th { background: #101727 !important; color: #98fcc2 !important; }
+        }
+        @media only screen and (max-width: 640px) {
+            .wrap { padding: 16px 10px; }
+            .header, .content { padding-left: 22px; padding-right: 22px; }
+            .header { padding-top: 32px; padding-bottom: 36px; }
+            .header .brand-logo { margin-bottom: 36px; }
+            .brand-logo { width: 148px !important; max-width: 148px !important; }
+            .footer { padding-left: 20px; padding-right: 20px; }
+            h1 { font-size: 28px; }
+        }
+    </style>
+</head>
+<body>
+<div class="wrap">
+    <div class="card">
+        <div class="header">
+            {% include "emails/partials/header.html" %}
+            <div class="eyebrow">{% block eyebrow %}{{ subject }}{% endblock %}</div>
+            <h1>{% block title %}{{ subject }}{% endblock %}</h1>
+        </div>
+        <div class="content">{% block content %}{% endblock %}</div>
+        <div class="footer">{% block footer %}{% include "emails/partials/footer.html" %}{% endblock %}</div>
+    </div>
+</div>
+</body>
+</html>

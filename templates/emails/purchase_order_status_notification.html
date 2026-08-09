@@ -1,57 +1,22 @@
-<!DOCTYPE html>
-<html>
-<head>
-    <style>
-        body {
-            font-family: 'Segoe UI', sans-serif;
-            background-color: #f8f8f8;
-            padding: 20px;
-            color: #333;
-        }
-        .container {
-            background: white;
-            border-radius: 8px;
-            padding: 20px;
-            max-width: 600px;
-            margin: auto;
-            box-shadow: 0 0 10px rgba(0,0,0,0.08);
-        }
-        h2 {
-            color: #2c3e50;
-        }
-        .status {
-            margin: 18px 0;
-            padding: 14px 16px;
-            border-radius: 6px;
-            background: #f6f8fb;
-        }
-        .footer {
-            margin-top: 20px;
-            font-size: 13px;
-            color: #777;
-            text-align: center;
-        }
-    </style>
-</head>
-<body>
-<div class="container">
-    <h2>Purchase Order {{ purchase_order.reference }} Status Update</h2>
-    <p>Hello {{ contact_name }},</p>
-    <p>{{ company_name }} has updated the status of your purchase order.</p>
+{% extends "emails/intera_email_base.html" %}
 
-    <div class="status">
-        <p><strong>Previous status:</strong> {{ status_change.from_status|default:"N/A" }}</p>
-        <p><strong>Current status:</strong> {{ status_change.to_status|default:"N/A" }}</p>
-        {% if purchase_order.delivery_date %}
-        <p><strong>Delivery date:</strong> {{ purchase_order.delivery_date }}</p>
-        {% endif %}
-    </div>
+{% block eyebrow %}Purchase Order Update{% endblock %}
+{% block title %}Purchase Order {{ purchase_order.reference }} Status Update{% endblock %}
 
-    <p>Please contact {{ company_name }} if you need any clarification.</p>
+{% block content %}
+<p>Hello {{ contact_name }},</p>
+<p>{{ company_name }} has updated the status of your purchase order.</p>
 
-    <div class="footer">
-        This is an automated message. Please do not reply.
-    </div>
+<div class="summary">
+    <span class="summary-label">Previous status</span>
+    <div class="summary-value">{{ status_change.from_status|default:"N/A" }}</div>
+    <span class="summary-label">Current status</span>
+    <div class="summary-value">{{ status_change.to_status|default:"N/A" }}</div>
+    {% if purchase_order.delivery_date %}
+    <span class="summary-label">Delivery date</span>
+    <div class="summary-value">{{ purchase_order.delivery_date }}</div>
+    {% endif %}
 </div>
-</body>
-</html>
+
+<p>Please contact {{ company_name }} if you need any clarification.</p>
+{% endblock %}

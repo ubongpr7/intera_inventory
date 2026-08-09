@@ -1,79 +1,37 @@
-<!DOCTYPE html>
-<html>
-<head>
-    <style>
-        body {
-            font-family: 'Segoe UI', sans-serif;
-            background-color: #f8f8f8;
-            padding: 20px;
-            color: #333;
-        }
-        .container {
-            background: white;
-            border-radius: 8px;
-            padding: 20px;
-            max-width: 600px;
-            margin: auto;
-            box-shadow: 0 0 10px rgba(0,0,0,0.08);
-        }
-        h2 {
-            color: #2c3e50;
-        }
-        table {
-            width: 100%;
-            margin-top: 16px;
-            border-collapse: collapse;
-        }
-        th, td {
-            padding: 8px 10px;
-            border-bottom: 1px solid #eaeaea;
-        }
-        th {
-            background-color: #f1f1f1;
-            text-align: left;
-        }
-        .footer {
-            margin-top: 20px;
-            font-size: 13px;
-            color: #777;
-            text-align: center;
-        }
-    </style>
-</head>
-<body>
-<div class="container">
-    <h2>Purchase Order #{{ purchase_order.reference }}</h2>
-    <p>Hello {{ contact_name }},</p>
-    <p>Attached is the purchase order issued by <strong>{{ company_name }}</strong>. Below is a summary:</p>
+{% extends "emails/intera_email_base.html" %}
 
-    <table>
-        <thead>
-            <tr>
-                <th>Item</th>
-                <th>Qty</th>
-                <th>Unit Price</th>
-                <th>Total</th>
-            </tr>
-        </thead>
-        <tbody>
-        {% for item in line_items %}
-            <tr>
-                <td>{{ item.inventory_item }}</td>
-                <td>{{ item.quantity }}</td>
-                <td>{{ item.unit_price }}</td>
-                <td>{{ item.total_price }}</td>
-            </tr>
-        {% endfor %}
-        </tbody>
-    </table>
+{% block eyebrow %}Purchase Order{% endblock %}
+{% block title %}Purchase Order #{{ purchase_order.reference }}{% endblock %}
 
-    <p><strong>Delivery Date:</strong> {{ purchase_order.delivery_date }}</p>
+{% block content %}
+<p>Hello {{ contact_name }},</p>
+<p>Attached is the purchase order issued by <strong>{{ company_name }}</strong>. Below is a summary.</p>
 
-    <p>Thank you,<br/>{{ company_name }} Procurement Team</p>
+<table class="data-table">
+    <thead>
+        <tr>
+            <th>Item</th>
+            <th>Qty</th>
+            <th>Unit Price</th>
+            <th>Total</th>
+        </tr>
+    </thead>
+    <tbody>
+    {% for item in line_items %}
+        <tr>
+            <td>{{ item.inventory_item|default:item.stock_item|default:item }}</td>
+            <td>{{ item.quantity }}</td>
+            <td>{{ item.unit_price }}</td>
+            <td>{{ item.total_price }}</td>
+        </tr>
+    {% endfor %}
+    </tbody>
+</table>
 
-    <div class="footer">
-        This is an automated message. Please do not reply.
-    </div>
+<div class="summary">
+    <span class="summary-label">Delivery Date</span>
+    <div class="summary-value">{{ purchase_order.delivery_date|default:"Not specified" }}</div>
 </div>
-</body>
-</html>
+
+<p>Thank you,<br>{{ company_name }} Procurement Team</p>
+{% endblock %}

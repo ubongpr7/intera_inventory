@@ -14,7 +14,7 @@ A comprehensive Django-based inventory management system for pharmaceutical oper
 ## Quick Start
 ```bash
 # Clone the repository
-git clone https://github.com/your-repo/pharm-inventory.git
+git clone https://github.com/your-repo/intera-ims.git
 
 # Setup environment
 cp .env.example .env

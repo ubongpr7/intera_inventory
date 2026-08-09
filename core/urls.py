@@ -1,5 +1,6 @@
 from django.contrib import admin
 from django.http import JsonResponse
+from django.db import connection
 from django.urls import path,include
 from rest_framework import permissions
 from drf_yasg.views import get_schema_view
@@ -23,9 +24,23 @@ schema_view = get_schema_view(
 def healthz(_request):
     return JsonResponse({"status": "ok"})
 
+
+def readyz(_request):
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT 1")
+            cursor.fetchone()
+    except Exception as exc:
+        return JsonResponse(
+            {"status": "error", "database": "unavailable", "error": type(exc).__name__},
+            status=503,
+        )
+    return JsonResponse({"status": "ok", "database": "available"})
+
 urlpatterns = [
     path('admin/', admin.site.urls),
     path('healthz/', healthz, name='healthz'),
+    path('readyz/', readyz, name='readyz'),
     # djoser urls
     # path('auth-api/', include('djoser.urls')),
     # path('', include('djoser.urls.jwt')),

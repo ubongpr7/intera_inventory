@@ -7,6 +7,13 @@ from django.core.mail import EmailMessage, EmailMultiAlternatives
 from django.template.loader import render_to_string
 
 logger = logging.getLogger(__name__)
+INTERA_BRAND = {
+    "name": "Intera IMS",
+    "deep_blue": "#101727",
+    "bright_blue": "#3c83f7",
+    "light_green": "#98fcc2",
+    "surface": "#f5f9ff",
+}
 
 
 class EmailService:
@@ -15,6 +22,11 @@ class EmailService:
     @classmethod
     def _resolve_from_email(cls):
         return getattr(settings, "DEFAULT_FROM_EMAIL", None) or settings.EMAIL_HOST_USER
+
+    @classmethod
+    def _resolve_reply_to(cls):
+        reply_to = (getattr(settings, "EMAIL_DEFAULT_REPLY_TO", "") or "").strip()
+        return [reply_to] if reply_to else None
 
     @classmethod
     def _email_backend_is_local_only(cls):
@@ -34,6 +46,27 @@ class EmailService:
         if cls._email_backend_is_local_only():
             return True
         return bool(settings.EMAIL_HOST_USER and settings.EMAIL_HOST_PASSWORD)
+
+    @classmethod
+    def _brand_context(cls):
+        frontend_site = getattr(settings, "FRONTEND_SITE_URL", "").strip().rstrip("/")
+        site_url = getattr(settings, "SITE_URL", "").strip().rstrip("/")
+        brand_site_url = frontend_site or site_url
+        white_logo = "/assets/img/logos/verticals/no-bg/INTERA-PRIMARY-LOGO-VERTICAL-WHITE-4.png"
+        black_logo = "/assets/img/logos/verticals/no-bg/INTERA-PRIMARY-LOGO-VERTICAL-BLACK-3.png"
+        return {
+            "brand": INTERA_BRAND,
+            "brand_name": INTERA_BRAND["name"],
+            "brand_site_url": brand_site_url,
+            "brand_logo_url": getattr(settings, "EMAIL_BRAND_LOGO_URL", "")
+            or getattr(settings, "EMAIL_BRAND_LOGO_DARK_URL", "")
+            or (f"{brand_site_url}{white_logo}" if brand_site_url else ""),
+            "brand_logo_light_url": getattr(settings, "EMAIL_BRAND_LOGO_LIGHT_URL", "")
+            or (f"{brand_site_url}{black_logo}" if brand_site_url else ""),
+            "brand_logo_dark_url": getattr(settings, "EMAIL_BRAND_LOGO_DARK_URL", "")
+            or (f"{brand_site_url}{white_logo}" if brand_site_url else ""),
+            "support_email": getattr(settings, "EMAIL_SUPPORT_EMAIL", "") or "support@interaims.com",
+        }
 
     @classmethod
     def send_purchase_order_email(cls, purchase_order, pdf_file):
@@ -74,14 +107,22 @@ class EmailService:
                     "purchase_order": purchase_order,
                     "company_name": purchase_order.profile.name,
                     "contact_name": purchase_order.contact.name or "Supplier",
-                    "line_items": purchase_order.line_items.all()
+                    "line_items": purchase_order.line_items.all(),
+                    **cls._brand_context(),
                 })
             except Exception as e:
                 logger.exception("Failed to render email template.")
                 return False
 
             # Create email with HTML content
-            email = EmailMultiAlternatives(subject, "", from_email, to, cc=cc_emails)
+            email = EmailMultiAlternatives(
+                subject,
+                "",
+                from_email,
+                to,
+                cc=cc_emails,
+                reply_to=cls._resolve_reply_to(),
+            )
             email.attach_alternative(html_content, "text/html")
 
             # Attach PDF — check if it's a file-like object or a file path
@@ -147,7 +188,8 @@ class EmailService:
                 'return_order': return_order,
                 'purchase_order': purchase_order,
                 'contact': return_order.contact,
-                'company_name': return_order.profile.name if return_order.profile else 'Company'
+                'company_name': return_order.profile.name if return_order.profile else 'Company',
+                **cls._brand_context(),
             }
             
             # Render email template
@@ -157,8 +199,9 @@ class EmailService:
             email = EmailMessage(
                 subject,
                 html_content,
-                settings.DEFAULT_FROM_EMAIL,
+                cls._resolve_from_email(),
                 recipients,
+                reply_to=cls._resolve_reply_to(),
             )
             email.content_subtype = "html"
             
@@ -233,6 +276,7 @@ class EmailService:
                 'status_change': status_change,
                 'company_name': purchase_order.profile.name,
                 'contact_name': purchase_order.contact.name or "Supplier",
+                **cls._brand_context(),
             }
             
             if additional_context:
@@ -244,7 +288,8 @@ class EmailService:
                 subject,
                 "",
                 cls._resolve_from_email(),
-                [purchase_order.contact.email]
+                [purchase_order.contact.email],
+                reply_to=cls._resolve_reply_to(),
             )
             email.attach_alternative(html_content, "text/html")
             email.send(fail_silently=False)

@@ -1,57 +1,23 @@
-<!DOCTYPE html>
-<html>
-<head>
-    <style>
-        body {
-            font-family: 'Segoe UI', sans-serif;
-            background-color: #f8f8f8;
-            padding: 20px;
-            color: #333;
-        }
-        .container {
-            background: white;
-            border-radius: 8px;
-            padding: 20px;
-            max-width: 600px;
-            margin: auto;
-            box-shadow: 0 0 10px rgba(0,0,0,0.08);
-        }
-        h2 {
-            color: #2c3e50;
-        }
-        .meta {
-            margin: 16px 0;
-            padding: 12px 16px;
-            background: #f6f8fb;
-            border-radius: 6px;
-        }
-        .footer {
-            margin-top: 20px;
-            font-size: 13px;
-            color: #777;
-            text-align: center;
-        }
-    </style>
-</head>
-<body>
-<div class="container">
-    <h2>Return Request {{ return_order.reference }}</h2>
-    <p>Hello {{ contact.name|default:"Supplier" }},</p>
-    <p>{{ company_name }} has created a supplier return request for purchase order <strong>{{ purchase_order.reference }}</strong>.</p>
+{% extends "emails/intera_email_base.html" %}
 
-    <div class="meta">
-        <p><strong>Purchase order:</strong> {{ purchase_order.reference }}</p>
-        <p><strong>Return reference:</strong> {{ return_order.reference }}</p>
-        <p><strong>Supplier:</strong> {{ supplier.name|default:"N/A" }}</p>
-        <p><strong>Status:</strong> {{ return_order.status|default:"Pending" }}</p>
-    </div>
+{% block eyebrow %}Return Order{% endblock %}
+{% block title %}Return Request {{ return_order.reference }}{% endblock %}
 
-    <p>The original purchase order PDF and the return order PDF are attached for your review.</p>
-    <p>Thank you,<br/>{{ company_name }} Procurement Team</p>
+{% block content %}
+<p>Hello {{ contact.name|default:"Supplier" }},</p>
+<p>{{ company_name }} has created a supplier return request for purchase order <strong>{{ purchase_order.reference }}</strong>.</p>
 
-    <div class="footer">
-        This is an automated message. Please do not reply.
-    </div>
+<div class="summary">
+    <span class="summary-label">Purchase order</span>
+    <div class="summary-value">{{ purchase_order.reference }}</div>
+    <span class="summary-label">Return reference</span>
+    <div class="summary-value">{{ return_order.reference }}</div>
+    <span class="summary-label">Supplier</span>
+    <div class="summary-value">{{ supplier.name|default:"N/A" }}</div>
+    <span class="summary-label">Status</span>
+    <div class="summary-value">{{ return_order.status|default:"Pending" }}</div>
 </div>
-</body>
-</html>
+
+<p>The original purchase order PDF and the return order PDF are attached for your review.</p>
+<p>Thank you,<br>{{ company_name }} Procurement Team</p>
+{% endblock %}

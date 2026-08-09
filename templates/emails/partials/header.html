@@ -1,0 +1,5 @@
+{% if brand_logo_url %}
+<img class="brand-logo" src="{{ brand_logo_url }}" width="176" alt="{{ brand_name|default:'Intera IMS' }}" style="display: block; width: 176px; max-width: 176px; height: auto; border: 0; outline: none; text-decoration: none;">
+{% else %}
+<span class="brand-text">{{ brand_name|default:"Intera IMS" }}</span>
+{% endif %}
