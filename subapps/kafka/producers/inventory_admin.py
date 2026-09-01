@@ -155,6 +155,7 @@ def serialize_stock_location(location: StockLocation) -> dict[str, Any]:
         "location_type_id": str(location.location_type_id or ""),
         "location_type_name": _string(getattr(location.location_type, "name", "")),
         "official_user_id": location.official_user_id,
+        "address_id": str(location.address_id or ""),
         "physical_address": location.physical_address or "",
         "created_by_user_id": location.created_by_user_id,
         "updated_by_user_id": location.updated_by_user_id,

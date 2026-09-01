@@ -1,9 +1,10 @@
+from django.conf import settings
 from rest_framework import viewsets, status, filters
 from rest_framework.decorators import action
 from rest_framework.response import Response
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from django_filters.rest_framework import DjangoFilterBackend
-from django.db.models import Q, Sum, Count, Avg, F, Case, When, Value, IntegerField, DecimalField
+from django.db.models import Prefetch, Q, Sum, Count, Avg, F, Case, When, Value, IntegerField, DecimalField
 from django.db import transaction
 from django.http import HttpResponse
 from django.utils import timezone
@@ -44,6 +45,7 @@ from mainapps.stock.models import (
     StockReservationStatus,
     StockSerial,
 )
+from mainapps.identity.models import IdentityCompanyProfile
 from subapps.permissions.constants import PURCHASE_ORDER_PERMISSIONS, UNIFIED_PERMISSION_DICT
 from subapps.permissions.microservice_permissions import BaseCachePermissionViewset, HasModelRequestPermission, PermissionRequiredMixin
 from subapps.kafka.producers import (
@@ -58,9 +60,17 @@ from subapps.kafka.producers import (
     serialize_sales_order_line_item,
     serialize_sales_order_shipment,
 )
-from subapps.services.emails.email_services import EmailService
+from subapps.kafka.producers.platform_events import publish_notification_dispatch
+from subapps.services.emails.email_services import EmailService, get_workspace_display_name
 from subapps.services.location_scope import get_location_scope_ids, get_location_scope_ids_for_locations
 from subapps.services.pdf.pdf_service import PDFService, PDFServiceUnavailableError
+from subapps.services.pdf.notification_documents import (
+    NotificationDocumentError,
+    build_purchase_order_pdf_url,
+    build_return_order_pdf_url,
+    verify_purchase_order_pdf_token,
+    verify_return_order_pdf_token,
+)
 from subapps.services.identity_directory import IdentityDirectory
 from subapps.services.stock_domain import StockDomainError, StockDomainService
 from subapps.utils.request_context import (
@@ -69,8 +79,10 @@ from subapps.utils.request_context import (
     scope_queryset_by_identity,
 )
 
+from .pagination import PurchaseOrderPagination
+
 from .models import (
-    GoodsReceipt,
+    GoodsReceipt, GoodsReceiptLine,
     PurchaseOrder, PurchaseOrderLineItem, PurchaseOrderStatus,
     ReturnOrder, ReturnOrderLineItem, ReturnOrderStatus,
     SalesOrder, SalesOrderLineItem, SalesOrderShipment, SalesOrderStatus,
@@ -155,12 +167,71 @@ def _audit_actor_from_request(request):
     }
 
 
+_POST_ISSUE_WORKFLOW_STATES = {
+    'SENT_TO_SUPPLIER',
+    'PARTIALLY_RECEIVED',
+    'FULLY_RECEIVED',
+    'CLOSED',
+}
+
+
+def _purchase_order_edit_lock_reason(purchase_order):
+    if purchase_order is None:
+        return None
+    if purchase_order.status in {
+        PurchaseOrderStatus.ISSUED,
+        PurchaseOrderStatus.RECEIVED,
+        PurchaseOrderStatus.COMPLETED,
+        PurchaseOrderStatus.CANCELLED,
+        PurchaseOrderStatus.RETURNED,
+        PurchaseOrderStatus.REJECTED,
+        PurchaseOrderStatus.LOST,
+        PurchaseOrderStatus.OVERDUE,
+    }:
+        return 'Issued purchase orders can no longer be edited.'
+    if purchase_order.workflow_state in _POST_ISSUE_WORKFLOW_STATES:
+        return 'Issued purchase orders can no longer be edited.'
+    if purchase_order.issue_date:
+        return 'Issued purchase orders can no longer be edited.'
+    return None
+
+
+def _sales_order_edit_lock_reason(sales_order):
+    if sales_order is None:
+        return None
+    if sales_order.status in {SalesOrderStatus.COMPLETED, SalesOrderStatus.CANCELLED}:
+        return 'Completed or cancelled sales orders can no longer be edited.'
+    return None
+
+
+def _purchase_order_open_line_count(purchase_order):
+    line_items = getattr(purchase_order, 'line_items', None)
+    if line_items is None:
+        return 0
+    if hasattr(line_items, 'filter'):
+        return line_items.filter(fully_received=False).count()
+    try:
+        return sum(1 for line in line_items.all() if not getattr(line, 'fully_received', False))
+    except Exception:
+        return 0
+
+
 class GoodsReceiptViewSet(BaseCachePermissionViewset):
+    # Receipts are posted through purchase-order workflows, so this viewset
+    # cannot reliably invalidate a five-minute list cache on every mutation.
+    CACHE_ENABLED = False
     required_permission = UNIFIED_PERMISSION_DICT.get('purchase_order')
     queryset = GoodsReceipt.objects.select_related('purchase_order', 'supplier').prefetch_related(
-        'lines',
-        'lines__inventory_item',
-        'lines__stock_location',
+        Prefetch(
+            'lines',
+            queryset=GoodsReceiptLine.objects.select_related(
+                'inventory_item',
+                'stock_location',
+                'stock_location__parent',
+                'stock_location__parent__parent',
+                'stock_location__parent__parent__parent',
+            ),
+        ),
     )
     filterset_fields = ['purchase_order', 'supplier']
     search_fields = [
@@ -214,6 +285,21 @@ class GoodsReceiptViewSet(BaseCachePermissionViewset):
             queryset = queryset.filter(received_at__date__lte=date_to)
 
         return queryset.distinct()
+
+    @action(detail=False, methods=['get'])
+    def summary(self, request):
+        queryset = self.filter_queryset(self.get_queryset())
+        aggregates = queryset.aggregate(total_quantity=Sum('lines__received_quantity'))
+        return Response(
+            {
+                'total_receipts': queryset.count(),
+                'total_quantity': aggregates.get('total_quantity') or Decimal('0'),
+                'supplier_count': queryset.values('supplier_id').distinct().count(),
+                'purchase_order_count': queryset.values('purchase_order_id').distinct().count(),
+                'location_count': queryset.values('lines__stock_location_id').distinct().count(),
+                'inventory_item_count': queryset.values('lines__inventory_item_id').distinct().count(),
+            }
+        )
 
 
 class SalesOrderShipmentViewSet(BaseCachePermissionViewset):
@@ -294,12 +380,36 @@ class SalesOrderShipmentViewSet(BaseCachePermissionViewset):
 
         return queryset.distinct()
 
+    @action(detail=False, methods=['get'])
+    def summary(self, request):
+        queryset = self.filter_queryset(self.get_queryset())
+        aggregates = queryset.aggregate(total_quantity=Sum('lines__quantity_shipped'))
+        return Response(
+            {
+                'total_shipments': queryset.count(),
+                'total_quantity': aggregates.get('total_quantity') or Decimal('0'),
+                'tracked_shipment_count': queryset.exclude(
+                    Q(tracking_number='') & Q(invoice_number='') & Q(link='')
+                ).count(),
+                'customer_count': queryset.values('order__customer_id').distinct().count(),
+                'order_count': queryset.values('order_id').distinct().count(),
+                'location_count': queryset.values('lines__stock_location_id').distinct().count(),
+                'inventory_item_count': queryset.values('lines__sales_order_line__inventory_item_id').distinct().count(),
+            }
+        )
+
 class PurchaseOrderViewSet(BaseCachePermissionViewset):
     """
     Enhanced ViewSet for comprehensive purchase order management
     Includes workflow management, receiving, returns, and analytics
     """
+    # Purchase-order state changes through custom line-item and workflow actions.
+    # The generic five-minute cache is not invalidated by those actions and can
+    # otherwise hide newly added lines or receipts from the operations workbench.
+    CACHE_ENABLED = False
     required_permission = UNIFIED_PERMISSION_DICT.get('purchase_order')
+    pagination_class = PurchaseOrderPagination
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
 
     queryset = PurchaseOrder.objects.select_related('supplier', 'contact', 'address').prefetch_related('line_items')
     # permission_classes = [IsAuthenticated, HasModelRequestPermission]
@@ -345,6 +455,13 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
             queryset = queryset.filter(created_at__gte=date_from)
         if date_to:
             queryset = queryset.filter(created_at__lte=date_to)
+
+        delivery_date_from = self.request.query_params.get('delivery_date_from')
+        delivery_date_to = self.request.query_params.get('delivery_date_to')
+        if delivery_date_from:
+            queryset = queryset.filter(delivery_date__gte=delivery_date_from)
+        if delivery_date_to:
+            queryset = queryset.filter(delivery_date__lte=delivery_date_to)
         return queryset
     
     def perform_create(self, serializer):
@@ -433,6 +550,20 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
             'changes': self._get_field_changes(original_data, serializer.data)
         })
 
+    def update(self, request, *args, **kwargs):
+        purchase_order = self.get_object()
+        lock_reason = _purchase_order_edit_lock_reason(purchase_order)
+        if lock_reason:
+            return Response({'error': lock_reason}, status=status.HTTP_400_BAD_REQUEST)
+        return super().update(request, *args, **kwargs)
+
+    def partial_update(self, request, *args, **kwargs):
+        purchase_order = self.get_object()
+        lock_reason = _purchase_order_edit_lock_reason(purchase_order)
+        if lock_reason:
+            return Response({'error': lock_reason}, status=status.HTTP_400_BAD_REQUEST)
+        return super().partial_update(request, *args, **kwargs)
+
     def perform_destroy(self, instance):
         before = serialize_purchase_order(instance)
         publish_order_admin_event(
@@ -467,6 +598,9 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
     def add_line_item(self, request, pk=None):
         """Add line item to purchase order"""
         purchase_order = self.get_object()
+        lock_reason = _purchase_order_edit_lock_reason(purchase_order)
+        if lock_reason:
+            return Response({'error': lock_reason}, status=status.HTTP_400_BAD_REQUEST)
         if purchase_order.status not in [PurchaseOrderStatus.PENDING,]:
             return Response(
                 {'error': 'Cannot add line item to order in current status'},
@@ -523,6 +657,9 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
     def update_line_item(self, request, pk=None):
         """Update a specific line item"""
         purchase_order = self.get_object()
+        lock_reason = _purchase_order_edit_lock_reason(purchase_order)
+        if lock_reason:
+            return Response({'error': lock_reason}, status=status.HTTP_400_BAD_REQUEST)
         if purchase_order.status not in [PurchaseOrderStatus.PENDING,]:
             return Response(
                 {'error': f'Cannot edit line item in the  order in current status ({purchase_order.status})'},
@@ -590,6 +727,9 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
     def remove_line_item(self, request, pk=None):
         """Remove a line item from purchase order"""
         purchase_order = self.get_object()
+        lock_reason = _purchase_order_edit_lock_reason(purchase_order)
+        if lock_reason:
+            return Response({'error': lock_reason}, status=status.HTTP_400_BAD_REQUEST)
         line_item_id = request.query_params.get('line_item_id')
         
         if not line_item_id:
@@ -733,7 +873,10 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
                 email_sent = False
                 if request.data.get('notify_supplier', True):
                     try:
-                        self._send_purchase_order_email(purchase_order)
+                        self._send_purchase_order_email(
+                            purchase_order,
+                            delivery_key=f"purchase-order:{purchase_order.id}:issued:{purchase_order.issue_date.isoformat()}",
+                        )
                         email_sent = True
                     except Exception as e:
                         logger.warning(f"Failed to send email for PO {purchase_order.reference}: {str(e)}")
@@ -999,7 +1142,7 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
                     status_transitioned_to_received = True
                 after = serialize_purchase_order(purchase_order)
                 goods_receipt_payload = serialize_goods_receipt(goods_receipt)
-                open_line_count = purchase_order.line_items.filter(remaining_quantity__gt=0).count()
+                open_line_count = _purchase_order_open_line_count(purchase_order)
                 receipt_completion_state = 'complete' if open_line_count == 0 else 'partial'
                 if status_transitioned_to_received:
                     publish_order_admin_event(
@@ -1143,6 +1286,11 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
         if purchase_order.status != PurchaseOrderStatus.RECEIVED:
             return Response(
                 {'error': 'Only received orders can be completed'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        if _purchase_order_open_line_count(purchase_order) > 0:
+            return Response(
+                {'error': 'All purchase order line items must be fully received before completion'},
                 status=status.HTTP_400_BAD_REQUEST
             )
         
@@ -1354,7 +1502,11 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
                 
                 # Send notifications if requested
                 try:
-                    self._send_return_order_email(return_order, purchase_order)
+                    self._send_return_order_email(
+                        return_order,
+                        purchase_order,
+                        delivery_key=f"return-order:{return_order.id}:created",
+                    )
                 except Exception as e:
                     logger.warning(f"Failed to send return order email: {str(e)}")
                 
@@ -1465,7 +1617,15 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
         
         summary = {
             'total_orders': queryset.count(),
+            'active_orders': queryset.exclude(status__in=[PurchaseOrderStatus.COMPLETED, PurchaseOrderStatus.CANCELLED]).count(),
             'pending_approval': queryset.filter(status=PurchaseOrderStatus.PENDING).count(),
+            'issued_orders': queryset.filter(status=PurchaseOrderStatus.ISSUED).count(),
+            'received_orders': queryset.filter(status=PurchaseOrderStatus.RECEIVED).count(),
+            'partially_received_orders': queryset.filter(workflow_state='PARTIALLY_RECEIVED').count(),
+            'awaiting_receipt_orders': queryset.filter(
+                Q(status=PurchaseOrderStatus.ISSUED) | Q(workflow_state='PARTIALLY_RECEIVED')
+            ).distinct().count(),
+            'ready_to_close_orders': queryset.filter(status=PurchaseOrderStatus.RECEIVED).count(),
             'overdue_orders': queryset.filter(
                 delivery_date__lt=today,
                 status__in=[PurchaseOrderStatus.ISSUED, PurchaseOrderStatus.APPROVED]
@@ -1698,8 +1858,128 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
                 }
         return changes
     
-    def _send_purchase_order_email(self, purchase_order):
-        """Send purchase order email to supplier using enhanced service"""
+    def _workspace_owner_recipient(self, purchase_order):
+        """Return the workspace owner as an internal notification recipient."""
+        try:
+            profile = (
+                IdentityCompanyProfile.objects.filter(
+                    profile_id=purchase_order.profile_id,
+                    is_active=True,
+                )
+                .only("owner_user_id")
+                .first()
+            )
+            owner_user_id = str(getattr(profile, "owner_user_id", "") or "").strip()
+            owner = IdentityDirectory.get_user_details(owner_user_id)
+        except Exception:
+            logger.exception("Could not resolve the workspace owner for purchase order delivery")
+            return None
+
+        owner_email = str((owner or {}).get("email") or "").strip()
+        if not owner_user_id or not owner_email:
+            return None
+        return {
+            "kind": "user",
+            "user_id": owner_user_id,
+            "email_snapshot": owner_email,
+            "display_name": str((owner or {}).get("full_name") or "Workspace owner").strip(),
+        }
+
+    def _publish_purchase_order_email_dispatch(self, purchase_order, *, delivery_key: str, email_required: bool):
+        contact = purchase_order.contact
+        document_url = build_purchase_order_pdf_url(purchase_order)
+        recipients_by_email = {}
+        contact_email = str(getattr(contact, "email", "") or "").strip()
+        if contact_email:
+            recipients_by_email[contact_email.lower()] = {
+                "kind": "external_email",
+                "email": contact_email,
+                "display_name": getattr(contact, "name", "") or "Supplier",
+            }
+        supplier_email = str(getattr(purchase_order.supplier, "email", "") or "").strip()
+        if supplier_email:
+            recipients_by_email.setdefault(
+                supplier_email.lower(),
+                {
+                    "kind": "external_email",
+                    "email": supplier_email,
+                    "display_name": getattr(purchase_order.supplier, "name", "") or "Supplier",
+                },
+            )
+        owner_recipient = self._workspace_owner_recipient(purchase_order)
+        if owner_recipient:
+            # Use the internal recipient when the owner and supplier share an email.
+            # This prevents duplicate email jobs while retaining the owner's in-app copy.
+            recipients_by_email[owner_recipient["email_snapshot"].lower()] = owner_recipient
+        if not recipients_by_email:
+            raise ValueError(f"Purchase order {purchase_order.reference} has no email recipient.")
+        line_items = []
+        line_item_manager = getattr(purchase_order, "line_items", None)
+        if line_item_manager is not None:
+            for line_item in line_item_manager.select_related("inventory_item").all():
+                line_items.append(
+                    {
+                        "name": str(line_item.inventory_item),
+                        "description": str(line_item.description or "").strip(),
+                        "quantity": str(line_item.quantity),
+                        "unit_price": f"{Decimal(str(line_item.unit_price)):,.2f}",
+                        "line_total": f"{Decimal(str(line_item.total_price)):,.2f}",
+                    }
+                )
+        publish_notification_dispatch(
+            key=str(purchase_order.profile_id),
+            payload={
+                "notification_type": "purchase_order.issued.v1",
+                "workspace_id": str(purchase_order.profile_id),
+                "resource": {"type": "purchase_order", "id": str(purchase_order.id), "reference": purchase_order.reference},
+                "recipients": list(recipients_by_email.values()),
+                "channels": {
+                    "email": "required" if email_required else "disabled",
+                    "in_app": "disabled",
+                    "realtime": "disabled",
+                },
+                "template": {
+                    "key": "purchase_order_issued",
+                    "version": 1,
+                    "data": {
+                        "purchase_order_reference": purchase_order.reference,
+                        "supplier_name": purchase_order.supplier.name if purchase_order.supplier else "Supplier",
+                        "issued_by_name": get_workspace_display_name(purchase_order),
+                        "delivery_date": purchase_order.delivery_date.isoformat() if purchase_order.delivery_date else "",
+                        "document_url": document_url,
+                        "order_currency": str(getattr(purchase_order, "order_currency", "") or "").strip(),
+                        "line_items": line_items,
+                    },
+                },
+                "action": {"url": document_url, "label": "Open purchase order"},
+                "attachments": [{"filename": f"PurchaseOrder_{purchase_order.reference}.pdf", "content_type": "application/pdf", "download_url": document_url}],
+                "email_thread": {
+                    "key": f"purchase-order:{purchase_order.id}",
+                    "is_reply": ":resend:" in delivery_key,
+                },
+                "idempotency_key": delivery_key,
+                "correlation_id": str(purchase_order.id),
+            },
+        )
+
+    def _send_purchase_order_email(self, purchase_order, *, delivery_key: str | None = None):
+        """Use a feature-gated direct/shadow/notification-service PO delivery path."""
+        delivery_mode = settings.PURCHASE_ORDER_EMAIL_DELIVERY_MODE
+        if delivery_mode not in {"direct", "shadow", "notification_service"}:
+            raise ValueError("PURCHASE_ORDER_EMAIL_DELIVERY_MODE must be direct, shadow, or notification_service.")
+        if delivery_mode in {"shadow", "notification_service"}:
+            self._publish_purchase_order_email_dispatch(
+                purchase_order,
+                delivery_key=delivery_key or f"purchase-order:{purchase_order.id}:issued",
+                email_required=delivery_mode == "notification_service",
+            )
+        if delivery_mode in {"shadow", "notification_service"}:
+            logger.info(
+                "%s purchase order email dispatch for %s",
+                "Queued" if delivery_mode == "notification_service" else "Recorded shadow",
+                purchase_order.reference,
+            )
+            return
         try:
             # Generate PDF
             pdf_content = PDFService.generate_purchase_order_pdf(purchase_order)
@@ -1718,9 +1998,111 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
         except Exception as e:
             logger.error(f"Failed to send purchase order email: {str(e)}")
             raise
+
+    def _publish_return_order_email_dispatch(self, return_order, purchase_order, *, delivery_key: str, email_required: bool):
+        supplier = purchase_order.supplier
+        recipients_by_email = {}
+        supplier_email = str(getattr(supplier, "email", "") or "").strip()
+        if supplier_email:
+            recipients_by_email[supplier_email.lower()] = {
+                "kind": "external_email",
+                "email": supplier_email,
+                "display_name": getattr(supplier, "name", "") or "Supplier",
+            }
+        contact = return_order.contact
+        contact_email = str(getattr(contact, "email", "") or "").strip()
+        if contact_email:
+            recipients_by_email[contact_email.lower()] = {
+                "kind": "external_email",
+                "email": contact_email,
+                "display_name": getattr(contact, "name", "") or "Supplier",
+            }
+        if not recipients_by_email:
+            raise ValueError(f"Return order {return_order.reference} has no supplier email recipient.")
+
+        purchase_order_url = build_purchase_order_pdf_url(purchase_order)
+        return_order_url = build_return_order_pdf_url(return_order)
+        publish_notification_dispatch(
+            key=str(return_order.profile_id),
+            payload={
+                "notification_type": "return_order.created.v1",
+                "workspace_id": str(return_order.profile_id),
+                "resource": {"type": "return_order", "id": str(return_order.id), "reference": return_order.reference},
+                "recipients": list(recipients_by_email.values()),
+                "channels": {
+                    "email": "required" if email_required else "disabled",
+                    "in_app": "disabled",
+                    "realtime": "disabled",
+                },
+                "template": {
+                    "key": "return_order_created",
+                    "version": 1,
+                    "data": {
+                        "purchase_order_reference": purchase_order.reference,
+                        "return_order_reference": return_order.reference,
+                        "supplier_name": getattr(supplier, "name", "") or "Supplier",
+                        "company_name": get_workspace_display_name(return_order),
+                        "return_document_url": return_order_url,
+                        "purchase_order_document_url": purchase_order_url,
+                    },
+                },
+                "action": {"url": return_order_url, "label": "Open return order"},
+                "attachments": [
+                    {"filename": f"Return_{return_order.reference}.pdf", "content_type": "application/pdf", "download_url": return_order_url},
+                    {"filename": f"Original_PO_{purchase_order.reference}.pdf", "content_type": "application/pdf", "download_url": purchase_order_url},
+                ],
+                "email_thread": {"key": f"purchase-order:{purchase_order.id}", "is_reply": True},
+                "idempotency_key": delivery_key,
+                "correlation_id": str(return_order.id),
+            },
+        )
+
+    @action(
+        detail=True,
+        methods=["get"],
+        url_path="notification-pdf",
+        url_name="notification-pdf",
+        authentication_classes=[],
+        permission_classes=[AllowAny],
+    )
+    def notification_pdf(self, request, pk=None):
+        """Serve one signed, short-lived PO PDF to the notification delivery service."""
+        token = str(request.query_params.get("token") or "")
+        try:
+            verify_purchase_order_pdf_token(purchase_order_id=str(pk), token=token)
+            purchase_order = self.get_queryset().get(pk=pk)
+            pdf_content = PDFService.generate_purchase_order_pdf(purchase_order)
+        except NotificationDocumentError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_403_FORBIDDEN)
+        except PurchaseOrder.DoesNotExist:
+            return Response({"detail": "Purchase order not found."}, status=status.HTTP_404_NOT_FOUND)
+        except PDFServiceUnavailableError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+        response = HttpResponse(pdf_content.getvalue(), content_type="application/pdf")
+        response["Content-Disposition"] = f'attachment; filename="PurchaseOrder_{purchase_order.reference}.pdf"'
+        response["Cache-Control"] = "private, no-store"
+        return response
     
-    def _send_return_order_email(self, return_order, purchase_order):
-        """Send return order email notifications using enhanced service"""
+    def _send_return_order_email(self, return_order, purchase_order, *, delivery_key: str | None = None):
+        """Use a feature-gated direct/shadow/notification-service return-order delivery path."""
+        delivery_mode = settings.RETURN_ORDER_EMAIL_DELIVERY_MODE
+        if delivery_mode not in {"direct", "shadow", "notification_service"}:
+            raise ValueError("RETURN_ORDER_EMAIL_DELIVERY_MODE must be direct, shadow, or notification_service.")
+        if delivery_mode in {"shadow", "notification_service"}:
+            self._publish_return_order_email_dispatch(
+                return_order,
+                purchase_order,
+                delivery_key=delivery_key or f"return-order:{return_order.id}:created",
+                email_required=delivery_mode == "notification_service",
+            )
+        if delivery_mode in {"shadow", "notification_service"}:
+            logger.info(
+                "%s return order email dispatch for %s",
+                "Queued" if delivery_mode == "notification_service" else "Recorded shadow",
+                return_order.reference,
+            )
+            return
         try:
             # Generate PDFs
             po_pdf = PDFService.generate_purchase_order_pdf(purchase_order)
@@ -1779,7 +2161,12 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
                 status=status.HTTP_503_SERVICE_UNAVAILABLE
             )
         except Exception as e:
-            logger.error(f"Failed to generate PDF for PO {purchase_order.reference}: {str(e)}")
+            logger.error(
+                "Failed to generate PDF for PO %s: %s",
+                purchase_order.reference,
+                str(e),
+                exc_info=True,
+            )
             return Response(
                 {'error': 'Failed to generate PDF'},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
@@ -1871,7 +2258,10 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
                     status=status.HTTP_400_BAD_REQUEST
                 )
             
-            self._send_purchase_order_email(purchase_order)
+            self._send_purchase_order_email(
+                purchase_order,
+                delivery_key=f"purchase-order:{purchase_order.id}:resend:{timezone.now().isoformat()}",
+            )
             payload = serialize_purchase_order(purchase_order)
             publish_order_admin_event(
                 event_name='purchase_order.email_resent',
@@ -1927,7 +2317,6 @@ class SalesOrderViewSet(BaseCachePermissionViewset):
         'address',
     ).prefetch_related(
         'line_items',
-        'line_items__inventory',
         'line_items__inventory_item',
         'shipments',
         'shipments__lines',
@@ -1951,6 +2340,21 @@ class SalesOrderViewSet(BaseCachePermissionViewset):
                 legacy_field='profile',
                 value=profile_id,
             )
+
+        status_filter = (self.request.query_params.get('status_filter') or '').strip().lower()
+        if status_filter == 'active':
+            queryset = queryset.exclude(status__in=[SalesOrderStatus.COMPLETED, SalesOrderStatus.CANCELLED])
+        elif status_filter == 'ready_to_close':
+            queryset = queryset.filter(status=SalesOrderStatus.SHIPPED)
+
+        date_from = self.request.query_params.get('date_from')
+        if date_from:
+            queryset = queryset.filter(created_at__date__gte=date_from)
+
+        date_to = self.request.query_params.get('date_to')
+        if date_to:
+            queryset = queryset.filter(created_at__date__lte=date_to)
+
         return queryset
 
     def get_serializer_class(self):
@@ -1963,6 +2367,20 @@ class SalesOrderViewSet(BaseCachePermissionViewset):
         if self.action == 'ship':
             return SalesOrderShipSerializer
         return SalesOrderDetailSerializer
+
+    @action(detail=False, methods=['get'])
+    def summary(self, request):
+        queryset = self.filter_queryset(self.get_queryset())
+        return Response(
+            {
+                'total_orders': queryset.count(),
+                'active_orders': queryset.exclude(status__in=[SalesOrderStatus.COMPLETED, SalesOrderStatus.CANCELLED]).count(),
+                'pending_orders': queryset.filter(status=SalesOrderStatus.PENDING).count(),
+                'in_progress_orders': queryset.filter(status=SalesOrderStatus.IN_PROGRESS).count(),
+                'shipped_orders': queryset.filter(status=SalesOrderStatus.SHIPPED).count(),
+                'ready_to_close_orders': queryset.filter(status=SalesOrderStatus.SHIPPED).count(),
+            }
+        )
 
     def perform_create(self, serializer):
         current_user_id = get_request_user_id(self.request, as_str=False)
@@ -2003,6 +2421,7 @@ class SalesOrderViewSet(BaseCachePermissionViewset):
             notification_action_url='/order/sales',
         )
         self._log_activity('CREATE', instance, {'initial_data': self.request.data})
+        self._invalidate_cache()
 
     def perform_update(self, serializer):
         current_user_id = get_request_user_id(self.request, as_str=False)
@@ -2032,6 +2451,28 @@ class SalesOrderViewSet(BaseCachePermissionViewset):
             reference_number=instance.reference,
         )
         self._log_activity('UPDATE', instance, {'updated_fields': list(serializer.validated_data.keys())})
+        self._invalidate_cache()
+
+    def update(self, request, *args, **kwargs):
+        sales_order = self.get_object()
+        lock_reason = _sales_order_edit_lock_reason(sales_order)
+        if lock_reason:
+            return Response({'error': lock_reason}, status=status.HTTP_400_BAD_REQUEST)
+        return super().update(request, *args, **kwargs)
+
+    def partial_update(self, request, *args, **kwargs):
+        sales_order = self.get_object()
+        lock_reason = _sales_order_edit_lock_reason(sales_order)
+        if lock_reason:
+            return Response({'error': lock_reason}, status=status.HTTP_400_BAD_REQUEST)
+        return super().partial_update(request, *args, **kwargs)
+
+    def destroy(self, request, *args, **kwargs):
+        sales_order = self.get_object()
+        lock_reason = _sales_order_edit_lock_reason(sales_order)
+        if lock_reason:
+            return Response({'error': lock_reason}, status=status.HTTP_400_BAD_REQUEST)
+        return super().destroy(request, *args, **kwargs)
 
     def perform_destroy(self, instance):
         before = serialize_sales_order(instance)
@@ -2053,6 +2494,7 @@ class SalesOrderViewSet(BaseCachePermissionViewset):
             reference_number=instance.reference,
         )
         instance.delete()
+        self._invalidate_cache()
 
     @action(detail=True, methods=['get'])
     def line_items(self, request, pk=None):
@@ -2100,6 +2542,7 @@ class SalesOrderViewSet(BaseCachePermissionViewset):
             reference_number=sales_order.reference,
         )
         self._log_activity('ADD_LINE_ITEM', sales_order, {'line_item_id': str(line_item.id)})
+        self._invalidate_cache()
         return Response(SalesOrderLineItemSerializer(line_item).data, status=status.HTTP_201_CREATED)
 
     @action(detail=True, methods=['put', 'patch'])
@@ -2147,6 +2590,7 @@ class SalesOrderViewSet(BaseCachePermissionViewset):
             reference_number=sales_order.reference,
         )
         self._log_activity('UPDATE_LINE_ITEM', sales_order, {'line_item_id': str(line_item.id)})
+        self._invalidate_cache()
         return Response(SalesOrderLineItemSerializer(line_item).data)
 
     @action(detail=True, methods=['delete'])
@@ -2198,6 +2642,7 @@ class SalesOrderViewSet(BaseCachePermissionViewset):
         )
         line_item.delete()
         self._log_activity('REMOVE_LINE_ITEM', sales_order, {'line_item_id': str(line_item_id)})
+        self._invalidate_cache()
         return Response({'message': 'Line item removed successfully'})
 
     @action(detail=True, methods=['post'])
@@ -2325,6 +2770,7 @@ class SalesOrderViewSet(BaseCachePermissionViewset):
                     'reservation_ids': reservations,
                 })
 
+            self._invalidate_cache()
             return Response({
                 'message': 'Stock reserved successfully',
                 'reservation_count': len(reservations),
@@ -2441,6 +2887,7 @@ class SalesOrderViewSet(BaseCachePermissionViewset):
 
                 self._log_activity('RELEASE_RESERVATION', sales_order, {'released_count': released_count})
 
+            self._invalidate_cache()
             return Response({
                 'message': 'Reservations released successfully',
                 'released_count': released_count,
@@ -2723,6 +3170,7 @@ class SalesOrderViewSet(BaseCachePermissionViewset):
                 })
 
             shipment.refresh_from_db()
+            self._invalidate_cache()
             return Response(SalesOrderShipmentSerializer(shipment).data, status=status.HTTP_201_CREATED)
         except SalesOrderLineItem.DoesNotExist:
             return Response({'error': 'Sales order line item not found'}, status=status.HTTP_404_NOT_FOUND)
@@ -2774,6 +3222,7 @@ class SalesOrderViewSet(BaseCachePermissionViewset):
         )
 
         self._log_activity('COMPLETE', sales_order, {'complete_date': sales_order.complete_date})
+        self._invalidate_cache()
         return Response(SalesOrderDetailSerializer(sales_order, context={'request': request}).data)
 
     @action(detail=True, methods=['post'])
@@ -2853,6 +3302,7 @@ class SalesOrderViewSet(BaseCachePermissionViewset):
 
                 self._log_activity('CANCEL', sales_order, {'notes': request.data.get('notes', '')})
 
+            self._invalidate_cache()
             return Response(SalesOrderDetailSerializer(sales_order, context={'request': request}).data)
         except SalesOrderLineItem.DoesNotExist:
             return Response({'error': 'Sales order line item not found'}, status=status.HTTP_404_NOT_FOUND)
@@ -2901,6 +3351,15 @@ class ReturnOrderViewSet(BaseCachePermissionViewset):
                 legacy_field='profile',
                 value=profile_id,
             )
+
+        date_from = self.request.query_params.get('date_from')
+        if date_from:
+            queryset = queryset.filter(created_at__date__gte=date_from)
+
+        date_to = self.request.query_params.get('date_to')
+        if date_to:
+            queryset = queryset.filter(created_at__date__lte=date_to)
+
         return queryset
 
     def get_serializer_class(self):
@@ -2909,6 +3368,33 @@ class ReturnOrderViewSet(BaseCachePermissionViewset):
         if self.action == 'dispatch_return_order':
             return ReturnOrderProcessSerializer
         return ReturnOrderDetailSerializer
+
+    @action(
+        detail=True,
+        methods=["get"],
+        url_path="notification-pdf",
+        url_name="notification-pdf",
+        authentication_classes=[],
+        permission_classes=[AllowAny],
+    )
+    def notification_pdf(self, request, pk=None):
+        """Serve one signed, short-lived return-order PDF to the notification delivery service."""
+        token = str(request.query_params.get("token") or "")
+        try:
+            verify_return_order_pdf_token(return_order_id=str(pk), token=token)
+            return_order = self.get_queryset().get(pk=pk)
+            pdf_content = PDFService.generate_return_order_pdf(return_order)
+        except NotificationDocumentError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_403_FORBIDDEN)
+        except ReturnOrder.DoesNotExist:
+            return Response({"detail": "Return order not found."}, status=status.HTTP_404_NOT_FOUND)
+        except PDFServiceUnavailableError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+        response = HttpResponse(pdf_content.getvalue(), content_type="application/pdf")
+        response["Content-Disposition"] = f'attachment; filename="Return_{return_order.reference}.pdf"'
+        response["Cache-Control"] = "private, no-store"
+        return response
 
     def create(self, request, *args, **kwargs):
         return Response(
@@ -3061,6 +3547,7 @@ class ReturnOrderViewSet(BaseCachePermissionViewset):
                     'notes': payload.get('notes', ''),
                 })
 
+            self._invalidate_cache()
             return Response({
                 'message': 'Return order dispatched successfully',
                 'status': return_order.status,
@@ -3118,6 +3605,7 @@ class ReturnOrderViewSet(BaseCachePermissionViewset):
             'completed_at': return_order.complete_date,
         })
 
+        self._invalidate_cache()
         serializer = ReturnOrderDetailSerializer(return_order, context={'request': request})
         return Response(serializer.data)
 
@@ -3167,6 +3655,7 @@ class ReturnOrderViewSet(BaseCachePermissionViewset):
             'notes': request.data.get('notes', ''),
         })
 
+        self._invalidate_cache()
         serializer = ReturnOrderDetailSerializer(return_order, context={'request': request})
         return Response(serializer.data)
 

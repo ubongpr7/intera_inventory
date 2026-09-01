@@ -2,9 +2,16 @@ from django.template.loader import render_to_string
 from io import BytesIO
 from django.conf import settings
 from django.utils import timezone
+from datetime import timedelta
 from html import escape
 import logging
 import os
+import json
+from urllib.request import Request, urlopen
+from urllib.parse import urlparse
+
+from subapps.services.emails.email_services import get_workspace_display_name
+from mainapps.identity.models import IdentityCompanyProfile
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +51,116 @@ class PDFService:
     @staticmethod
     def _as_string(value):
         return value if isinstance(value, str) else ""
+
+    @staticmethod
+    def _format_company_address(address) -> str:
+        if not address:
+            return ""
+        parts = [
+            getattr(address, "title", ""),
+            getattr(address, "address", ""),
+            getattr(address, "short_address", ""),
+        ]
+        return "\n".join(str(part).strip() for part in parts if str(part or "").strip())
+
+    @staticmethod
+    def _resolve_shared_address(address_id):
+        if not address_id:
+            return {}
+        service_key = os.getenv("SUBSCRIPTION_SERVICE_KEY", "")
+        if not service_key:
+            return {}
+        base_url = os.getenv("SUBSCRIPTION_SERVICE_URL", "http://subscriptions:8550").rstrip("/")
+        try:
+            request = Request(
+                f"{base_url}/api/v1/locations/internal/addresses/{address_id}/",
+                headers={"X-Intera-Service-Key": service_key, "Accept": "application/json"},
+            )
+            with urlopen(request, timeout=float(os.getenv("SUBSCRIPTION_SERVICE_TIMEOUT", "2.0"))) as response:
+                value = json.loads(response.read().decode("utf-8"))
+            return value if isinstance(value, dict) else {}
+        except Exception as exc:
+            logger.warning("Shared address resolution failed for %s: %s", address_id, exc)
+            return {}
+
+    @classmethod
+    def _format_shared_or_local_address(cls, address, profile_id=None) -> str:
+        address_id = getattr(address, "address_id", None)
+        resolved = cls._resolve_shared_address(address_id) if address_id else {}
+        if resolved:
+            parts = [
+                resolved.get("address_line_1"),
+                resolved.get("address_line_2"),
+                resolved.get("city_name") or resolved.get("city"),
+                resolved.get("region_name") or resolved.get("region"),
+                resolved.get("country_name") or resolved.get("country"),
+                resolved.get("postal_code"),
+            ]
+            return "\n".join(str(part).strip() for part in parts if str(part or "").strip())
+        return cls._format_company_address(address)
+
+    @staticmethod
+    def _workspace_logo_url(profile_id) -> str:
+        if not profile_id:
+            return ""
+        logo_url = (
+            IdentityCompanyProfile.objects.filter(profile_id=profile_id, is_active=True)
+            .values_list("logo_url", flat=True)
+            .first()
+            or ""
+        ).strip()
+        parsed = urlparse(logo_url)
+        return logo_url if parsed.scheme == "https" and parsed.netloc else ""
+
+    @staticmethod
+    def _workspace_address(profile_id) -> str:
+        if not profile_id:
+            return ""
+        profile = IdentityCompanyProfile.objects.filter(profile_id=profile_id, is_active=True).first()
+        if not profile:
+            return ""
+
+        address = {}
+        if profile.headquarters_address_id:
+            base_url = os.getenv("SUBSCRIPTION_SERVICE_URL", "http://subscriptions:8550").rstrip("/")
+            service_key = os.getenv("SUBSCRIPTION_SERVICE_KEY", "")
+            if service_key:
+                try:
+                    request = Request(
+                        f"{base_url}/api/v1/locations/internal/addresses/{profile.headquarters_address_id}/",
+                        headers={"X-Intera-Service-Key": service_key, "Accept": "application/json"},
+                    )
+                    with urlopen(request, timeout=float(os.getenv("SUBSCRIPTION_SERVICE_TIMEOUT", "2.0"))) as response:
+                        resolved = json.loads(response.read().decode("utf-8"))
+                    if isinstance(resolved, dict):
+                        address = resolved
+                except Exception as exc:
+                    logger.warning("Shared headquarters address resolution failed for profile %s: %s", profile_id, exc)
+
+        if not address:
+            address = profile.headquarters_address or {}
+        if not isinstance(address, dict):
+            return ""
+        street_parts = [
+            str(address.get("street_number") or "").strip(),
+            str(address.get("street") or address.get("address_line_1") or "").strip(),
+        ]
+        location_parts = [
+            str(address.get("city_name") or address.get("city") or "").strip(),
+            str(address.get("subregion_name") or address.get("subregion") or "").strip(),
+            str(address.get("region_name") or address.get("region") or "").strip(),
+        ]
+        lines = [" ".join(part for part in street_parts if part)]
+        if address.get("apt_number") not in (None, ""):
+            lines.append(f"Apt {address['apt_number']}")
+        lines.extend(
+            [
+                ", ".join(part for part in location_parts if part),
+                str(address.get("country_name") or address.get("country") or "").strip(),
+                str(address.get("postal_code") or "").strip(),
+            ]
+        )
+        return "\n".join(line for line in lines if line)
 
     @classmethod
     def _render_badges(cls, title, values, tone):
@@ -430,13 +547,35 @@ class PDFService:
             tax = sum(line_item.tax_amount for line_item in purchase_order.line_items.all())
             discount = sum(line_item.discount for line_item in purchase_order.line_items.all())
             
-            # Prepare template context
+            supplier = purchase_order.supplier
+            purchase_order_currency = str(
+                purchase_order.order_currency or getattr(supplier, "currency", "") or ""
+            ).strip().upper()
+            line_items = purchase_order.line_items.select_related("inventory_item").all()
+            headquarters_address = cls._workspace_address(purchase_order.profile_id)
+            shipping_address = cls._format_shared_or_local_address(
+                purchase_order.address,
+                purchase_order.profile_id,
+            ) or headquarters_address
+
+            # Keep the PDF independent from legacy profile/address object shapes.
             context = {
                 'po': purchase_order,
                 'tax': tax,
-                'company_profile': purchase_order.profile,
+                'company_name': get_workspace_display_name(purchase_order),
+                'company_logo_url': cls._workspace_logo_url(purchase_order.profile_id),
+                'company_address': headquarters_address,
+                'supplier_address': cls._format_company_address(supplier),
+                'shipping_address': shipping_address,
+                'currency_code': purchase_order_currency or "Not specified",
                 'discount': discount,
-                'line_items': purchase_order.line_items.all(),
+                'subtotal': purchase_order.total_price + discount - tax,
+                'valid_until': (
+                    purchase_order.issue_date + timedelta(days=30)
+                    if purchase_order.issue_date
+                    else None
+                ),
+                'line_items': line_items,
                 'static_path': settings.STATIC_ROOT  
             }
             

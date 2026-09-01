@@ -4,13 +4,15 @@ import os
 from dataclasses import dataclass
 from functools import lru_cache
 
+from subapps.kafka.topics import namespaced_topic
+
 DEFAULT_CONSUMER_TOPICS = (
-    "identity.user",
-    "identity.company_profile",
-    "identity.membership",
-    "catalog.product",
-    "catalog.variant",
-    "pos.order",
+    namespaced_topic("identity.user"),
+    namespaced_topic("identity.company_profile"),
+    namespaced_topic("identity.membership"),
+    namespaced_topic("catalog.product"),
+    namespaced_topic("catalog.variant"),
+    namespaced_topic("pos.order"),
 )
 
 
@@ -18,6 +20,10 @@ def _parse_csv(value: str | None, default: tuple[str, ...] = ()) -> tuple[str, .
     if value is None:
         return default
     return tuple(part.strip() for part in value.split(",") if part.strip())
+
+
+def _parse_topic_csv(value: str | None, default: tuple[str, ...] = ()) -> tuple[str, ...]:
+    return tuple(namespaced_topic(topic) for topic in _parse_csv(value, default))
 
 
 def _parse_int(value: str | None, default: int) -> int:
@@ -86,7 +92,7 @@ class KafkaSettings:
             ssl_key_location=os.getenv("KAFKA_SSL_KEY_FILE") or None,
             ssl_key_password=os.getenv("KAFKA_SSL_KEY_PASSWORD") or None,
             consumer_group=os.getenv("KAFKA_CONSUMER_GROUP", f"{service_name}-consumer"),
-            consumer_topics=_parse_csv(os.getenv("KAFKA_CONSUMER_TOPICS"), DEFAULT_CONSUMER_TOPICS),
+            consumer_topics=_parse_topic_csv(os.getenv("KAFKA_CONSUMER_TOPICS"), DEFAULT_CONSUMER_TOPICS),
             auto_offset_reset=os.getenv("KAFKA_AUTO_OFFSET_RESET", "earliest"),
             request_timeout_ms=_parse_int(os.getenv("KAFKA_REQUEST_TIMEOUT_MS"), 10000),
             message_timeout_ms=_parse_int(os.getenv("KAFKA_MESSAGE_TIMEOUT_MS"), 10000),

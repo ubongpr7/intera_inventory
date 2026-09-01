@@ -5,12 +5,38 @@ from unittest.mock import patch
 
 from django.test import SimpleTestCase
 
-from subapps.kafka.producers.inventory_admin import publish_inventory_admin_event
+from subapps.kafka.producers.inventory_admin import publish_inventory_admin_event, serialize_stock_location
 from subapps.kafka.producers.inventory import publish_inventory_availability_upserted
 from subapps.kafka.producers.orders_admin import publish_order_admin_event, serialize_goods_receipt_line
 
 
 class InventoryKafkaProducerTests(SimpleTestCase):
+    def test_stock_location_serializer_exposes_shared_address_id(self):
+        location = SimpleNamespace(
+            id="location-1",
+            profile_id=17,
+            name="Main Warehouse",
+            code="WAREHOUSE_17_1",
+            description="",
+            structural=True,
+            external=False,
+            is_default_structural_location=True,
+            parent_id=None,
+            parent=None,
+            location_type_id=3,
+            location_type=SimpleNamespace(name="Warehouse"),
+            official_user_id=None,
+            address_id="052ccf7b-2276-490b-a4e9-2a7ae02f54c1",
+            physical_address="1 Example Street",
+            created_by_user_id=9,
+            updated_by_user_id=9,
+        )
+
+        payload = serialize_stock_location(location)
+
+        self.assertEqual(payload["address_id"], "052ccf7b-2276-490b-a4e9-2a7ae02f54c1")
+        self.assertEqual(payload["physical_address"], "1 Example Street")
+
     def test_goods_receipt_line_serializer_exposes_trace_fields(self):
         inventory_item = SimpleNamespace(
             id="inventory-1",

@@ -7,10 +7,9 @@ class CompanyAddressSerializer(serializers.ModelSerializer):
     class Meta:
         model = CompanyAddress
         fields = '__all__'
-        read_only_fields = ('id', 'created_at', 'updated_at')
+    read_only_fields = ('id', 'created_at', 'updated_at')
     def get_full_address(self, obj):
-        return f"{obj.apt_number}, {obj.street_number}, {obj.street}, {obj.region},"
-        return
+        return obj.address
 
 class ContactSerializer(serializers.ModelSerializer):
     class Meta:

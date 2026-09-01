@@ -7,6 +7,7 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 
 from mainapps.stock.models import StockLocation
+from mainapps.projections.models import CatalogVariantProjection
 from subapps.kafka.producers.inventory_admin import (
     publish_inventory_admin_event,
     serialize_inventory_category,
@@ -170,9 +171,11 @@ class BaseInventoryViewSet(BaseCachePermissionViewset):
             created_by_user_id=get_request_user_id(self.request, required=True, as_str=False),
             updated_by_user_id=get_request_user_id(self.request, as_str=False),
         )
+        self._invalidate_cache()
 
     def perform_update(self, serializer):
         serializer.save(updated_by_user_id=get_request_user_id(self.request, as_str=False))
+        self._invalidate_cache()
 
 
 class InventoryCategoryViewSet(BaseInventoryViewSet):
@@ -302,6 +305,39 @@ class InventoryItemViewSet(BaseInventoryViewSet):
             return None
         return resolve_structural_location(profile_id=profile_id, stock_location_id=location_id)
 
+    @action(detail=False, methods=['get'], url_path='available-catalog-variants')
+    def available_catalog_variants(self, request):
+        """Return catalog variants that can be linked to a new inventory item."""
+        profile_id = get_request_profile_id(request, required=True, as_str=False)
+        linked_variant_ids = InventoryItem.objects.filter(
+            profile_id=profile_id,
+            product_variant_id__isnull=False,
+        ).values('product_variant_id')
+        variants = (
+            CatalogVariantProjection.objects.select_related('product')
+            .filter(
+                profile_id=profile_id,
+                is_active=True,
+                product__is_active=True,
+            )
+            .exclude(variant_id__in=linked_variant_ids)
+            .order_by('product__name', 'display_name')
+        )
+        return Response(
+            [
+                {
+                    'id': str(variant.variant_id),
+                    'display_name': variant.display_name,
+                    'product_id': str(variant.product_id),
+                    'product_name': variant.product.name,
+                    'sku': variant.variant_sku,
+                    'barcode': variant.variant_barcode or '',
+                    'image_url': variant.image_url or '',
+                }
+                for variant in variants
+            ]
+        )
+
     def _get_requested_structural_locations(self):
         profile_id = get_request_profile_id(self.request, as_str=False)
         if not profile_id:
@@ -340,10 +376,25 @@ class InventoryItemViewSet(BaseInventoryViewSet):
             return structural_locations[0], structural_locations
         return None, []
 
+    def paginate_queryset(self, queryset):
+        page = super().paginate_queryset(queryset)
+        # The list serializer needs stock totals, but a paged request must not
+        # build them for every inventory item in the tenant.
+        if page is not None:
+            self._inventory_summary_items = list(page)
+        return page
+
     def get_serializer_context(self):
         context = super().get_serializer_context()
         stock_location, stock_locations = self._get_inventory_scope()
-        queryset = list(self.filter_queryset(self.get_queryset())) if self.action in {'list', 'low_stock', 'needs_reorder'} else []
+        if hasattr(self, '_inventory_summary_items'):
+            queryset = self._inventory_summary_items
+        elif self.action in {'list', 'low_stock', 'needs_reorder'}:
+            # Preserve the legacy unpaged contract until every selector caller
+            # has intentionally migrated to the page envelope.
+            queryset = list(self.filter_queryset(self.get_queryset()))
+        else:
+            queryset = []
         if self.action in {'retrieve', 'minimal_item', 'stock_summary'} and getattr(self, 'kwargs', {}).get('pk'):
             try:
                 queryset = [self.get_object()]

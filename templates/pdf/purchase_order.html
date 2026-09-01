@@ -1,4 +1,3 @@
-{% load math_filters %}
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -107,27 +106,19 @@
 <header>
     <div class="header-info">
         <div class="company-info">
-            <h1>{{ company_profile.name }}</h1>
-            {% if company_profile.headquarters_address %}
-            {% with addr=company_profile.headquarters_address %}
-            {% if addr.apartment_number %}
-                Apt. {{ addr.apartment_number }}<br>
+            {% if company_logo_url %}
+            <img src="{{ company_logo_url }}" alt="{{ company_name }} logo" style="display:block;max-width:180px;max-height:72px;margin:0 0 12px;object-fit:contain;object-position:left center;">
             {% endif %}
-            {% if addr.street_number %}
-                {{ addr.street_number }},
-            {% endif %}
-            {{ addr.street }}<br>
-            {{ addr.city }},  {{ addr.subregion }}, {{ addr.state }} {{ addr.postal_code }}<br>
-            {{ addr.country }}
-            {% endwith %}
-            
+            <h1>{{ company_name }}</h1>
+            {% if company_address %}
+            <p>{{ company_address|linebreaksbr }}</p>
             {% endif %}
         </div>
         
         <div>
             <h1>PURCHASE ORDER</h1>
             <p><strong>PO Number:</strong> {{ po.reference }}</p>
-            <p><strong>Date Issued:</strong> {{ po.issue_date|date:"M d, Y" }}</p>
+            <p><strong>Date Issued:</strong> {% if po.issue_date %}{{ po.issue_date|date:"M d, Y" }}{% else %}Not issued{% endif %}</p>
             {% if po.delivery_date %}
                 <p><strong>Delivery Date:</strong> {{ po.delivery_date|date:"M d, Y" }}</p>
             {% endif %}
@@ -140,10 +131,8 @@
         <h3>Supplier Information</h3>
         <p>
             {{ po.supplier.name }}<br>
-            {% if po.supplier.address %}
-                {{ po.supplier.address.street }}<br>
-                {{ po.supplier.address.city }}, {{ po.supplier.address.state }}<br>
-                {{ po.supplier.address.country }}<br>
+            {% if supplier_address %}
+                {{ supplier_address|linebreaksbr }}<br>
             {% endif %}
             {% if po.contact %}
                 Attn: {{ po.contact.name }}<br>
@@ -155,20 +144,10 @@
     <div>
         <h3>Shipping Address</h3>
         <p>
-            {% if po.delivery_address %}
-                {{ po.delivery_address|linebreaksbr }}
+            {% if shipping_address %}
+                {{ shipping_address|linebreaksbr }}
             {% else %}
-                {% with addr=company_profile.headquarters_address %}
-                    {% if addr.apartment_number %}
-                        Apt. {{ addr.apartment_number }}<br>
-                    {% endif %}
-                    {% if addr.street_number %}
-                        {{ addr.street_number }},
-                    {% endif %}
-                    {{ addr.street }}<br>
-                    {{ addr.city }},  {{ addr.subregion }}, {{ addr.state }} {{ addr.postal_code }}<br>
-                    {{ addr.country }}
-                {% endwith %}
+                Not specified
             {% endif %}
         </p>
     </div>
@@ -180,10 +159,10 @@
             <th class="col-1">#</th>
             <th class="col-2">Item Code</th>
             <th class="col-3">Qty</th>
-            <th class="col-4">Unit Price ({{po.supplier.currency.code}})</th>
-            <th class="col-5">Discount ({{po.supplier.currency.code}})</th>
-            <th class="col-6">Tax ({{po.supplier.currency.code}})</th>
-            <th class="col-7">Total ({{po.supplier.currency.code}})</th>
+            <th class="col-4">Unit Price ({{ currency_code }})</th>
+            <th class="col-5">Discount ({{ currency_code }})</th>
+            <th class="col-6">Tax ({{ currency_code }})</th>
+            <th class="col-7">Total ({{ currency_code }})</th>
             <!-- <th class="col-2">Packaging</th> -->
             <th class="col-8">Description</th>
         </tr>
@@ -200,6 +179,10 @@
             <td>{{ item.total_price }}</td>
             <td>{{ item.inventory_item.description|truncatechars:100 }}</td>
         </tr>
+        {% empty %}
+        <tr>
+            <td colspan="8">No line items were recorded for this purchase order.</td>
+        </tr>
         {% endfor %}
     </tbody>
 </table>
@@ -207,19 +190,19 @@
 <table class="totals-table">
     <tr>
         <td><strong>Subtotal:</strong></td>
-        <td>{{po.supplier.currency.code}} {{ po.total_price|add:discount|sub:tax }}</td>
+        <td>{{ currency_code }} {{ subtotal }}</td>
     </tr>
     <tr>
         <td><strong>Total Discount:</strong></td>
-        <td>{{po.supplier.currency.code}} {{ discount }}</td>
+        <td>{{ currency_code }} {{ discount }}</td>
     </tr>
     <tr>
         <td><strong>Total Tax:</strong></td>
-        <td>{{po.supplier.currency.code}} {{ tax }}</td>
+        <td>{{ currency_code }} {{ tax }}</td>
     </tr>
     <tr>
         <td><strong>Grand Total:</strong></td>
-        <td>{{po.supplier.currency.code}} {{ po.total_price }}</td>
+        <td>{{ currency_code }} {{ po.total_price }}</td>
     </tr>
 </table>
 <!-- I want from this section of the code to appear on a new page in the pdf -->
@@ -236,18 +219,18 @@
 </div>
 <p class="validity">
     <strong>Order Valid Until:</strong> 
-    {{ po.issue_date|add_days:30|date:"M d, Y" }}
+    {{ valid_until|date:"M d, Y" }}
 </p>
 
 <div class="currency-notice">
-    <p>All amounts in {{ po.supplier.currency.code }} unless otherwise stated</p>
+    <p>All amounts in {{ currency_code }} unless otherwise stated</p>
 </div>
 <div class="notes">
     <h3>Special Instructions</h3>
     <p>{{ po.notes|default:"No special instructions"|linebreaks }}</p>
 </div>
 <div class="tax-info">
-    <p>Withholding Tax Certificate: {{ company_profile.tax_id }}</p>
+    <p>Withholding Tax Certificate: Not specified</p>
 </div>
 <div class="returns">
     <h3>Return Policy</h3>
@@ -258,12 +241,12 @@
 </div>
 <div class="references">
     <p>
-        <strong>Contract #:</strong> {{ po.responsible.first_name }} {{ po.responsible.email }}<br>
+        <strong>Contract #:</strong> {{ po.responsible|default:"Not specified" }}<br>
         <strong>RFQ #:</strong> {{ po.reference|default:"N/A" }}
     </p>
 </div>
 <div class="footer">
-    <p>{{ company_profile.name }} | {{ company_profile.phone }} | {{ company_profile.email }}</p>
+    <p>{{ company_name }}</p>
     <p>This is an automatically generated purchase order. Please contact us for any discrepancies.</p>
 </div>
 </div>

@@ -1,7 +1,35 @@
 from django.core.exceptions import FieldDoesNotExist
+from django.conf import settings
 from django.db.models import Q
 from rest_framework.exceptions import AuthenticationFailed
 from rest_framework_simplejwt.tokens import UntypedToken
+import jwt
+
+
+def _get_authorization_context(request):
+    token = request.META.get("HTTP_X_INTERA_AUTHORIZATION_CONTEXT") or request.headers.get(
+        "X-Intera-Authorization-Context"
+    )
+    if not token:
+        return {}
+    try:
+        context = jwt.decode(
+            token,
+            getattr(settings, "JWT_VERIFYING_KEY", None),
+            algorithms=[getattr(settings, "JWT_ALGORITHM", "RS256")],
+            options={"verify_aud": False, "verify_iss": False},
+        )
+        access = _get_token_payload(request)
+        if context.get("token_type") != "intera_authorization_context" or str(context.get("user_id") or "") not in {
+            str(access.get("user_id") or getattr(request.user, "id", "")),
+            str(getattr(request.user, "id", "")),
+        }:
+            return {}
+        if str(context.get("profile_id") or "") != str(access.get("profile_id") or ""):
+            return {}
+        return context
+    except Exception:
+        return {}
 
 
 def _get_token_payload(request):
@@ -56,10 +84,14 @@ def get_request_user_id(request, *, required=False, as_str=True):
 
 
 def get_request_permissions(request):
-    permissions = get_request_claim(request, "permissions", [])
-    if not permissions:
-        return set()
-    return set(permissions)
+    claims = _get_token_payload(request)
+    permissions = set(claims.get("permissions") or [])
+    context = _get_authorization_context(request)
+    permissions.update(context.get("permissions") or [])
+    wildcard_permissions = context.get("wildcard_permissions") or {}
+    for wildcard in context.get("wildcards") or []:
+        permissions.update(wildcard_permissions.get(wildcard) or [])
+    return permissions
 
 
 def get_request_owner_id(request, *, as_str=True):

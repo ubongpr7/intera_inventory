@@ -37,6 +37,9 @@ def _sync_profile_lookup_value(value):
 
 class Address(models.Model):
 
+    # Legacy model retained during migration; the shared service owns the record.
+    address_id = models.UUIDField(null=True, blank=True, db_index=True)
+
     
     country = models.CharField(
         max_length=255,

@@ -99,6 +99,9 @@ class StockLocationType(models.Model):
         return self.name
 
 class StockLocation(ProfileMixin, MPTTModel):
+    # Opaque reference to the shared subscription address; physical_address remains
+    # temporarily for backwards-compatible reads and migration rollback.
+    address_id = models.UUIDField(null=True, blank=True, db_index=True)
     is_default_structural_location = models.BooleanField(
         default=False,
         db_index=True,

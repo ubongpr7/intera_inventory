@@ -10,9 +10,11 @@ from django.test import SimpleTestCase, TestCase
 from rest_framework.test import APIRequestFactory, force_authenticate
 
 from mainapps.inventory.models import InventoryCategory, InventoryItem, InventoryPlacement
+from mainapps.company.models import Company
+from mainapps.company.views import CompanyViewSet
 from mainapps.projections.models import CatalogProductProjection, CatalogVariantProjection
 from mainapps.stock.models import StockBalance, StockLocation
-from mainapps.inventory.views import InventoryItemViewSet, get_inventory_setup_summary
+from mainapps.inventory.views import BaseInventoryViewSet, InventoryItemViewSet, get_inventory_setup_summary
 from subapps.kafka.consumers.catalog import handle_catalog_variant_event
 from subapps.kafka.producers.inventory import _resolve_catalog_variant
 from subapps.services.location_scope import ensure_inventory_item_placement, get_workspace_default_structural_location
@@ -58,6 +60,251 @@ class IdentityScopeTests(TestCase):
         )
 
         self.assertEqual(list(scoped.values_list("id", flat=True)), [matching_item.id])
+
+
+class BaseInventoryViewSetCacheInvalidationTests(SimpleTestCase):
+    def test_create_invalidates_cached_lists_after_saving(self):
+        view = BaseInventoryViewSet()
+        view.request = MagicMock()
+        serializer = MagicMock()
+
+        with (
+            patch("mainapps.inventory.views.get_request_profile_id", return_value=4),
+            patch("mainapps.inventory.views.get_request_user_id", return_value=7),
+            patch.object(view, "_invalidate_cache") as invalidate_cache,
+        ):
+            view.perform_create(serializer)
+
+        serializer.save.assert_called_once_with(
+            profile_id=4,
+            created_by_user_id=7,
+            updated_by_user_id=7,
+        )
+        invalidate_cache.assert_called_once_with()
+
+    def test_update_invalidates_cached_lists_after_saving(self):
+        view = BaseInventoryViewSet()
+        view.request = MagicMock()
+        serializer = MagicMock()
+
+        with (
+            patch("mainapps.inventory.views.get_request_user_id", return_value=7),
+            patch.object(view, "_invalidate_cache") as invalidate_cache,
+        ):
+            view.perform_update(serializer)
+
+        serializer.save.assert_called_once_with(updated_by_user_id=7)
+        invalidate_cache.assert_called_once_with()
+
+
+class InventoryListServerFilterTests(TestCase):
+    def setUp(self):
+        self.factory = APIRequestFactory()
+
+    def _request(self, path):
+        request = self.factory.get(path)
+        force_authenticate(
+            request,
+            user=None,
+            token={
+                "profile_id": 1,
+                "user_id": 1,
+                "owner_id": 1,
+                "permissions": ["read_inventory_item"],
+            },
+        )
+        return request
+
+    def test_list_scopes_then_applies_page_search_filters_and_ordering(self):
+        matching_item = InventoryItem.objects.create(
+            profile_id=1,
+            name_snapshot="Alpha Cable",
+            inventory_type="raw_material",
+            status="active",
+        )
+        InventoryItem.objects.create(
+            profile_id=1,
+            name_snapshot="Alpha Finished Good",
+            inventory_type="finished_good",
+            status="active",
+        )
+        InventoryItem.objects.create(
+            profile_id=2,
+            name_snapshot="Alpha Other Tenant",
+            inventory_type="raw_material",
+            status="active",
+        )
+
+        response = InventoryItemViewSet.as_view({"get": "list"})(
+            self._request(
+                "/inventory_api/items/?page=1&page_size=20&search=alpha&"
+                "inventory_type=raw_material&status=active&ordering=name_snapshot"
+            )
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["count"], 1)
+        self.assertEqual(response.data["page"], 1)
+        self.assertEqual(response.data["page_size"], 20)
+        self.assertEqual(response.data["results"][0]["id"], str(matching_item.id))
+
+    @patch("mainapps.inventory.views.get_inventory_item_summary_map")
+    def test_paged_list_builds_stock_summaries_for_only_the_current_page(self, summary_map):
+        first_item = InventoryItem.objects.create(profile_id=1, name_snapshot="First item")
+        InventoryItem.objects.create(profile_id=1, name_snapshot="Second item")
+
+        def build_summary(items, **_kwargs):
+            return {item.id: {} for item in items}
+
+        summary_map.side_effect = build_summary
+
+        response = InventoryItemViewSet.as_view({"get": "list"})(
+            self._request("/inventory_api/items/?page=1&page_size=1&ordering=name_snapshot")
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["count"], 2)
+        self.assertEqual(response.data["results"][0]["id"], str(first_item.id))
+        self.assertEqual(
+            [item.id for item in summary_map.call_args.args[0]],
+            [first_item.id],
+        )
+
+
+class CompanyListServerFilterTests(TestCase):
+    def setUp(self):
+        self.factory = APIRequestFactory()
+
+    def _request(self, path):
+        request = self.factory.get(path)
+        force_authenticate(
+            request,
+            user=None,
+            token={
+                "profile_id": 1,
+                "user_id": 1,
+                "owner_id": 1,
+                "permissions": ["read_company"],
+            },
+        )
+        return request
+
+    def test_company_directory_does_not_cache_operational_partner_lists(self):
+        self.assertFalse(CompanyViewSet.CACHE_ENABLED)
+
+    def test_company_list_scopes_then_applies_page_search_filter_and_ordering(self):
+        matching_company = Company.objects.create(
+            profile_id=1,
+            name="Acme Supplier",
+            email="purchasing@acme.test",
+            is_supplier=True,
+        )
+        Company.objects.create(profile_id=1, name="Acme Customer", is_customer=True)
+        Company.objects.create(profile_id=2, name="Acme Other Tenant", is_supplier=True)
+
+        response = CompanyViewSet.as_view({"get": "list"})(
+            self._request(
+                "/company_api/companies/?page=1&page_size=20&search=acme&"
+                "is_supplier=true&ordering=name"
+            )
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["count"], 1)
+        self.assertEqual(response.data["page"], 1)
+        self.assertEqual(response.data["page_size"], 20)
+        self.assertEqual(response.data["results"][0]["id"], str(matching_company.id))
+
+
+class ManualCatalogVariantInventoryLinkTests(TestCase):
+    def setUp(self):
+        self.factory = APIRequestFactory()
+        self.product = CatalogProductProjection.objects.create(
+            product_id="22222222-2222-2222-2222-222222222222",
+            profile_id=1,
+            name="QA Product",
+            track_stock=False,
+            is_active=True,
+        )
+        self.available_variant = CatalogVariantProjection.objects.create(
+            variant_id="11111111-1111-1111-1111-111111111111",
+            product=self.product,
+            profile_id=1,
+            display_name="QA Product - Available",
+            variant_sku="QA-AVAILABLE",
+            variant_barcode="QA-001",
+            image_url="https://example.com/available.jpg",
+            is_active=True,
+        )
+        self.linked_variant = CatalogVariantProjection.objects.create(
+            variant_id="33333333-3333-3333-3333-333333333333",
+            product=self.product,
+            profile_id=1,
+            display_name="QA Product - Linked",
+            variant_sku="QA-LINKED",
+            is_active=True,
+        )
+        InventoryItem.objects.create(
+            profile_id=1,
+            product_template_id=self.product.product_id,
+            product_variant_id=self.linked_variant.variant_id,
+            name_snapshot=self.linked_variant.display_name,
+        )
+
+    def _request(self, method, path, data=None):
+        request = getattr(self.factory, method)(path, data or {}, format="json")
+        force_authenticate(
+            request,
+            user=None,
+            token={
+                "profile_id": 1,
+                "user_id": 1,
+                "owner_id": 1,
+                "permissions": ["create_inventory_item", "read_inventory_item"],
+            },
+        )
+        return request
+
+    def test_available_catalog_variants_excludes_existing_inventory_links(self):
+        response = InventoryItemViewSet.as_view({"get": "available_catalog_variants"})(
+            self._request("get", "/inventory_api/items/available-catalog-variants/")
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.data,
+            [
+                {
+                    "id": str(self.available_variant.variant_id),
+                    "display_name": "QA Product - Available",
+                    "product_id": str(self.product.product_id),
+                    "product_name": "QA Product",
+                    "sku": "QA-AVAILABLE",
+                    "barcode": "QA-001",
+                    "image_url": "https://example.com/available.jpg",
+                }
+            ],
+        )
+
+    @patch("mainapps.inventory.views.publish_inventory_admin_event")
+    def test_create_from_variant_sets_canonical_catalog_snapshots(self, publish_inventory_admin_event):
+        response = InventoryItemViewSet.as_view({"post": "create"})(
+            self._request(
+                "post",
+                "/inventory_api/items/",
+                {"product_variant_id": str(self.available_variant.variant_id)},
+            )
+        )
+
+        self.assertEqual(response.status_code, 201, response.data)
+        item = InventoryItem.objects.get(product_variant_id=self.available_variant.variant_id)
+        self.assertEqual(str(item.product_template_id), str(self.product.product_id))
+        self.assertEqual(item.name_snapshot, "QA Product - Available")
+        self.assertEqual(item.sku_snapshot, "QA-AVAILABLE")
+        self.assertEqual(item.barcode_snapshot, "QA-001")
+        self.assertEqual(item.product_variant_image_url, "https://example.com/available.jpg")
+        self.assertEqual(item.metadata["source"], "catalog_variant_selection")
+        publish_inventory_admin_event.assert_called_once()
 
 
 class CatalogVariantInventoryLinkTests(TestCase):

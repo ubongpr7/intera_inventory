@@ -4,10 +4,11 @@ from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from django.test import SimpleTestCase
+from django.test import SimpleTestCase, TransactionTestCase
 from starlette.testclient import TestClient
 
 from mainapps.inventory.models import InventoryItem
+from mainapps.stock.models import StockBalance, StockLocation
 from mcp_server.server import (
     InventoryMcpPrincipal,
     _adjust_inventory_item_stock_via_view_sync,
@@ -16,6 +17,7 @@ from mcp_server.server import (
     _create_stock_reservation_via_view_sync,
     _extract_bearer_token,
     _inventory_item_payload,
+    _get_stock_risk_sync,
     _invoke_view_action_sync,
     _principal_var,
     app as inventory_mcp_app,
@@ -120,6 +122,51 @@ class InventoryMcpSerializationTests(SimpleTestCase):
         self.assertEqual(payload["quantity"], 18.0)
         self.assertEqual(payload["lot_count"], 2)
         self.assertEqual(payload["location_breakdown"][0]["location_name"], "Rack B")
+
+
+class InventoryMcpStockRiskTests(TransactionTestCase):
+    def test_stock_risk_excludes_unallocated_items_but_keeps_zero_balances(self):
+        profile_id = 8675309
+        principal = InventoryMcpPrincipal(
+            token="jwt-token",
+            claims={},
+            user_id="1",
+            profile_id=profile_id,
+            company_code=None,
+            permissions=set(),
+        )
+        location = StockLocation.objects.create(profile_id=profile_id, name="QA Shelf")
+        unallocated_item = InventoryItem.objects.create(
+            profile_id=profile_id,
+            name_snapshot="Unallocated catalog item",
+        )
+        zero_balance_item = InventoryItem.objects.create(
+            profile_id=profile_id,
+            name_snapshot="Tracked zero-balance item",
+        )
+        StockBalance.objects.create(
+            profile_id=profile_id,
+            inventory_item=zero_balance_item,
+            stock_location=location,
+            quantity_on_hand=Decimal("0"),
+        )
+
+        payload = _get_stock_risk_sync(
+            principal=principal,
+            limit=25,
+            expiring_days=30,
+        )
+
+        self.assertEqual(payload["summary"]["out_of_stock_count"], 1)
+        self.assertEqual(
+            [item["id"] for item in payload["risk_items"]["out_of_stock"]],
+            [str(zero_balance_item.id)],
+        )
+        self.assertEqual(
+            payload["risk_items"]["out_of_stock"][0]["location_name"],
+            "QA Shelf",
+        )
+        self.assertNotIn(str(unallocated_item.id), [item["id"] for item in payload["risk_items"]["out_of_stock"]])
 
 
 class InventoryMcpToolTests(SimpleTestCase):

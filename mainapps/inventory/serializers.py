@@ -3,7 +3,9 @@ from decimal import Decimal
 from rest_framework import serializers
 
 from mainapps.content_type_linking_models.serializers import UserDetailMixin
+from mainapps.projections.models import CatalogVariantProjection
 from subapps.services.inventory_read_model import get_inventory_item_summary_map
+from subapps.utils.request_context import get_request_profile_id
 
 from .models import InventoryCategory, InventoryItem
 
@@ -122,7 +124,16 @@ class InventoryDetailSerializer(InventoryItemSummaryMixin, UserDetailMixin, seri
     class Meta:
         model = InventoryItem
         fields = '__all__'
-        read_only_fields = ['created_at', 'updated_at']
+        read_only_fields = [
+            'profile_id',
+            'created_by_user_id',
+            'updated_by_user_id',
+            'created_at',
+            'updated_at',
+        ]
+        extra_kwargs = {
+            'name_snapshot': {'required': False},
+        }
 
     def get_current_stock(self, obj):
         return self._get_summary(obj).get('quantity', Decimal('0'))
@@ -151,6 +162,66 @@ class InventoryDetailSerializer(InventoryItemSummaryMixin, UserDetailMixin, seri
             'serial_count': summary.get('serial_count', 0),
             'last_movement_at': summary.get('last_movement_at'),
         }
+
+    def validate(self, attrs):
+        """Keep manual inventory creation aligned with the catalog projection."""
+        variant_id = attrs.get('product_variant_id')
+        if variant_id is None:
+            if self.instance is None and not attrs.get('name_snapshot'):
+                raise serializers.ValidationError(
+                    {'name_snapshot': 'Enter a name or select a product variant to create an inventory item.'}
+                )
+            return attrs
+
+        request = self.context.get('request')
+        profile_id = get_request_profile_id(request, as_str=False) if request is not None else None
+        if not profile_id:
+            raise serializers.ValidationError({'product_variant_id': 'A workspace context is required to link a product variant.'})
+
+        variant = (
+            CatalogVariantProjection.objects.select_related('product')
+            .filter(
+                profile_id=profile_id,
+                variant_id=variant_id,
+                is_active=True,
+                product__is_active=True,
+            )
+            .first()
+        )
+        if variant is None:
+            raise serializers.ValidationError(
+                {'product_variant_id': 'Select an active product variant from this workspace.'}
+            )
+
+        duplicate = InventoryItem.objects.filter(
+            profile_id=profile_id,
+            product_variant_id=variant.variant_id,
+        )
+        if self.instance is not None:
+            duplicate = duplicate.exclude(pk=self.instance.pk)
+        if duplicate.exists():
+            raise serializers.ValidationError({'product_variant_id': 'This product variant already has an inventory item.'})
+
+        attrs.update(
+            {
+                'product_template_id': variant.product_id,
+                'name_snapshot': variant.display_name,
+                'sku_snapshot': variant.variant_sku or '',
+                'barcode_snapshot': variant.variant_barcode or '',
+                'product_variant_image_url': variant.image_url or '',
+                'track_stock': True,
+            }
+        )
+        metadata = dict(attrs.get('metadata') or {})
+        metadata.update(
+            {
+                'source': 'catalog_variant_selection',
+                'catalog_variant_id': str(variant.variant_id),
+                'catalog_product_id': str(variant.product_id),
+            }
+        )
+        attrs['metadata'] = metadata
+        return attrs
 
 
 class InventoryAnalyticsSerializer(serializers.Serializer):

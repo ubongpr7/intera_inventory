@@ -338,6 +338,24 @@ class StockDomainService:
                 )
             stock_lot = candidate_balance.stock_lot
 
+        # Some receipts persist a lot even when the item does not require lot
+        # tracking. Transfer from that existing balance instead of creating an
+        # empty non-lot balance and reporting stock as unavailable.
+        if stock_lot is None and not inventory_item.track_lot and not inventory_item.track_serial:
+            candidate_balance = (
+                StockBalance.objects.select_for_update()
+                .filter(
+                    profile_id=profile_id,
+                    inventory_item=inventory_item,
+                    stock_location=from_location,
+                    quantity_available__gte=quantity,
+                )
+                .order_by('created_at')
+                .first()
+            )
+            if candidate_balance is not None:
+                stock_lot = candidate_balance.stock_lot
+
         if stock_lot and stock_lot.inventory_item_id != inventory_item.id:
             raise StockDomainError("Stock lot does not belong to the selected inventory item.")
 
@@ -404,6 +422,7 @@ class StockDomainService:
             updated_by_user_id=actor_user_id,
         )
 
+        cls._publish_inventory_availability_on_commit(inventory_item.id)
         return {
             "inventory_item": inventory_item,
             "source_balance": source_balance,
@@ -708,6 +727,24 @@ class StockDomainService:
                     "Lot-tracked inventory requires a stock lot with enough available quantity to issue."
                 )
             stock_lot = candidate_balance.stock_lot
+
+        # Some legacy receipts recorded lot metadata for products that are not
+        # lot-tracked. Use their available lot-split balance rather than
+        # creating an empty non-lot balance and rejecting a valid issue.
+        if stock_lot is None and not inventory_item.track_lot and not inventory_item.track_serial:
+            candidate_balance = (
+                StockBalance.objects.select_for_update()
+                .filter(
+                    profile_id=profile_id,
+                    inventory_item=inventory_item,
+                    stock_location=stock_location,
+                    quantity_available__gte=quantity,
+                )
+                .order_by('created_at')
+                .first()
+            )
+            if candidate_balance is not None:
+                stock_lot = candidate_balance.stock_lot
 
         if stock_lot and stock_lot.inventory_item_id != inventory_item.id:
             raise StockDomainError("Stock lot does not belong to the selected inventory item.")

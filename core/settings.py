@@ -6,11 +6,26 @@ from pathlib import Path
 from django.core.exceptions import ImproperlyConfigured
 from dotenv import load_dotenv
 import dj_database_url
+from core.security import (
+    env_bool,
+    is_production_environment,
+    validate_notification_delivery_settings,
+    validate_production_settings,
+)
 
 load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-LOCAL_SERVER = os.getenv('LOCAL_SERVER', 'False')=='True'
+LOCAL_SERVER = env_bool(os.getenv("LOCAL_SERVER"))
+DEPLOYMENT_ENVIRONMENT = os.getenv("DJANGO_ENV") or os.getenv("DEPLOYMENT_ENV") or "development"
+IS_PRODUCTION = is_production_environment(DEPLOYMENT_ENVIRONMENT)
+
+
+def _split_csv_env(name: str, default: list[str] | None = None) -> list[str]:
+    value = os.getenv(name)
+    if not value:
+        return list(default or [])
+    return [item.strip() for item in value.split(",") if item.strip()]
 
 
 SECRET_KEY = os.getenv('SECRET_KEY')
@@ -18,7 +33,7 @@ SECRET_KEY = os.getenv('SECRET_KEY')
 if not SECRET_KEY:
     raise ImproperlyConfigured("SECRET_KEY must be set.")
 
-DEBUG = os.getenv("DEBUG", "False") == "True"
+DEBUG = env_bool(os.getenv("DEBUG"))
 
 # Logging
 # Django's default logging config won't show `logger.info(...)` from our modules unless you
@@ -71,6 +86,8 @@ _default_allowed_hosts = [
     'dev.inventory.interaims.com',
 ]
 _allowed_hosts_env = os.getenv("ALLOWED_HOSTS", "").strip()
+if IS_PRODUCTION and not _allowed_hosts_env:
+    raise ImproperlyConfigured("ALLOWED_HOSTS must be explicitly configured when DJANGO_ENV is production.")
 ALLOWED_HOSTS = (
     [host.strip() for host in _allowed_hosts_env.split(",") if host.strip()]
     if _allowed_hosts_env
@@ -252,6 +269,11 @@ EMAIL_SHARED_STATIC_LOCATION = os.getenv(
     os.getenv("AWS_STATIC_LOCATION", "assessment/static"),
 ).strip("/")
 FRONTEND_SITE_URL = os.getenv("FRONTEND_SITE_URL", os.getenv("SITE_URL", "http://localhost:3000")).strip().rstrip("/")
+NOTIFICATION_DOCUMENT_BASE_URL = os.getenv("NOTIFICATION_DOCUMENT_BASE_URL", "").strip().rstrip("/")
+NOTIFICATION_DOCUMENT_SIGNING_SALT = os.getenv("NOTIFICATION_DOCUMENT_SIGNING_SALT", "inventory-notification-document-v1")
+NOTIFICATION_DOCUMENT_URL_TTL_SECONDS = int(os.getenv("NOTIFICATION_DOCUMENT_URL_TTL_SECONDS", "900"))
+PURCHASE_ORDER_EMAIL_DELIVERY_MODE = os.getenv("PURCHASE_ORDER_EMAIL_DELIVERY_MODE", "direct").strip().lower()
+RETURN_ORDER_EMAIL_DELIVERY_MODE = os.getenv("RETURN_ORDER_EMAIL_DELIVERY_MODE", "direct").strip().lower()
 if AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY and AWS_STORAGE_BUCKET_NAME:
     AWS_STATIC_LOCATION = os.getenv("AWS_STATIC_LOCATION", "assessment/static")
     AWS_S3_CUSTOM_DOMAIN = "%s.s3.amazonaws.com" % AWS_STORAGE_BUCKET_NAME
@@ -359,20 +381,20 @@ SIMPLE_JWT = {
 AUTH_COOKIE='access'
 AUTH_COOKIE_ACCESS_MAX_AGE=60*10
 AUTH_COOKIE_REFRESH_MAX_AGE=60*60*24
-AUTH_COOKIE_SECURE=False 
+AUTH_COOKIE_SECURE=env_bool(os.getenv("AUTH_COOKIE_SECURE"), default=IS_PRODUCTION)
 AUTH_COOKIE_HTTP_ONLY=True
 AUTH_COOKIE_PATH='/'
-AUTH_COOKIE_SAMESITE='None'
+AUTH_COOKIE_SAMESITE=os.getenv("AUTH_COOKIE_SAMESITE", "Lax" if IS_PRODUCTION else "None")
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': (
         'rest_framework_simplejwt.authentication.JWTStatelessUserAuthentication',
     )
 }
 
-CORS_ALLOW_ALL_ORIGINS=os.getenv('CORS_ALLOW_ALL_ORIGINS', 'False')=='True'
+CORS_ALLOW_ALL_ORIGINS=env_bool(os.getenv("CORS_ALLOW_ALL_ORIGINS"))
 CORS_ORIGIN_ALLOW_ALL=CORS_ALLOW_ALL_ORIGINS
 
-CORS_ALLOW_CREDENTIALS=os.getenv('CORS_ALLOW_CREDENTIALS', 'True')=='True'
+CORS_ALLOW_CREDENTIALS=env_bool(os.getenv("CORS_ALLOW_CREDENTIALS"), default=True)
 
 CORS_ALLOW_METHODS = (
     "DELETE",
@@ -395,34 +417,68 @@ CORS_ALLOW_HEADERS = [
     'x-device-id',
 ]
 
-CORS_ALLOWED_ORIGINS = [
+_default_cors_allowed_origins = [
     "http://localhost:3000",
     "http://10.0.2.2:3000",
     "http://10.0.2.2:8080",
     'https://interaims.com',
     'https://www.interaims.com',
     'https://dev.interaims.com'
-    ]
+]
+CORS_ALLOWED_ORIGINS = _split_csv_env(
+    "CORS_ALLOWED_ORIGINS",
+    [] if IS_PRODUCTION else _default_cors_allowed_origins,
+)
+CSRF_TRUSTED_ORIGINS = _split_csv_env("CSRF_TRUSTED_ORIGINS", CORS_ALLOWED_ORIGINS)
 
 # Security / HTTPS.
 # For local development (`DEBUG=True` or `LOCAL_SERVER=True`), force these off to avoid
 # confusing localhost HTTPS redirects and missing cookies.
-SECURE_SSL_REDIRECT = os.getenv("SECURE_SSL_REDIRECT", "False") == "True"
+SECURE_SSL_REDIRECT = env_bool(os.getenv("SECURE_SSL_REDIRECT"), default=IS_PRODUCTION)
 
 SECURE_PROXY_SSL_HEADER = (
     ("HTTP_X_FORWARDED_PROTO", "https")
-    if os.getenv("SECURE_PROXY_SSL_HEADER_ENABLED", "False") == "True"
+    if env_bool(os.getenv("SECURE_PROXY_SSL_HEADER_ENABLED"), default=IS_PRODUCTION)
     else None
 )
 
-SESSION_COOKIE_SECURE = os.getenv("SESSION_COOKIE_SECURE", "False") == "True"
-CSRF_COOKIE_SECURE = os.getenv("CSRF_COOKIE_SECURE", "False") == "True"
+SESSION_COOKIE_SECURE = env_bool(os.getenv("SESSION_COOKIE_SECURE"), default=IS_PRODUCTION)
+CSRF_COOKIE_SECURE = env_bool(os.getenv("CSRF_COOKIE_SECURE"), default=IS_PRODUCTION)
+SECURE_HSTS_SECONDS = int(os.getenv("SECURE_HSTS_SECONDS", "31536000" if IS_PRODUCTION else "0"))
+SECURE_HSTS_INCLUDE_SUBDOMAINS = env_bool(os.getenv("SECURE_HSTS_INCLUDE_SUBDOMAINS"), default=IS_PRODUCTION)
+SECURE_HSTS_PRELOAD = env_bool(os.getenv("SECURE_HSTS_PRELOAD"), default=IS_PRODUCTION)
+SECURE_CONTENT_TYPE_NOSNIFF = True
+SECURE_REFERRER_POLICY = "same-origin"
 
 if DEBUG or LOCAL_SERVER:
     SECURE_SSL_REDIRECT = False
     SECURE_PROXY_SSL_HEADER = None
     SESSION_COOKIE_SECURE = False
     CSRF_COOKIE_SECURE = False
+    AUTH_COOKIE_SECURE = False
+    SECURE_HSTS_SECONDS = 0
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = False
+
+if IS_PRODUCTION:
+    validate_production_settings(
+        debug=DEBUG,
+        local_server=LOCAL_SERVER,
+        allowed_hosts=ALLOWED_HOSTS,
+        cors_allow_all=CORS_ALLOW_ALL_ORIGINS,
+        cors_allowed_origins=CORS_ALLOWED_ORIGINS,
+        csrf_trusted_origins=CSRF_TRUSTED_ORIGINS,
+        secure_ssl_redirect=SECURE_SSL_REDIRECT,
+        session_cookie_secure=SESSION_COOKIE_SECURE,
+        csrf_cookie_secure=CSRF_COOKIE_SECURE,
+        auth_cookie_secure=AUTH_COOKIE_SECURE,
+        hsts_seconds=SECURE_HSTS_SECONDS,
+    )
+    validate_notification_delivery_settings(
+        purchase_order_mode=PURCHASE_ORDER_EMAIL_DELIVERY_MODE,
+        return_order_mode=RETURN_ORDER_EMAIL_DELIVERY_MODE,
+        document_base_url=NOTIFICATION_DOCUMENT_BASE_URL,
+        signing_salt=NOTIFICATION_DOCUMENT_SIGNING_SALT,
+    )
 FILE_UPLOAD_TIMEOUT = 3600
 DATA_UPLOAD_MAX_MEMORY_SIZE = 2147483648  # 2GB
 FILE_UPLOAD_MAX_MEMORY_SIZE = 2147483648  # 2GB

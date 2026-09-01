@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from uuid import UUID
 from typing import Any
 
 from django.db import transaction
@@ -31,9 +32,19 @@ def _profile_defaults(payload: dict[str, Any]) -> dict[str, Any]:
     company_code = payload.get("company_code")
     if not company_code:
         raise ValueError("Identity company profile payload must include company_code.")
+    headquarters_address = payload.get("headquarters_address")
+    raw_address_id = payload.get("headquarters_address_id")
+    try:
+        headquarters_address_id = UUID(str(raw_address_id)) if raw_address_id else None
+    except (TypeError, ValueError):
+        logger.warning("Ignoring invalid headquarters_address_id=%r for profile=%s", raw_address_id, payload.get("profile_id"))
+        headquarters_address_id = None
     return {
         "company_code": company_code,
         "display_name": payload.get("display_name") or company_code,
+        "logo_url": payload.get("logo_url") or "",
+        "headquarters_address": headquarters_address if isinstance(headquarters_address, dict) else {},
+        "headquarters_address_id": headquarters_address_id,
         "owner_user_id": payload.get("owner_user_id"),
         "is_active": bool(payload.get("is_active", True)),
     }

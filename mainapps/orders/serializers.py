@@ -23,8 +23,13 @@ class StructuralLocationSerializerMixin:
     def _get_structural_location(self, stock_location):
         if not stock_location:
             return None
-        if getattr(stock_location, 'structural', False):
-            return stock_location
+
+        current = stock_location
+        # List querysets select the short parent chain needed for these summaries.
+        while current is not None:
+            if getattr(current, 'structural', False):
+                return current
+            current = getattr(current, 'parent', None)
         return stock_location.get_ancestors(include_self=True).filter(structural=True).last()
 
     def _structural_location_id(self, stock_location):
@@ -324,33 +329,39 @@ class GoodsReceiptListSerializer(StructuralLocationSerializerMixin, UserDetailMi
     def get_received_by_details(self, obj):
         return self.get_user_details(obj.received_by_user_id)
 
+    def _receipt_lines(self, obj):
+        prefetched = getattr(obj, '_prefetched_objects_cache', {}).get('lines')
+        if prefetched is not None:
+            return prefetched
+        lines = obj.lines
+        return list(lines.all()) if hasattr(lines, 'all') else list(lines)
+
     def get_line_count(self, obj):
-        return obj.lines.count()
+        return len(self._receipt_lines(obj))
 
     def get_total_quantity(self, obj):
-        total = sum((line.received_quantity for line in obj.lines.all()), Decimal('0'))
+        total = sum((line.received_quantity for line in self._receipt_lines(obj)), Decimal('0'))
         return str(total)
 
     def get_location_count(self, obj):
-        return obj.lines.values('stock_location_id').distinct().count()
+        return len({line.stock_location_id for line in self._receipt_lines(obj) if line.stock_location_id})
 
     def get_inventory_preview(self, obj):
-        return list(
-            obj.lines.select_related('inventory_item')
-            .values_list('inventory_item__name_snapshot', flat=True)
-            .distinct()[:3]
-        )
+        return list(dict.fromkeys(
+            line.inventory_item.name_snapshot
+            for line in self._receipt_lines(obj)
+            if getattr(line, 'inventory_item', None) and line.inventory_item.name_snapshot
+        ))[:3]
 
     def get_location_preview(self, obj):
-        return list(
-            obj.lines.select_related('stock_location')
-            .values_list('stock_location__name', flat=True)
-            .distinct()[:3]
-        )
+        return list(dict.fromkeys(
+            line.stock_location.name
+            for line in self._receipt_lines(obj)
+            if getattr(line, 'stock_location', None) and line.stock_location.name
+        ))[:3]
 
     def get_structural_location_preview(self, obj):
-        lines = list(obj.lines.select_related('stock_location')[:10])
-        return self._collect_structural_preview(lines)
+        return self._collect_structural_preview(self._receipt_lines(obj)[:10])
 
 
 class GoodsReceiptDetailSerializer(GoodsReceiptListSerializer):
@@ -647,38 +658,39 @@ class PurchaseOrderWorkflowSerializer(serializers.Serializer):
     notify_supplier = serializers.BooleanField(default=True)
 
 
+class ReceivedItemSerializer(serializers.Serializer):
+    line_item_id = serializers.UUIDField()
+    quantity_received = serializers.DecimalField(max_digits=15, decimal_places=5, min_value=Decimal("0.00001"))
+    location_id = serializers.UUIDField()
+    unit_cost = serializers.DecimalField(
+        max_digits=15,
+        decimal_places=2,
+        required=False,
+        allow_null=True,
+        min_value=Decimal("0"),
+    )
+    lot_number = serializers.CharField(required=False, allow_blank=True, max_length=100)
+    manufactured_date = serializers.DateField(required=False, allow_null=True)
+    expiry_date = serializers.DateField(required=False, allow_null=True)
+    serial_numbers = serializers.ListField(
+        child=serializers.CharField(max_length=255),
+        required=False,
+        allow_empty=True,
+    )
+    notes = serializers.CharField(required=False, allow_blank=True)
+
+    def validate(self, attrs):
+        _validate_inventory_dates(
+            manufactured_date=attrs.get('manufactured_date'),
+            expiry_date=attrs.get('expiry_date'),
+        )
+        return attrs
+
+
 class ReceiveItemsSerializer(serializers.Serializer):
     """Serializer for receiving purchase order items"""
     structural_location_id = serializers.UUIDField(required=False, allow_null=True)
-    received_items = serializers.ListField(
-        child=serializers.DictField(),
-        help_text="List of items being received"
-    )
-
-    def validate_received_items(self, value):
-        required_fields = ['line_item_id', 'quantity_received', 'location_id']
-        for item in value:
-            for field in required_fields:
-                if field not in item:
-                    raise serializers.ValidationError(
-                        f"Missing required field '{field}' in received items"
-                    )
-            if item['quantity_received'] <= 0:
-                raise serializers.ValidationError(
-                    "Quantity received must be greater than 0"
-                )
-            if item.get('unit_cost') is not None:
-                try:
-                    unit_cost = Decimal(str(item['unit_cost']))
-                except Exception as exc:
-                    raise serializers.ValidationError("Unit cost must be a valid number.") from exc
-                if unit_cost < 0:
-                    raise serializers.ValidationError("Unit cost cannot be negative.")
-            _validate_inventory_dates(
-                manufactured_date=item.get('manufactured_date'),
-                expiry_date=item.get('expiry_date'),
-            )
-        return value
+    received_items = ReceivedItemSerializer(many=True, help_text="List of items being received")
 
 
 class ReturnOrderCreateSerializer(serializers.Serializer):

@@ -11,9 +11,18 @@ from .serializers import CompanyAddressSerializer, CompanySerializer, ContactSer
 from rest_framework.decorators import action
 
 class CompanyViewSet(BaseInventoryViewSet):
+    # Partner records are used immediately by order forms, so a five-minute list
+    # cache can hide a successful create or update from the user.
+    CACHE_ENABLED = False
     serializer_class = CompanySerializer
     queryset=Company.objects.all()
     # required_permission=UNIFIED_PERMISSION_DICT.get('company')
+    # Keep list queries tenant-scoped by BaseInventoryViewSet, then expose only
+    # the fields the company directory can safely filter and sort by.
+    filterset_fields = ['is_customer', 'is_supplier', 'is_manufacturer', 'currency']
+    search_fields = ['name', 'description', 'email', 'phone', 'short_address']
+    ordering_fields = ['name', 'email', 'phone', 'currency']
+    ordering = ['name']
 
     @action(methods=['GET'], detail=True)
     def addresses(self, request, pk=None):

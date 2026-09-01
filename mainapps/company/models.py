@@ -96,8 +96,8 @@ class Contact(UUIDBaseModel):
     """A Contact represents a person who works at a particular company."""
 
     alphanumeric_validator = RegexValidator(
-        regex=r'^[a-zA-Z0-9]*$',
-        message='Only alphanumeric characters are allowed.',
+        regex=r'^[a-zA-Z0-9 ]*$',
+        message='Only letters, numbers, and spaces are allowed.',
         code='invalid_alphanumeric'
     )
 
@@ -126,6 +126,9 @@ class Contact(UUIDBaseModel):
 
 class CompanyAddress(UUIDBaseModel):
     """An address represents a physical location where the company is located."""
+
+    # Authoritative address lives in the shared subscription service.
+    address_id = models.UUIDField(null=True, blank=True, db_index=True)
 
     company = models.ForeignKey(
         Company,

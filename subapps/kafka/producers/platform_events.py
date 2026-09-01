@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, Iterable
 
 from subapps.kafka.client import publish_event
-from subapps.kafka.topics import AUDIT_EVENTS_TOPIC, NOTIFICATION_EVENTS_TOPIC
+from subapps.kafka.topics import AUDIT_EVENTS_TOPIC, NOTIFICATION_DISPATCH_TOPIC, NOTIFICATION_EVENTS_TOPIC
 
 
 def _string(value: Any) -> str:
@@ -126,4 +126,14 @@ def publish_workspace_notification(
             "action_url": action_url or "",
         },
         key=key,
+    )
+
+
+def publish_notification_dispatch(*, payload: dict[str, Any], key: str) -> dict[str, Any]:
+    return publish_event(
+        NOTIFICATION_DISPATCH_TOPIC,
+        "notification.dispatch.requested",
+        payload,
+        key=key,
+        use_outbox=True,
     )

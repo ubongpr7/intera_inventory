@@ -4,7 +4,7 @@ import os
 import secrets
 import uuid
 
-from django.db.models import Q
+from django.db.models import Count, DecimalField, ExpressionWrapper, F, Q, Sum
 from django.http import HttpResponse
 from django.utils import timezone
 from django_filters.rest_framework import DjangoFilterBackend
@@ -25,6 +25,7 @@ from mainapps.stock.models import (
     StockLot,
     StockMovement,
     StockReservation,
+    StockReservationStatus,
     StockSerial,
 )
 from mainapps.stock.serializers import (
@@ -49,6 +50,7 @@ from subapps.kafka.producers.inventory_admin import (
     serialize_stock_reservation,
 )
 from subapps.permissions.constants import UNIFIED_PERMISSION_DICT
+from subapps.pagination import OptionalPageNumberPagination
 from subapps.permissions.constants import CombinedPermissions
 from subapps.permissions.microservice_permissions import BaseCachePermissionViewset, CachingMixin, PermissionRequiredMixin
 from subapps.services.inventory_read_model import (
@@ -439,6 +441,7 @@ class StockLocationViewSet(BaseInventoryViewSet):
 
 class BaseInventoryViewSetMixin(CachingMixin, PermissionRequiredMixin, viewsets.ModelViewSet):
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    pagination_class = OptionalPageNumberPagination
     profile_scope_field = 'profile_id'
     legacy_profile_scope_field = 'profile'
 
@@ -457,6 +460,7 @@ class BaseInventoryViewSetMixin(CachingMixin, PermissionRequiredMixin, viewsets.
 
 class BaseInventoryReadOnlyViewSetMixin(CachingMixin, PermissionRequiredMixin, viewsets.ReadOnlyModelViewSet):
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    pagination_class = OptionalPageNumberPagination
     profile_scope_field = 'profile_id'
     legacy_profile_scope_field = 'profile'
 
@@ -950,6 +954,26 @@ class StockLotViewSet(BaseInventoryReadOnlyViewSetMixin):
     ordering_fields = ['expiry_date', 'remaining_quantity', 'received_quantity', 'created_at']
     ordering = ['expiry_date', '-created_at']
 
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        profile_id = get_request_profile_id(self.request, as_str=False)
+        stock_location_id = _get_scope_location_param(self.request)
+        if profile_id and stock_location_id:
+            scoped_location_ids = _resolve_location_scope_ids(profile_id=profile_id, location_id=stock_location_id)
+            if not scoped_location_ids:
+                return queryset.none()
+            queryset = queryset.filter(stock_balances__stock_location_id__in=scoped_location_ids).distinct()
+
+        date_from = self.request.query_params.get('date_from')
+        if date_from:
+            queryset = queryset.filter(expiry_date__gte=date_from)
+
+        date_to = self.request.query_params.get('date_to')
+        if date_to:
+            queryset = queryset.filter(expiry_date__lte=date_to)
+
+        return queryset
+
 
 class StockSerialViewSet(BaseInventoryReadOnlyViewSetMixin):
     required_permission = UNIFIED_PERMISSION_DICT.get('inventory_item')
@@ -971,6 +995,15 @@ class StockSerialViewSet(BaseInventoryReadOnlyViewSetMixin):
                 profile_id=profile_id,
                 location_id=stock_location_id,
             )
+
+        date_from = self.request.query_params.get('date_from')
+        if date_from:
+            queryset = queryset.filter(created_at__date__gte=date_from)
+
+        date_to = self.request.query_params.get('date_to')
+        if date_to:
+            queryset = queryset.filter(created_at__date__lte=date_to)
+
         return queryset
 
 
@@ -1003,10 +1036,49 @@ class StockMovementViewSet(BaseInventoryReadOnlyViewSetMixin):
             queryset = queryset.filter(
                 Q(from_location_id__in=scoped_location_ids) | Q(to_location_id__in=scoped_location_ids)
             )
+
+        date_from = self.request.query_params.get('date_from')
+        if date_from:
+            queryset = queryset.filter(occurred_at__date__gte=date_from)
+
+        date_to = self.request.query_params.get('date_to')
+        if date_to:
+            queryset = queryset.filter(occurred_at__date__lte=date_to)
+
         return queryset
+
+    @action(detail=False, methods=['get'])
+    def summary(self, request):
+        queryset = self.filter_queryset(self.get_queryset())
+        quantity_total = queryset.aggregate(total_quantity=Sum('quantity')).get('total_quantity') or Decimal('0')
+        location_ids = set(
+            filter(
+                None,
+                queryset.values_list('from_location_id', flat=True),
+            )
+        ) | set(
+            filter(
+                None,
+                queryset.values_list('to_location_id', flat=True),
+            )
+        )
+
+        return Response(
+            {
+                'total_movements': queryset.count(),
+                'total_quantity': quantity_total,
+                'reference_count': queryset.values('reference_type', 'reference_id').distinct().count(),
+                'inventory_item_count': queryset.values('inventory_item_id').distinct().count(),
+                'location_count': len(location_ids),
+                'route_count': queryset.values('from_location_id', 'to_location_id').distinct().count(),
+            }
+        )
 
 
 class StockReservationViewSet(BaseCachePermissionViewset):
+    # Reservations change through order workflows as well as this viewset; stale
+    # cache entries can otherwise hide newly created reservations for five minutes.
+    CACHE_ENABLED = False
     required_permission = UNIFIED_PERMISSION_DICT.get('stock_reservation')
     queryset = StockReservation.objects.select_related('inventory_item', 'stock_location', 'stock_lot', 'stock_serial')
     filterset_fields = ['status', 'stock_location', 'external_order_type', 'external_order_id']
@@ -1039,7 +1111,62 @@ class StockReservationViewSet(BaseCachePermissionViewset):
                 profile_id=profile_id,
                 location_id=stock_location_id,
             )
+
+        status_filter = (self.request.query_params.get('status_filter') or '').strip().lower()
+        if status_filter == 'open':
+            queryset = queryset.filter(
+                status__in=[
+                    StockReservationStatus.ACTIVE,
+                    StockReservationStatus.PARTIALLY_FULFILLED,
+                ]
+            )
+
+        date_from = self.request.query_params.get('date_from')
+        if date_from:
+            queryset = queryset.filter(created_at__date__gte=date_from)
+
+        date_to = self.request.query_params.get('date_to')
+        if date_to:
+            queryset = queryset.filter(created_at__date__lte=date_to)
+
         return queryset
+
+    @action(detail=False, methods=['get'])
+    def summary(self, request):
+        queryset = self.filter_queryset(self.get_queryset())
+        remaining_expression = ExpressionWrapper(
+            F('reserved_quantity') - F('fulfilled_quantity'),
+            output_field=DecimalField(max_digits=15, decimal_places=5),
+        )
+        aggregates = queryset.aggregate(
+            committed_quantity=Sum('reserved_quantity'),
+            # Keep this alias distinct from the field referenced by
+            # remaining_expression; otherwise Django resolves the F() lookup
+            # to this aggregate and rejects a nested aggregate.
+            fulfilled_quantity_total=Sum('fulfilled_quantity'),
+            remaining_quantity=Sum(remaining_expression),
+        )
+
+        return Response(
+            {
+                'total_reservations': queryset.count(),
+                'open_reservations': queryset.filter(
+                    status__in=[
+                        StockReservationStatus.ACTIVE,
+                        StockReservationStatus.PARTIALLY_FULFILLED,
+                    ]
+                ).count(),
+                'committed_quantity': aggregates.get('committed_quantity') or Decimal('0'),
+                'fulfilled_quantity': aggregates.get('fulfilled_quantity_total') or Decimal('0'),
+                'remaining_quantity': aggregates.get('remaining_quantity') or Decimal('0'),
+                'location_count': queryset.values('stock_location_id').distinct().count(),
+                'inventory_item_count': queryset.values('inventory_item_id').distinct().count(),
+                'status_breakdown': {
+                    row['status']: row['count']
+                    for row in queryset.values('status').annotate(count=Count('id')).order_by('status')
+                },
+            }
+        )
 
     def create(self, request, *args, **kwargs):
         serializer = self.get_serializer(data=request.data)

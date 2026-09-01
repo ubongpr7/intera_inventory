@@ -10,13 +10,15 @@ from django.core.exceptions import ValidationError
 from django.core.management import call_command
 from django.core.management.base import CommandError
 from django.test import SimpleTestCase, TestCase
+from rest_framework.request import Request
 from rest_framework.test import APIRequestFactory, force_authenticate
 
 from mainapps.inventory.models import InventoryItem, InventoryPlacement
 from mainapps.stock.models import StockBalance, StockLocation, StockLocationType, StockReservation, StockReservationStatus
-from mainapps.stock.serializers import InventoryItemDetailSerializer
+from mainapps.stock.serializers import InventoryItemDetailSerializer, StockLocationListSerializer
 from mainapps.stock.views import (
     AIReportExportView,
+    StockMovementViewSet,
     StockReservationViewSet,
     filter_inventory_items_for_location,
     filter_inventory_items_for_purchase_order,
@@ -99,6 +101,95 @@ class StockViewFilterTests(SimpleTestCase):
 
         queryset.filter.assert_called_once_with(sales_order_lines__sales_order_id="sales-order-id")
         filtered_queryset.distinct.assert_called_once_with()
+
+
+class StockSummaryViewTests(SimpleTestCase):
+    def test_reservation_open_filter_uses_reservation_status_choices(self):
+        base_queryset = MagicMock()
+        profile_queryset = MagicMock()
+        filtered_queryset = MagicMock()
+        base_queryset.filter.return_value = profile_queryset
+        profile_queryset.filter.return_value = filtered_queryset
+        request = Request(APIRequestFactory().get("/stock_api/reservations/?status_filter=open"))
+        view = StockReservationViewSet()
+        view.request = request
+
+        with (
+            patch("mainapps.stock.views.BaseCachePermissionViewset.get_queryset", return_value=base_queryset),
+            patch("mainapps.stock.views.get_request_profile_id", return_value=1),
+        ):
+            result = view.get_queryset()
+
+        self.assertIs(result, filtered_queryset)
+        base_queryset.filter.assert_called_once_with(profile_id=1)
+        profile_queryset.filter.assert_called_once_with(
+            status__in=[
+                StockReservationStatus.ACTIVE,
+                StockReservationStatus.PARTIALLY_FULFILLED,
+            ]
+        )
+
+    def test_stock_movement_summary_returns_aggregate_metrics(self):
+        queryset = MagicMock()
+        queryset.aggregate.return_value = {"total_quantity": Decimal("18.5")}
+        queryset.count.return_value = 7
+        queryset.values.return_value.distinct.return_value.count.side_effect = [4, 3, 2]
+        queryset.values_list.side_effect = [
+            ["loc-a", "loc-b", None],
+            ["loc-c", "loc-b", None],
+        ]
+        request = APIRequestFactory().get("/stock_api/movements/summary/")
+        view = StockMovementViewSet()
+
+        with patch.object(StockMovementViewSet, "get_queryset", return_value=queryset):
+            with patch.object(StockMovementViewSet, "filter_queryset", return_value=queryset):
+                response = StockMovementViewSet.summary(view, request)
+
+        self.assertEqual(response.data["total_movements"], 7)
+        self.assertEqual(response.data["total_quantity"], Decimal("18.5"))
+        self.assertEqual(response.data["reference_count"], 4)
+        self.assertEqual(response.data["inventory_item_count"], 3)
+        self.assertEqual(response.data["location_count"], 3)
+        self.assertEqual(response.data["route_count"], 2)
+
+    def test_stock_reservation_summary_returns_open_and_quantity_metrics(self):
+        queryset = MagicMock()
+        queryset.aggregate.return_value = {
+            "committed_quantity": Decimal("12"),
+            "fulfilled_quantity_total": Decimal("5"),
+            "remaining_quantity": Decimal("7"),
+        }
+        queryset.count.return_value = 6
+        open_queryset = MagicMock()
+        open_queryset.count.return_value = 4
+        location_values = MagicMock()
+        location_values.distinct.return_value.count.return_value = 2
+        inventory_values = MagicMock()
+        inventory_values.distinct.return_value.count.return_value = 3
+        breakdown_values = MagicMock()
+        breakdown_values.annotate.return_value.order_by.return_value = [
+            {"status": "active", "count": 2},
+            {"status": "fulfilled", "count": 1},
+        ]
+        queryset.filter.return_value = open_queryset
+        queryset.values.side_effect = [location_values, inventory_values, breakdown_values]
+        request = APIRequestFactory().get("/stock_api/reservations/summary/")
+        view = StockReservationViewSet()
+
+        with patch.object(StockReservationViewSet, "get_queryset", return_value=queryset):
+            with patch.object(StockReservationViewSet, "filter_queryset", return_value=queryset):
+                response = StockReservationViewSet.summary(view, request)
+
+        self.assertEqual(response.data["total_reservations"], 6)
+        self.assertEqual(response.data["open_reservations"], 4)
+        self.assertEqual(response.data["committed_quantity"], Decimal("12"))
+        self.assertEqual(response.data["fulfilled_quantity"], Decimal("5"))
+        self.assertEqual(response.data["remaining_quantity"], Decimal("7"))
+        self.assertIn("fulfilled_quantity_total", queryset.aggregate.call_args.kwargs)
+        self.assertNotIn("fulfilled_quantity", queryset.aggregate.call_args.kwargs)
+        self.assertEqual(response.data["location_count"], 2)
+        self.assertEqual(response.data["inventory_item_count"], 3)
+        self.assertEqual(response.data["status_breakdown"]["active"], 2)
 
 
 class StockReadModelTests(SimpleTestCase):
@@ -270,6 +361,90 @@ class StockDomainTests(SimpleTestCase):
         resolved = StockDomainService._ensure_operational_stock_location(leaf_location)
 
         self.assertIs(resolved, leaf_location)
+
+    def test_issue_stock_uses_available_legacy_lot_balance_for_non_lot_inventory(self):
+        inventory_item = MagicMock(
+            id=uuid.uuid4(),
+            track_serial=False,
+            track_lot=False,
+            allow_negative_stock=False,
+        )
+        stock_location = MagicMock()
+        stock_lot = MagicMock(inventory_item_id=inventory_item.id, remaining_quantity=Decimal("5"))
+        candidate_balance = MagicMock(stock_lot=stock_lot)
+        issued_balance = MagicMock(quantity_on_hand=Decimal("5"), quantity_available=Decimal("5"))
+
+        candidate_queryset = MagicMock()
+        candidate_queryset.select_for_update.return_value.filter.return_value.order_by.return_value.first.return_value = candidate_balance
+
+        with patch("subapps.services.stock_domain.StockBalance.objects", candidate_queryset):
+            with patch("subapps.services.stock_domain.StockDomainService._resolve_profile_id", return_value=1):
+                with patch("subapps.services.stock_domain.StockDomainService._get_locked_balance", return_value=issued_balance) as get_balance:
+                    with patch("subapps.services.stock_domain.StockDomainService._resolve_inventory_unit_cost", return_value=Decimal("10")):
+                        with patch("subapps.services.stock_domain.StockMovement.objects.create"):
+                            with patch("subapps.services.stock_domain.StockDomainService._publish_inventory_availability_on_commit"):
+                                StockDomainService.issue_stock.__wrapped__(
+                                    StockDomainService,
+                                    inventory_item=inventory_item,
+                                    stock_location=stock_location,
+                                    quantity=Decimal("1"),
+                                    actor_user_id=7,
+                                )
+
+        self.assertEqual(issued_balance.quantity_on_hand, Decimal("4"))
+        self.assertEqual(stock_lot.remaining_quantity, Decimal("4"))
+        get_balance.assert_called_once_with(
+            profile_id=1,
+            inventory_item=inventory_item,
+            stock_location=stock_location,
+            stock_lot=stock_lot,
+            actor_user_id=7,
+        )
+
+    def test_transfer_stock_uses_available_legacy_lot_balance_for_non_lot_inventory(self):
+        inventory_item = MagicMock(
+            id=uuid.uuid4(),
+            track_serial=False,
+            track_lot=False,
+            allow_negative_stock=False,
+        )
+        source_location = MagicMock()
+        destination_location = MagicMock()
+        stock_lot = MagicMock(inventory_item_id=inventory_item.id)
+        candidate_balance = MagicMock(stock_lot=stock_lot)
+        source_balance = MagicMock(quantity_on_hand=Decimal("5"), quantity_available=Decimal("5"))
+        destination_balance = MagicMock(quantity_on_hand=Decimal("0"))
+
+        candidate_queryset = MagicMock()
+        candidate_queryset.select_for_update.return_value.filter.return_value.order_by.return_value.first.return_value = candidate_balance
+
+        with patch("subapps.services.stock_domain.StockBalance.objects", candidate_queryset):
+            with patch("subapps.services.stock_domain.StockDomainService._resolve_profile_id", return_value=1):
+                with patch(
+                    "subapps.services.stock_domain.StockDomainService._get_locked_balance",
+                    side_effect=[source_balance, destination_balance],
+                ) as get_balance:
+                    with patch("subapps.services.stock_domain.StockDomainService._resolve_inventory_unit_cost", return_value=Decimal("10")):
+                        with patch("subapps.services.stock_domain.StockMovement.objects.create"):
+                            with patch("subapps.services.stock_domain.ensure_inventory_item_placement"):
+                                with patch(
+                                    "subapps.services.stock_domain.StockDomainService._publish_inventory_availability_on_commit"
+                                ) as publish_availability:
+                                    StockDomainService.transfer_stock.__wrapped__(
+                                        StockDomainService,
+                                        inventory_item=inventory_item,
+                                        from_location=source_location,
+                                        to_location=destination_location,
+                                        quantity=Decimal("1"),
+                                        actor_user_id=7,
+                                    )
+
+        self.assertEqual(source_balance.quantity_on_hand, Decimal("4"))
+        self.assertEqual(destination_balance.quantity_on_hand, Decimal("1"))
+        self.assertEqual(get_balance.call_count, 2)
+        self.assertEqual(get_balance.call_args_list[0].kwargs["stock_lot"], stock_lot)
+        self.assertEqual(get_balance.call_args_list[1].kwargs["stock_lot"], stock_lot)
+        publish_availability.assert_called_once_with(inventory_item.id)
 
     def test_receive_purchase_line_ensures_inventory_item_placement(self):
         purchase_order = MagicMock(reference="PO-001", supplier=MagicMock())
@@ -572,6 +747,20 @@ class StockLocationDefaultStructuralLocationTests(TestCase):
                 is_default_structural_location=True,
                 location_type=self.location_type,
             )
+
+    def test_list_serializer_includes_editable_location_references(self):
+        location = StockLocation.objects.create(
+            profile_id=15,
+            name="QA Shelf",
+            structural=False,
+            location_type=self.location_type,
+            official="42",
+        )
+
+        payload = StockLocationListSerializer(location).data
+
+        self.assertEqual(payload["location_type"], self.location_type.id)
+        self.assertEqual(payload["official"], "42")
 
 
 class StockAnalyticsScopeTests(TestCase):

@@ -16,6 +16,32 @@ INTERA_BRAND = {
 }
 
 
+def get_workspace_display_name(order, default: str = "Company") -> str:
+    """Resolve the local identity projection without treating legacy profile IDs as objects."""
+    profile = getattr(order, "profile", None)
+    for attribute in ("display_name", "name"):
+        value = getattr(profile, attribute, None)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+
+    profile_id = getattr(order, "profile_id", None)
+    if profile_id:
+        try:
+            from mainapps.identity.models import IdentityCompanyProfile
+
+            display_name = (
+                IdentityCompanyProfile.objects.filter(profile_id=profile_id, is_active=True)
+                .values_list("display_name", flat=True)
+                .first()
+            )
+            if display_name:
+                return display_name
+        except Exception:
+            logger.warning("Could not resolve workspace display name for profile %s", profile_id, exc_info=True)
+
+    return default
+
+
 class EmailService:
     """Enhanced email service matching your existing implementation"""
 
@@ -92,7 +118,8 @@ class EmailService:
                 return False
 
             contact_email = purchase_order.contact.email
-            subject = f"Purchase Order #{purchase_order.reference} from {purchase_order.profile.name}"
+            company_name = get_workspace_display_name(purchase_order)
+            subject = f"Purchase Order #{purchase_order.reference} from {company_name}"
             from_email = cls._resolve_from_email()
             to = [contact_email]
 
@@ -105,7 +132,7 @@ class EmailService:
             try:
                 html_content = render_to_string("emails/purchase_order_email.html", {
                     "purchase_order": purchase_order,
-                    "company_name": purchase_order.profile.name,
+                    "company_name": company_name,
                     "contact_name": purchase_order.contact.name or "Supplier",
                     "line_items": purchase_order.line_items.all(),
                     **cls._brand_context(),
@@ -188,7 +215,7 @@ class EmailService:
                 'return_order': return_order,
                 'purchase_order': purchase_order,
                 'contact': return_order.contact,
-                'company_name': return_order.profile.name if return_order.profile else 'Company',
+                'company_name': get_workspace_display_name(return_order),
                 **cls._brand_context(),
             }
             
@@ -274,7 +301,7 @@ class EmailService:
             context = {
                 'purchase_order': purchase_order,
                 'status_change': status_change,
-                'company_name': purchase_order.profile.name,
+                'company_name': get_workspace_display_name(purchase_order),
                 'contact_name': purchase_order.contact.name or "Supplier",
                 **cls._brand_context(),
             }

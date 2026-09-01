@@ -1,4 +1,5 @@
-from rest_framework import permissions
+from rest_framework import filters, permissions
+from django_filters.rest_framework import DjangoFilterBackend
 import logging
 from rest_framework.response import Response
 
@@ -14,6 +15,7 @@ from subapps.utils.request_context import (
     get_request_permissions,
     get_request_user_id,
 )
+from subapps.pagination import OptionalPageNumberPagination
 
 class HasModelRequestPermission(permissions.BasePermission):
     """
@@ -81,9 +83,15 @@ class CachingMixin:
         version = cache.get(self.CACHE_VERSION_KEY, 1)
         
         # Get query params if enabled
-        params = {}
+        params = ()
         if self.INCLUDE_QUERY_PARAMS and hasattr(request, 'query_params'):
-            params = request.query_params.dict()
+            params = tuple(
+                sorted(
+                    (key, value)
+                    for key, values in request.query_params.lists()
+                    for value in values
+                )
+            )
         
         # Include view-specific args if needed
         view_specific = self._get_view_specific_cache_components(request, *args, **kwargs)
@@ -93,7 +101,7 @@ class CachingMixin:
             'path': path,
             'version': version,
             'identity': get_identity_cache_key(request),
-            'params': '_'.join(f"{k}={v}" for k, v in sorted(params.items())),
+            'params': '_'.join(f"{key}={value}" for key, value in params),
             'view_specific': view_specific
         }
         
@@ -192,5 +200,8 @@ class CachingMixin:
         return response
     
 from rest_framework import viewsets
-class BaseCachePermissionViewset(PermissionRequiredMixin,viewsets.ModelViewSet):
-    pass
+class BaseCachePermissionViewset(CachingMixin, PermissionRequiredMixin, viewsets.ModelViewSet):
+    """Authenticated, cached viewset with opt-in field allow-lists for list queries."""
+
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    pagination_class = OptionalPageNumberPagination

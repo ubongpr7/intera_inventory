@@ -295,6 +295,11 @@ class Command(BaseCommand):
             target_units=target_units,
         )
 
+        current_local_date = timezone.localdate()
+        max_day_for_month = monthrange(month_start.year, month_start.month)[1]
+        if month_start.year == current_local_date.year and month_start.month == current_local_date.month:
+            max_day_for_month = min(max_day_for_month, current_local_date.day)
+
         po_days = (3, 10, 18, 25)
         po_specs = [
             ("Multipro Consumer Products Ltd", ("beverage", "grocery")),
@@ -314,9 +319,11 @@ class Command(BaseCommand):
                 purchase_order_index += 1
                 continue
 
-            issue_date = min(po_day, monthrange(month_start.year, month_start.month)[1])
+            issue_date = min(po_day, max_day_for_month)
             issue_at = _aware_datetime(date(month_start.year, month_start.month, issue_date), hour=9 + purchase_order_index, minute=10)
             delivery_at = issue_at + timedelta(days=4 + (purchase_order_index % 3))
+            if delivery_at.date() > current_local_date and month_start.year == current_local_date.year and month_start.month == current_local_date.month:
+                delivery_at = _aware_datetime(current_local_date, hour=min(issue_at.hour + 4, 18), minute=10)
             supplier = suppliers[supplier_name]
 
             with transaction.atomic():

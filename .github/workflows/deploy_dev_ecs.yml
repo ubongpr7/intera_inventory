@@ -3,7 +3,6 @@ name: Deploy Dev ECS
 on:
   push:
     branches:
-      - dev
       - main
   workflow_dispatch:
 
@@ -35,6 +34,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Validate Email Ownership
+        run: python3 scripts/check_email_ownership.py
 
       - name: Validate Deploy Contract
         run: |

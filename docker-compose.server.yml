@@ -1,0 +1,47 @@
+name: interaims-dev-inventory
+
+x-service: &service
+  build:
+    context: .
+  env_file:
+    - .env
+  restart: unless-stopped
+  networks:
+    - platform
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+  web:
+    <<: *service
+    container_name: interaims-dev-inventory-web
+    command: ["sh", "-c", "python manage.py migrate && python manage.py runserver 0.0.0.0:7002"]
+    expose:
+      - "7002"
+
+  consumer:
+    <<: *service
+    container_name: interaims-dev-inventory-consumer
+    command: ["sh", "-c", "python manage.py consume_kafka"]
+
+  outbox:
+    <<: *service
+    container_name: interaims-dev-inventory-outbox
+    command: ["sh", "-c", "python manage.py publish_outbox_events"]
+
+  mcp:
+    <<: *service
+    container_name: interaims-dev-inventory-mcp
+    command: ["sh", "-c", "python -m mcp_server.server"]
+    expose:
+      - "8000"
+    depends_on:
+      - web
+
+networks:
+  platform:
+    external: true
+    name: interaims-platform

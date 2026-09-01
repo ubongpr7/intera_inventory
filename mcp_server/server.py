@@ -179,8 +179,25 @@ def get_current_principal(*, required: bool = False) -> InventoryMcpPrincipal | 
     return principal
 
 
-def _build_principal_from_token(token: str) -> InventoryMcpPrincipal:
+def _merge_authorization_context(claims: dict[str, Any], context_token: str | None) -> dict[str, Any]:
+    if not context_token:
+        return claims
+    context = dict(UntypedToken(context_token).payload)
+    if (
+        context.get("token_type") != "intera_authorization_context"
+        or str(context.get("user_id") or "") != str(claims.get("user_id") or claims.get("sub") or "")
+        or str(context.get("profile_id") or "") != str(claims.get("profile_id") or "")
+    ):
+        raise RuntimeError("Authorization context does not match the access token.")
+    permissions = set(claims.get("permissions") or []) | set(context.get("permissions") or [])
+    for wildcard in context.get("wildcards") or []:
+        permissions.update((context.get("wildcard_permissions") or {}).get(wildcard) or [])
+    return {**claims, "permissions": sorted(str(item) for item in permissions if str(item).strip())}
+
+
+def _build_principal_from_token(token: str, context_token: str | None = None) -> InventoryMcpPrincipal:
     claims = dict(UntypedToken(token).payload)
+    claims = _merge_authorization_context(claims, context_token)
     user_id = claims.get("user_id") or claims.get("id") or claims.get("sub")
     if user_id in (None, ""):
         raise RuntimeError("Access token missing user identifier.")
@@ -227,7 +244,7 @@ class InventoryMcpAuthMiddleware:
             return
 
         try:
-            principal = _build_principal_from_token(token)
+            principal = _build_principal_from_token(token, headers.get("x-intera-authorization-context"))
         except Exception as exc:
             response = JSONResponse({"detail": str(exc)}, status_code=401)
             await response(scope, receive, send)
@@ -1422,6 +1439,10 @@ def _get_inventory_alerts_sync(
                     "location_count": 0,
                 },
             )
+            # An item without a balance has not been placed in a stock location yet.
+            # Treat that as an inventory-setup gap, not a confirmed stockout.
+            if not int(summary.get("location_count") or 0):
+                continue
             current_stock = Decimal(summary.get("quantity") or Decimal("0"))
             minimum_stock_level = Decimal(str(inventory_row.get("minimum_stock_level") or 0))
             reorder_point = Decimal(str(inventory_row.get("reorder_point") or 0))
@@ -1443,6 +1464,18 @@ def _get_inventory_alerts_sync(
             item.id: item
             for item in inventory_queryset.filter(id__in=selected_ids)
         }
+        scoped_locations = _resolve_structural_scope_locations_sync(
+            principal=principal,
+            structural_location_id=structural_location_id,
+        )
+        item_summaries = (
+            get_inventory_item_summary_map(
+                list(inventory_map.values()),
+                stock_locations=scoped_locations,
+            )
+            if inventory_map
+            else {}
+        )
 
         def _payload_for(item_id: Any) -> dict[str, Any] | None:
             item = inventory_map.get(item_id)
@@ -1450,7 +1483,9 @@ def _get_inventory_alerts_sync(
                 return None
             return _inventory_item_payload(
                 item,
-                summary=summary_map.get(
+                # The alert aggregate decides risk membership. The canonical item
+                # summary supplies structural location names and product metadata.
+                summary=item_summaries.get(
                     item_id,
                     {
                         "quantity": Decimal("0"),
@@ -1461,17 +1496,35 @@ def _get_inventory_alerts_sync(
                 ),
             )
 
-        out_of_stock = [payload for payload in (_payload_for(item_id) for item_id in out_of_stock_ids[:limit]) if payload]
-        low_stock = [payload for payload in (_payload_for(item_id) for item_id in low_stock_ids[:limit]) if payload]
-        needs_reorder = [payload for payload in (_payload_for(item_id) for item_id in needs_reorder_ids[:limit]) if payload]
+        def _risk_payloads(item_ids: list[Any], category: str) -> list[dict[str, Any]]:
+            return [
+                {**payload, "risk_category": category}
+                for payload in (_payload_for(item_id) for item_id in item_ids[:limit])
+                if payload
+            ]
+
+        out_of_stock = _risk_payloads(out_of_stock_ids, "out_of_stock")
+        low_stock = _risk_payloads(low_stock_ids, "low_stock")
+        needs_reorder = _risk_payloads(needs_reorder_ids, "needs_reorder")
 
         return {
             "profile_id": principal.profile_id,
             "expiring_days": expiring_days,
+            "limit_per_category": limit,
+            "summary": {
+                "low_stock_count": len(low_stock_ids),
+                "reorder_count": len(needs_reorder_ids),
+                "out_of_stock_count": len(out_of_stock_ids),
+                "expiring_count": len(expiring),
+            },
             "low_stock": low_stock,
             "needs_reorder": needs_reorder,
             "out_of_stock": out_of_stock,
-            "expiring_soon": expiring[:limit],
+            "expiring_soon": [
+                {**item, "risk_category": "expiring_soon"}
+                for item in expiring[:limit]
+                if isinstance(item, dict)
+            ],
         }
     finally:
         close_old_connections()
@@ -1492,11 +1545,13 @@ def _get_stock_risk_sync(
     )
     return {
         "profile_id": principal.profile_id,
+        "limit_per_category": alerts.get("limit_per_category", limit),
         "summary": {
-            "low_stock_count": len(alerts["low_stock"]),
-            "reorder_count": len(alerts["needs_reorder"]),
-            "out_of_stock_count": len(alerts["out_of_stock"]),
-            "expiring_count": len(alerts["expiring_soon"]),
+            **(alerts.get("summary") if isinstance(alerts.get("summary"), dict) else {}),
+            "low_stock_count": int((alerts.get("summary") or {}).get("low_stock_count") or len(alerts["low_stock"])),
+            "reorder_count": int((alerts.get("summary") or {}).get("reorder_count") or len(alerts["needs_reorder"])),
+            "out_of_stock_count": int((alerts.get("summary") or {}).get("out_of_stock_count") or len(alerts["out_of_stock"])),
+            "expiring_count": int((alerts.get("summary") or {}).get("expiring_count") or len(alerts["expiring_soon"])),
         },
         "risk_items": {
             "out_of_stock": alerts["out_of_stock"],

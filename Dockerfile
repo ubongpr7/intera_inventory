@@ -8,13 +8,25 @@ WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
-RUN apt-get update && apt-get install -y gcc libpq-dev graphviz librdkafka-dev && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    graphviz \
+    libpq-dev \
+    librdkafka-dev \
+    libcairo2 \
+    libgdk-pixbuf-2.0-0 \
+    libgobject-2.0-0 \
+    libpango-1.0-0 \
+    libpangocairo-1.0-0 \
+    shared-mime-info \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml /app/
 COPY uv.lock /app/
 COPY .python-version /app/
 
 RUN uv sync --locked
+RUN uv run python -c "from weasyprint import HTML; HTML(string='<p>WeasyPrint smoke test</p>').write_pdf('/tmp/weasyprint-smoke.pdf')"
 ENV PATH="/app/.venv/bin:$PATH"
 
 COPY . /app/
