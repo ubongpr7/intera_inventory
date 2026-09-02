@@ -429,10 +429,8 @@ _default_cors_allowed_origins = [
     'https://www.interaims.com',
     'https://dev.interaims.com'
 ]
-CORS_ALLOWED_ORIGINS = _split_csv_env(
-    "CORS_ALLOWED_ORIGINS",
-    [] if IS_PRODUCTION else _default_cors_allowed_origins,
-)
+_configured_cors_allowed_origins = _split_csv_env("CORS_ALLOWED_ORIGINS", [])
+CORS_ALLOWED_ORIGINS = list(dict.fromkeys([*_default_cors_allowed_origins, *_configured_cors_allowed_origins]))
 CSRF_TRUSTED_ORIGINS = _split_csv_env("CSRF_TRUSTED_ORIGINS", CORS_ALLOWED_ORIGINS)
 
 # Security / HTTPS.
