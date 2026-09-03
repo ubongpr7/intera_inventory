@@ -130,6 +130,7 @@ CORE_APPS = [
     'mainapps.orders',
     'mainapps.projections',
     'mainapps.stock',
+    'mainapps.subscription_bootstrap',
 ]
 INSTALLED_APPS=[
 ]

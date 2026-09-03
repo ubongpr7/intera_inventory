@@ -10,6 +10,7 @@ DEFAULT_CONSUMER_TOPICS = (
     namespaced_topic("identity.user"),
     namespaced_topic("identity.company_profile"),
     namespaced_topic("identity.membership"),
+    namespaced_topic("workspace.subscription"),
     namespaced_topic("catalog.product"),
     namespaced_topic("catalog.variant"),
     namespaced_topic("pos.order"),

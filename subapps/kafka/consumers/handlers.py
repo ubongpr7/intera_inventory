@@ -8,6 +8,7 @@ from subapps.kafka.consumers.identity import (
     handle_identity_user_event,
 )
 from subapps.kafka.consumers.pos import handle_pos_order_event
+from subapps.kafka.consumers.subscriptions import handle_workspace_subscription_event
 from subapps.kafka.topics import (
     CATALOG_PRODUCT_TOPIC,
     CATALOG_VARIANT_TOPIC,
@@ -15,6 +16,7 @@ from subapps.kafka.topics import (
     IDENTITY_MEMBERSHIP_TOPIC,
     IDENTITY_USER_TOPIC,
     POS_ORDER_TOPIC,
+    namespaced_topic,
 )
 
 EVENT_HANDLERS = {
@@ -24,4 +26,5 @@ EVENT_HANDLERS = {
     CATALOG_PRODUCT_TOPIC: handle_catalog_product_event,
     CATALOG_VARIANT_TOPIC: handle_catalog_variant_event,
     POS_ORDER_TOPIC: handle_pos_order_event,
+    namespaced_topic("workspace.subscription"): handle_workspace_subscription_event,
 }
