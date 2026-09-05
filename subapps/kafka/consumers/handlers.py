@@ -5,6 +5,7 @@ from subapps.kafka.consumers.catalog import (
 from subapps.kafka.consumers.identity import (
     handle_identity_company_profile_event,
     handle_identity_membership_event,
+    handle_identity_permission_context_event,
     handle_identity_user_event,
 )
 from subapps.kafka.consumers.pos import handle_pos_order_event
@@ -14,6 +15,7 @@ from subapps.kafka.topics import (
     CATALOG_VARIANT_TOPIC,
     IDENTITY_COMPANY_PROFILE_TOPIC,
     IDENTITY_MEMBERSHIP_TOPIC,
+    IDENTITY_PERMISSION_CONTEXT_TOPIC,
     IDENTITY_USER_TOPIC,
     POS_ORDER_TOPIC,
     namespaced_topic,
@@ -23,6 +25,7 @@ EVENT_HANDLERS = {
     IDENTITY_USER_TOPIC: handle_identity_user_event,
     IDENTITY_COMPANY_PROFILE_TOPIC: handle_identity_company_profile_event,
     IDENTITY_MEMBERSHIP_TOPIC: handle_identity_membership_event,
+    IDENTITY_PERMISSION_CONTEXT_TOPIC: handle_identity_permission_context_event,
     CATALOG_PRODUCT_TOPIC: handle_catalog_product_event,
     CATALOG_VARIANT_TOPIC: handle_catalog_variant_event,
     POS_ORDER_TOPIC: handle_pos_order_event,

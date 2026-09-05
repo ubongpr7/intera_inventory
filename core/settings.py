@@ -148,6 +148,7 @@ MIDDLEWARE = [
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
     'corsheaders.middleware.CorsMiddleware',
+    'subapps.middleware.FrontendOriginMiddleware',
    
 ]
 
@@ -416,6 +417,7 @@ CORS_ALLOW_HEADERS = [
     'x-csrftoken',
     'x-requested-with',
     'x-intera-authorization-context',
+    'x-intera-frontend-origin',
     'x-device-id',
 ]
 

@@ -4,6 +4,7 @@ from typing import Any, Iterable
 
 from subapps.kafka.client import publish_event
 from subapps.kafka.topics import AUDIT_EVENTS_TOPIC, NOTIFICATION_DISPATCH_TOPIC, NOTIFICATION_EVENTS_TOPIC
+from subapps.utils.request_context import current_frontend_origin
 
 
 def _string(value: Any) -> str:
@@ -109,6 +110,7 @@ def publish_workspace_notification(
     message: str,
     metadata: dict[str, Any] | None = None,
     action_url: str | None = None,
+    frontend_origin: str | None = None,
     user_ids: Iterable[Any] | None = None,
     key: str | None = None,
 ) -> dict[str, Any]:
@@ -124,6 +126,7 @@ def publish_workspace_notification(
             "user_ids": recipients,
             "metadata": metadata or {},
             "action_url": action_url or "",
+            "frontend_origin": frontend_origin or current_frontend_origin(),
         },
         key=key,
     )

@@ -29,6 +29,7 @@ def namespaced_topic(topic: str) -> str:
 IDENTITY_USER_TOPIC = namespaced_topic("identity.user")
 IDENTITY_COMPANY_PROFILE_TOPIC = namespaced_topic("identity.company_profile")
 IDENTITY_MEMBERSHIP_TOPIC = namespaced_topic("identity.membership")
+IDENTITY_PERMISSION_CONTEXT_TOPIC = namespaced_topic("identity.permission_context")
 
 CATALOG_PRODUCT_TOPIC = namespaced_topic("catalog.product")
 CATALOG_VARIANT_TOPIC = namespaced_topic("catalog.variant")

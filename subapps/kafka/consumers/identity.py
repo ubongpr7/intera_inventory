@@ -7,6 +7,7 @@ from typing import Any
 from django.db import transaction
 
 from mainapps.identity.models import IdentityCompanyProfile, IdentityMembership, IdentityUser
+from subapps.utils.request_context import invalidate_permission_cache
 
 logger = logging.getLogger(__name__)
 
@@ -141,5 +142,20 @@ def handle_identity_membership_event(envelope: dict[str, Any], **_: Any) -> bool
             membership.profile_id,
             membership.user_id,
             membership.is_active,
+        )
+    return True
+
+
+def handle_identity_permission_context_event(envelope: dict[str, Any], **_: Any) -> bool:
+    if envelope.get("event_name") != "identity.permission_context.invalidated":
+        return True
+    payload = envelope.get("payload") or {}
+    if not isinstance(payload, dict):
+        return True
+    for user_id in payload.get("user_ids") or []:
+        invalidate_permission_cache(
+            user_id=str(user_id),
+            profile_id=str(payload.get("profile_id") or ""),
+            platform=str(payload.get("platform") or ""),
         )
     return True

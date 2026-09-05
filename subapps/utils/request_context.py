@@ -1,9 +1,20 @@
+from contextvars import ContextVar
+import hashlib
+import json
+import os
+from urllib import error, request as urlrequest
+from urllib.parse import urlsplit, urlunsplit
+
 from django.core.exceptions import FieldDoesNotExist
 from django.conf import settings
+from django.core.cache import cache
 from django.db.models import Q
 from rest_framework.exceptions import AuthenticationFailed
 from rest_framework_simplejwt.tokens import UntypedToken
 import jwt
+
+
+_frontend_origin_context: ContextVar[str] = ContextVar("intera_frontend_origin", default="")
 
 
 def _get_authorization_context(request):
@@ -85,13 +96,131 @@ def get_request_user_id(request, *, required=False, as_str=True):
 
 def get_request_permissions(request):
     claims = _get_token_payload(request)
-    permissions = set(claims.get("permissions") or [])
+    permissions = _expanded_permissions(claims)
     context = _get_authorization_context(request)
-    permissions.update(context.get("permissions") or [])
-    wildcard_permissions = context.get("wildcard_permissions") or {}
-    for wildcard in context.get("wildcards") or []:
-        permissions.update(wildcard_permissions.get(wildcard) or [])
+    permissions.update(_expanded_permissions(context))
     return permissions
+
+
+def _expanded_permissions(claims):
+    permissions = set(str(item) for item in (claims.get("permissions") or []) if str(item).strip())
+    wildcard_permissions = claims.get("wildcard_permissions") or {}
+    for wildcard in claims.get("wildcards") or []:
+        permissions.update(str(item) for item in wildcard_permissions.get(wildcard) or [] if str(item).strip())
+    return permissions
+
+
+def _matches_permission(required, granted_permissions):
+    return any(
+        granted == required
+        or (granted.endswith(".*") and str(required).startswith(granted[:-1]))
+        for granted in granted_permissions
+    )
+
+
+def _permission_cache_version():
+    version = cache.get("permission:v1:version")
+    if version in (None, ""):
+        version = 1
+        cache.set("permission:v1:version", version, None)
+    return str(version)
+
+
+def _permission_cache_key(*, user_id, profile_id, platform, service_name, permission):
+    raw = json.dumps(
+        {
+            "permission": str(permission or ""),
+            "platform": str(platform or ""),
+            "profile_id": str(profile_id or ""),
+            "service": str(service_name or ""),
+            "user_id": str(user_id or ""),
+            "version": _permission_cache_version(),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return f"permission:v1:{hashlib.sha256(raw.encode('utf-8')).hexdigest()}"
+
+
+def _permission_service_config():
+    return (
+        (
+            os.getenv("USER_SERVICE_URL")
+            or os.getenv("INTERA_USERS_SERVICE_URL")
+            or os.getenv("AUTHORIZATION_SERVICE_URL")
+            or ""
+        ).rstrip("/"),
+        (
+            os.getenv("PERMISSION_EVALUATION_SERVICE_KEY")
+            or os.getenv("INTERA_INTERNAL_SERVICE_KEY")
+            or os.getenv("SUBSCRIPTION_SERVICE_KEY")
+            or ""
+        ),
+        os.getenv("KAFKA_SERVICE_NAME") or os.getenv("SERVICE_NAME") or "inventory",
+    )
+
+
+def has_request_permission(request, permission):
+    permission = str(permission or "").strip()
+    if not permission:
+        return False
+    if _matches_permission(permission, get_request_permissions(request)):
+        return True
+
+    claims = _get_token_payload(request)
+    context = _get_authorization_context(request)
+    user_id = get_request_user_id(request)
+    profile_id = get_request_profile_id(request)
+    platform = context.get("platform") or claims.get("platform") or "intera_ims"
+    if not user_id or not profile_id:
+        return False
+
+    base_url, service_key, service_name = _permission_service_config()
+    if not base_url or not service_key:
+        return False
+
+    cache_key = _permission_cache_key(
+        user_id=user_id,
+        profile_id=profile_id,
+        platform=platform,
+        service_name=service_name,
+        permission=permission,
+    )
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return bool(cached)
+
+    payload = json.dumps(
+        {
+            "user_id": user_id,
+            "profile_id": profile_id,
+            "platform": platform,
+            "service": service_name,
+            "permissions": [permission],
+        }
+    ).encode("utf-8")
+    req = urlrequest.Request(
+        f"{base_url}/permission_api/internal/evaluate-permissions/",
+        data=payload,
+        headers={"Content-Type": "application/json", "X-Intera-Service-Key": service_key},
+        method="POST",
+    )
+    try:
+        with urlrequest.urlopen(req, timeout=float(os.getenv("PERMISSION_EVALUATION_TIMEOUT", "2.0"))) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except (OSError, ValueError, error.HTTPError, error.URLError):
+        return False
+
+    allowed = bool((data.get("grants") or {}).get(permission))
+    cache.set(cache_key, allowed, int(data.get("expires_in") or os.getenv("PERMISSION_EVALUATION_CACHE_TTL_SECONDS", "3600")))
+    return allowed
+
+
+def invalidate_permission_cache(*, user_id="", profile_id="", platform=""):
+    try:
+        cache.incr("permission:v1:version")
+    except ValueError:
+        cache.set("permission:v1:version", 2, None)
 
 
 def get_request_owner_id(request, *, as_str=True):
@@ -122,6 +251,57 @@ def get_request_auth_headers(request):
     if not auth_header:
         return {}
     return {"Authorization": auth_header}
+
+
+def normalize_frontend_origin(value):
+    parsed = urlsplit(str(value or "").strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return ""
+    return urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), "", "", ""))
+
+
+def allowed_frontend_origins():
+    configured = getattr(settings, "FRONTEND_ACTION_ALLOWED_ORIGINS", None)
+    if configured is None:
+        configured = getattr(settings, "CORS_ALLOWED_ORIGINS", [])
+    origins = [
+        *list(configured or []),
+        getattr(settings, "FRONTEND_SITE_URL", ""),
+        getattr(settings, "SITE_URL", ""),
+    ]
+    return {origin for origin in (normalize_frontend_origin(item) for item in origins) if origin}
+
+
+def frontend_origin_from_request(request, *, default=None):
+    candidates = [
+        request.headers.get("X-Intera-Frontend-Origin"),
+        request.headers.get("X-Frontend-Origin"),
+        request.headers.get("Origin"),
+        request.headers.get("Referer"),
+        default,
+        getattr(settings, "FRONTEND_SITE_URL", ""),
+        getattr(settings, "SITE_URL", ""),
+    ]
+    allowed = allowed_frontend_origins()
+    for candidate in candidates:
+        origin = normalize_frontend_origin(candidate)
+        if origin and (not allowed or origin in allowed):
+            return origin
+    return ""
+
+
+def set_frontend_origin_context(origin):
+    return _frontend_origin_context.set(normalize_frontend_origin(origin))
+
+
+def reset_frontend_origin_context(token):
+    _frontend_origin_context.reset(token)
+
+
+def current_frontend_origin():
+    return _frontend_origin_context.get() or normalize_frontend_origin(
+        getattr(settings, "FRONTEND_SITE_URL", "")
+    )
 
 
 def get_identity_cache_key(request, default="default"):

@@ -4,13 +4,54 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from django.test import SimpleTestCase
+from django.test import override_settings
 
 from subapps.kafka.producers.inventory_admin import publish_inventory_admin_event, serialize_stock_location
 from subapps.kafka.producers.inventory import publish_inventory_availability_upserted
 from subapps.kafka.producers.orders_admin import publish_order_admin_event, serialize_goods_receipt_line
+from subapps.utils.request_context import set_frontend_origin_context, reset_frontend_origin_context
 
 
 class InventoryKafkaProducerTests(SimpleTestCase):
+    @override_settings(FRONTEND_SITE_URL="https://dev.interaims.com")
+    @patch("subapps.kafka.producers.inventory_admin.publish_workspace_notification")
+    @patch("subapps.kafka.producers.inventory_admin._notification_recipients")
+    @patch("subapps.kafka.producers.inventory_admin.publish_audit_fact")
+    def test_notification_carries_request_frontend_origin(
+        self, publish_audit_fact, notification_recipients, publish_workspace_notification
+    ):
+        token = set_frontend_origin_context("https://dev.interaims.com")
+        try:
+            notification_recipients.return_value = (["55"], [{"user_id": "55"}])
+            publish_inventory_admin_event(
+                event_name="inventory.item.created",
+                payload={"profile_id": 11},
+                actor={}, target={"type": "inventory_item", "id": "1"},
+                summary="Created", notification_category="inventory",
+                notification_title="Created", notification_message="Created",
+                notification_action_url="/inventory",
+            )
+        finally:
+            reset_frontend_origin_context(token)
+
+        self.assertEqual(
+            publish_workspace_notification.call_args.kwargs["frontend_origin"],
+            "https://dev.interaims.com",
+        )
+
+    @override_settings(FRONTEND_SITE_URL="https://interaims.com")
+    @patch("subapps.kafka.producers.platform_events.publish_event")
+    def test_background_notification_uses_inventory_default_origin(self, publish_event):
+        from subapps.kafka.producers.platform_events import publish_workspace_notification
+
+        publish_workspace_notification(
+            event_name="notification.inventory.system",
+            workspace_id="11", category="inventory", title="Notice", message="Notice",
+            action_url="/inventory", user_ids=["55"],
+        )
+
+        payload = publish_event.call_args.args[2]
+        self.assertEqual(payload["frontend_origin"], "https://interaims.com")
     def test_stock_location_serializer_exposes_shared_address_id(self):
         location = SimpleNamespace(
             id="location-1",

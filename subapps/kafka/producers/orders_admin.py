@@ -16,6 +16,7 @@ from mainapps.orders.models import (
     SalesOrderShipment,
 )
 from subapps.kafka.producers.platform_events import publish_audit_fact, publish_workspace_notification
+from subapps.utils.request_context import current_frontend_origin
 
 
 def _string(value: Any) -> str:
@@ -373,6 +374,7 @@ def publish_order_admin_event(
                 message=notification_message,
                 metadata={**payload, **notification_metadata},
                 action_url=notification_action_url,
+                frontend_origin=payload.get("frontend_origin") or current_frontend_origin(),
                 user_ids=recipients,
                 key=f"{payload.get('profile_id')}:{target.get('type')}:{target.get('id')}:{event_name}:notification",
             )

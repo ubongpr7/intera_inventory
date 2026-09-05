@@ -12,8 +12,8 @@ logger = logging.getLogger(__name__)
 from subapps.utils.request_context import (
     get_identity_cache_key,
     get_request_owner_id,
-    get_request_permissions,
     get_request_user_id,
+    has_request_permission,
 )
 from subapps.pagination import OptionalPageNumberPagination
 
@@ -28,7 +28,6 @@ class HasModelRequestPermission(permissions.BasePermission):
         if not permission:
             return True
 
-        user_permissions = get_request_permissions(request)
         owner_id = get_request_owner_id(request, as_str=False)
         current_user_id = get_request_user_id(request, as_str=False)
 
@@ -41,7 +40,7 @@ class HasModelRequestPermission(permissions.BasePermission):
         if not permission:
             return False
 
-        return permission in user_permissions
+        return has_request_permission(request, permission)
         
 class PermissionRequiredMixin:
     """
