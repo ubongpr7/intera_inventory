@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from mainapps.subscription_bootstrap.services import apply_subscription_activation
+from subapps.services.subscription_entitlements import invalidate_subscription_decisions
 
 
 def handle_workspace_subscription_event(envelope: dict[str, Any], **_: Any) -> bool:
@@ -26,4 +27,12 @@ def handle_workspace_subscription_event(envelope: dict[str, Any], **_: Any) -> b
         activation_event_id=str(event_id),
         payload=payload,
     )
+    application = str(
+        subscription.get('application')
+        or subscription.get('application_slug')
+        or payload.get('application')
+        or payload.get('application_slug')
+        or 'intera-ims'
+    ).strip()
+    invalidate_subscription_decisions(profile_id=profile_id, application=application)
     return True

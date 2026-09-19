@@ -199,7 +199,12 @@ class StockLocationViewSet(BaseInventoryViewSet):
         profile_id = get_request_profile_id(self.request, required=True, as_str=False)
         if serializer.validated_data.get('structural', False):
             usage = self.get_queryset().filter(structural=True).count()
-            enforce_subscription_limit(profile_id=profile_id, feature='structural-locations', usage=usage)
+            enforce_subscription_limit(
+                profile_id=profile_id,
+                application='intera-ims',
+                feature='structural-locations',
+                usage=usage,
+            )
         super().perform_create(serializer)
         payload = serialize_stock_location(serializer.instance)
         publish_inventory_admin_event(
