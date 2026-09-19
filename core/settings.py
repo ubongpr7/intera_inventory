@@ -430,7 +430,11 @@ _default_cors_allowed_origins = [
     "http://10.0.2.2:8080",
     'https://interaims.com',
     'https://www.interaims.com',
-    'https://dev.interaims.com'
+    'https://dev.interaims.com',
+    'https://hosperator.com',
+    'https://dev.hosperator.com',
+    'https://ospirator.com',
+    'https://dev.ospirator.com',
 ]
 _configured_cors_allowed_origins = _split_csv_env("CORS_ALLOWED_ORIGINS", [])
 CORS_ALLOWED_ORIGINS = list(dict.fromkeys([*_default_cors_allowed_origins, *_configured_cors_allowed_origins]))
