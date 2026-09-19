@@ -489,19 +489,16 @@ DATA_UPLOAD_MAX_MEMORY_SIZE = 2147483648  # 2GB
 FILE_UPLOAD_MAX_MEMORY_SIZE = 2147483648  # 2GB
 
 
-"""
+REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
+
 CACHES = {
     "default": {
-        "BACKEND": "django_redis.cache.RedisCache",
-        "LOCATION": "redis://redis:6379/",
-        "OPTIONS": {
-            "CLIENT_CLASS": "django_redis.client.DefaultClient",
-        }
+        "BACKEND": "django.core.cache.backends.redis.RedisCache",
+        "LOCATION": os.getenv("DJANGO_CACHE_URL", REDIS_URL),
     }
 }
-"""
 
-CELERY_BROKER_URL = os.getenv('CELERY_BROKER_URL', 'redis://redis:6379/0')  
-CELERY_RESULT_BACKEND = os.getenv('CELERY_RESULT_BACKEND', 'redis://redis:6379/0')
+CELERY_BROKER_URL = os.getenv('CELERY_BROKER_URL', REDIS_URL)
+CELERY_RESULT_BACKEND = os.getenv('CELERY_RESULT_BACKEND', REDIS_URL)
 USE_L10N = True
 USE_THOUSAND_SEPARATOR = True
