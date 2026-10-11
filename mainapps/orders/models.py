@@ -59,8 +59,29 @@ class PurchaseOrderLineItem(UUIDBaseModel):
         related_name='purchase_order_lines',
         on_delete=models.PROTECT,
     )
+    structural_location = models.ForeignKey(
+        'stock.StockLocation',
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name='purchase_order_line_items',
+        help_text='Structural stock location this replenishment line is intended for.',
+    )
     quantity = models.PositiveIntegerField(
         validators=[MinValueValidator(1)]
+    )
+    quantity_uom_code = models.CharField(max_length=32, blank=True, default="")
+    stock_quantity = models.DecimalField(
+        max_digits=15,
+        decimal_places=5,
+        null=True,
+        blank=True,
+        help_text="Canonical stock quantity derived from quantity and its UOM.",
+    )
+    conversion_factor_snapshot = models.DecimalField(
+        max_digits=15,
+        decimal_places=5,
+        default=1,
     )
     quantity_received = models.DecimalField(
         max_digits=15,
@@ -94,26 +115,40 @@ class PurchaseOrderLineItem(UUIDBaseModel):
         if not self.batch_number:
             self.batch_number = self.generate_batch_number()
         self.full_clean()
-        self.fully_received = Decimal(str(self.quantity_received)) >= Decimal(str(self.quantity))
+        self.fully_received = Decimal(str(self.quantity_received)) >= self.ordered_stock_quantity
         super().save(*args, **kwargs)
+
+    @property
+    def ordered_stock_quantity(self):
+        return Decimal(str(self.stock_quantity)) if self.stock_quantity is not None else (
+            Decimal(str(self.quantity)) * Decimal(str(self.conversion_factor_snapshot or 1))
+        )
 
     def clean(self):
         if not self.inventory_item_id:
             raise ValidationError("inventory_item must be provided.")
+        if self.structural_location_id and self.purchase_order_id:
+            item_profile = getattr(self.inventory_item, 'profile_id', None)
+            location_profile = getattr(self.structural_location, 'profile_id', None)
+            order_profile = getattr(self.purchase_order, 'profile_id', None)
+            if item_profile is not None and location_profile is not None and item_profile != location_profile:
+                raise ValidationError("The purchase-order line location must belong to the inventory workspace.")
+            if order_profile is not None and location_profile is not None and order_profile != location_profile:
+                raise ValidationError("The purchase-order line location must belong to the purchase-order workspace.")
         if self.quantity <= 0:
             raise ValidationError("Quantity must be greater than zero.")
         if self.unit_price < 0:
             raise ValidationError("Unit price must be non-negative.")
         if Decimal(str(self.quantity_received)) < 0:
             raise ValidationError("Quantity received cannot be negative.")
-        if Decimal(str(self.quantity_received)) > Decimal(str(self.quantity)):
+        if Decimal(str(self.quantity_received)) > self.ordered_stock_quantity:
             raise ValidationError("Quantity received cannot exceed ordered quantity.")
-        _validate_inventory_dates(
-            manufactured_date=self.manufactured_date,
-            expiry_date=self.expiry_date,
-        )
+        if self.manufactured_date or self.expiry_date:
+            raise ValidationError(
+                "Manufacture and expiry dates are captured when goods are received, not on a purchase-order line."
+            )
         minimum_quantity = Decimal(str(self.inventory_item.reorder_quantity or 0)) if self.inventory_item_id else Decimal("0")
-        if minimum_quantity > 0 and Decimal(str(self.quantity)) < minimum_quantity:
+        if minimum_quantity > 0 and self.ordered_stock_quantity < minimum_quantity:
             raise ValidationError(
                 {"quantity": f"Quantity cannot be lower than the inventory item's reorder quantity ({minimum_quantity})."}
             )
@@ -138,7 +173,7 @@ class PurchaseOrderLineItem(UUIDBaseModel):
 
     @property
     def remaining_quantity(self):
-        return max(Decimal(str(self.quantity)) - Decimal(str(self.quantity_received)), Decimal("0"))
+        return max(self.ordered_stock_quantity - Decimal(str(self.quantity_received)), Decimal("0"))
 
 
 class TotalPriceMixin(UUIDBaseModel):
@@ -562,6 +597,19 @@ class SalesOrderLineItem(UUIDBaseModel):
         related_name='sales_order_lines',
     )
     quantity = models.DecimalField(max_digits=15, decimal_places=5, validators=[MinValueValidator(1)])
+    quantity_uom_code = models.CharField(max_length=32, blank=True, default="")
+    stock_quantity = models.DecimalField(
+        max_digits=15,
+        decimal_places=5,
+        null=True,
+        blank=True,
+        help_text="Canonical stock quantity derived from quantity and its UOM.",
+    )
+    conversion_factor_snapshot = models.DecimalField(
+        max_digits=15,
+        decimal_places=5,
+        default=1,
+    )
     reserved_quantity = models.DecimalField(max_digits=15, decimal_places=5, default=0)
     shipped_quantity = models.DecimalField(max_digits=15, decimal_places=5, default=0)
     unit_price = models.DecimalField(max_digits=15, decimal_places=2)
@@ -580,11 +628,16 @@ class SalesOrderLineItem(UUIDBaseModel):
             raise ValidationError("Reserved quantity cannot be negative.")
         if Decimal(str(self.shipped_quantity)) < 0:
             raise ValidationError("Shipped quantity cannot be negative.")
-        if Decimal(str(self.reserved_quantity)) > Decimal(str(self.quantity)):
+        ordered_stock_quantity = (
+            Decimal(str(self.stock_quantity))
+            if self.stock_quantity is not None
+            else Decimal(str(self.quantity)) * Decimal(str(self.conversion_factor_snapshot or 1))
+        )
+        if Decimal(str(self.reserved_quantity)) > ordered_stock_quantity:
             raise ValidationError("Reserved quantity cannot exceed ordered quantity.")
-        if Decimal(str(self.shipped_quantity)) > Decimal(str(self.quantity)):
+        if Decimal(str(self.shipped_quantity)) > ordered_stock_quantity:
             raise ValidationError("Shipped quantity cannot exceed ordered quantity.")
-        if Decimal(str(self.reserved_quantity)) + Decimal(str(self.shipped_quantity)) > Decimal(str(self.quantity)):
+        if Decimal(str(self.reserved_quantity)) + Decimal(str(self.shipped_quantity)) > ordered_stock_quantity:
             raise ValidationError("Reserved and shipped quantities combined cannot exceed ordered quantity.")
 
     @property
@@ -604,12 +657,22 @@ class SalesOrderLineItem(UUIDBaseModel):
 
     @property
     def remaining_quantity(self):
-        return max(Decimal(str(self.quantity)) - Decimal(str(self.shipped_quantity)), Decimal("0"))
+        ordered_stock_quantity = (
+            Decimal(str(self.stock_quantity))
+            if self.stock_quantity is not None
+            else Decimal(str(self.quantity)) * Decimal(str(self.conversion_factor_snapshot or 1))
+        )
+        return max(ordered_stock_quantity - Decimal(str(self.shipped_quantity)), Decimal("0"))
 
     @property
     def reservable_quantity(self):
+        ordered_stock_quantity = (
+            Decimal(str(self.stock_quantity))
+            if self.stock_quantity is not None
+            else Decimal(str(self.quantity)) * Decimal(str(self.conversion_factor_snapshot or 1))
+        )
         return max(
-            Decimal(str(self.quantity))
+            ordered_stock_quantity
             - Decimal(str(self.shipped_quantity))
             - Decimal(str(self.reserved_quantity)),
             Decimal("0"),
@@ -765,6 +828,10 @@ class SalesOrderShipmentLine(UUIDBaseModel):
         related_name='shipment_lines',
     )
     quantity_shipped = models.DecimalField(max_digits=15, decimal_places=5, validators=[MinValueValidator(1)])
+    unit_cost = models.DecimalField(max_digits=15, decimal_places=5, default=0)
+    cogs_amount = models.DecimalField(max_digits=18, decimal_places=5, default=0)
+    revenue_amount = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    gross_margin = models.DecimalField(max_digits=18, decimal_places=2, default=0)
     notes = models.TextField(blank=True)
 
     class Meta:
@@ -776,6 +843,104 @@ class SalesOrderShipmentLine(UUIDBaseModel):
 
     def __str__(self):
         return f"{self.quantity_shipped} shipped on {self.shipment.reference}"
+
+
+class CustomerReturnStatus(models.TextChoices):
+    PENDING = 'pending', _('Pending')
+    RECEIVED = 'received', _('Received')
+    COMPLETED = 'completed', _('Completed')
+    CANCELLED = 'cancelled', _('Cancelled')
+
+
+class CustomerReturn(ProfileMixin):
+    reference = models.CharField(max_length=64, unique=True)
+    idempotency_key = models.CharField(
+        max_length=200,
+        blank=True,
+        default='',
+        help_text='Client mutation key, unique within the workspace when supplied.',
+    )
+    completion_idempotency_key = models.CharField(
+        max_length=200,
+        blank=True,
+        default='',
+        help_text='Stable key for the completion mutation, unique within the workspace when supplied.',
+    )
+    sales_order = models.ForeignKey(
+        SalesOrder,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name='customer_returns',
+    )
+    status = models.CharField(
+        max_length=20,
+        choices=CustomerReturnStatus.choices,
+        default=CustomerReturnStatus.PENDING,
+    )
+    return_date = models.DateField(default=timezone.now)
+    reason = models.TextField(blank=True, default='')
+    notes = models.TextField(blank=True, default='')
+
+    class Meta:
+        ordering = ['-return_date', '-created_at']
+        indexes = [models.Index(fields=['profile_id', 'status', 'return_date'])]
+        constraints = [
+            models.UniqueConstraint(
+                fields=['profile_id', 'idempotency_key'],
+                condition=~models.Q(idempotency_key=''),
+                name='unique_customer_return_profile_idempotency',
+            ),
+            models.UniqueConstraint(
+                fields=['profile_id', 'completion_idempotency_key'],
+                condition=~models.Q(completion_idempotency_key=''),
+                name='unique_customer_return_profile_completion_idempotency',
+            ),
+        ]
+
+    def save(self, *args, **kwargs):
+        if not self.reference:
+            self.reference = f"CR-{uuid.uuid4().hex[:12].upper()}"
+        super().save(*args, **kwargs)
+
+
+class CustomerReturnLine(UUIDBaseModel):
+    customer_return = models.ForeignKey(CustomerReturn, on_delete=models.CASCADE, related_name='lines')
+    shipment_line = models.ForeignKey(
+        SalesOrderShipmentLine,
+        on_delete=models.PROTECT,
+        related_name='customer_return_lines',
+    )
+    quantity_returned = models.DecimalField(max_digits=15, decimal_places=5, validators=[MinValueValidator(Decimal('0.00001'))])
+    quantity_received = models.DecimalField(max_digits=15, decimal_places=5, default=0)
+    stock_quantity_returned = models.DecimalField(max_digits=15, decimal_places=5, default=0)
+    stock_quantity_received = models.DecimalField(max_digits=15, decimal_places=5, default=0)
+    unit_cost = models.DecimalField(max_digits=15, decimal_places=5, default=0)
+    cogs_reversal = models.DecimalField(max_digits=18, decimal_places=5, default=0)
+    revenue_reversal = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    reason = models.TextField(blank=True, default='')
+
+    class Meta:
+        ordering = ['created_at']
+        constraints = [
+            models.UniqueConstraint(fields=['customer_return', 'shipment_line'], name='unique_customer_return_shipment_line'),
+        ]
+
+    @property
+    def remaining_quantity(self):
+        return max(self.quantity_returned - self.quantity_received, Decimal('0'))
+
+    @property
+    def remaining_stock_quantity(self):
+        return max(self.stock_quantity_returned - self.stock_quantity_received, Decimal('0'))
+
+    def clean(self):
+        if self.quantity_returned <= 0:
+            raise ValidationError('Returned quantity must be greater than zero.')
+        if self.quantity_received < 0 or self.quantity_received > self.quantity_returned:
+            raise ValidationError('Received quantity must be between zero and returned quantity.')
+        if self.shipment_line_id and self.quantity_returned > self.shipment_line.quantity_shipped:
+            raise ValidationError('Returned quantity cannot exceed the shipped quantity on the line.')
 
 
 class ReturnOrderStatus(models.TextChoices):
@@ -804,6 +969,7 @@ class ReturnOrder(TotalPriceMixin, Order):
         # default=order.validators.generate_next_return_order_reference,
         # validators=[order.validators.validate_return_order_reference],
     )
+    dispatch_idempotency_key = models.CharField(max_length=200, blank=True, default='')
     purchase_order = models.ForeignKey(
         PurchaseOrder,
         on_delete=models.SET_NULL,
@@ -849,6 +1015,15 @@ class ReturnOrder(TotalPriceMixin, Order):
         verbose_name=_('Return Reason'),
         help_text=_('Detailed reason for the return')
     )
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['profile_id', 'dispatch_idempotency_key'],
+                condition=~models.Q(dispatch_idempotency_key=''),
+                name='unique_return_order_profile_dispatch_idempotency',
+            ),
+        ]
     
     def save(self, *args, **kwargs):
         if not self.reference:

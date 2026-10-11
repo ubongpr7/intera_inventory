@@ -15,10 +15,16 @@ x-service: &service
       max-file: "3"
 
 services:
+  migrate:
+    <<: *service
+    restart: "no"
+    profiles: ["release"]
+    command: ["python", "manage.py", "migrate", "--noinput"]
+
   web:
     <<: *service
     container_name: interaims-dev-inventory-web
-    command: ["sh", "-c", "python manage.py migrate && python manage.py runserver 0.0.0.0:7002"]
+    command: ["sh", "-c", "exec uvicorn core.asgi:application --host 0.0.0.0 --port 7002 --workers $${WEB_CONCURRENCY:-2}"]
     expose:
       - "7002"
 
@@ -26,6 +32,11 @@ services:
     <<: *service
     container_name: interaims-dev-inventory-consumer
     command: ["sh", "-c", "python manage.py consume_kafka"]
+
+  reorder-worker:
+    <<: *service
+    container_name: interaims-dev-inventory-reorder-worker
+    command: ["sh", "-c", "python manage.py evaluate_automated_reorders --interval $${AUTOMATED_REORDER_INTERVAL_SECONDS:-18000}"]
 
   outbox:
     <<: *service

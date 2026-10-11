@@ -31,6 +31,20 @@ services:
       - .:/app
       - venv:/app/.venv
     restart: unless-stopped
+  reorder_worker:
+    build:
+      context: .
+    container_name: intera-inventory-reorder-worker
+    env_file:
+      - .env
+    command: >
+      sh -c "
+        uv run manage.py evaluate_automated_reorders --interval $${AUTOMATED_REORDER_INTERVAL_SECONDS:-18000}
+      "
+    volumes:
+      - .:/app
+      - venv:/app/.venv
+    restart: unless-stopped
   outbox_publisher:
     build:
       context: .

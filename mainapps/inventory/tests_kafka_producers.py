@@ -163,6 +163,7 @@ class InventoryKafkaProducerTests(SimpleTestCase):
 
         publish_inventory_availability_upserted(inventory_item_id="inv-1")
 
+        self.assertTrue(publish_event.call_args.kwargs["use_outbox"])
         envelope_overrides = publish_event.call_args.kwargs["envelope_overrides"]
         self.assertEqual(envelope_overrides["workspace_id"], "7")
         self.assertEqual(envelope_overrides["actor"]["user_id"], "34")

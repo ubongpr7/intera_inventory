@@ -22,7 +22,7 @@ from mainapps.content_type_linking_models.models import (
 )
 from django.db import transaction
 from django.db.models import F
-from django.core.validators import RegexValidator
+from django.core.validators import MinValueValidator
 from django.core.exceptions import ValidationError
 
 
@@ -524,8 +524,28 @@ class InventoryItem(TenantStampedUUIDModel):
     track_serial = models.BooleanField(default=False, verbose_name=_("Track Serial"))
     track_expiry = models.BooleanField(default=False, verbose_name=_("Track Expiry"))
     allow_negative_stock = models.BooleanField(default=False, verbose_name=_("Allow Negative Stock"))
+    assembly = models.BooleanField(
+        default=False,
+        help_text=_("Can this inventory item be produced from other inventory items?"),
+    )
+    component = models.BooleanField(
+        default=False,
+        help_text=_("Can this inventory item be consumed in production of another item?"),
+    )
+    purchaseable = models.BooleanField(
+        default=True,
+        help_text=_("Can this inventory item be purchased from a supplier?"),
+    )
+    salable = models.BooleanField(
+        default=True,
+        help_text=_("Can this inventory item be sold directly to customers?"),
+    )
     reorder_point = models.DecimalField(max_digits=15, decimal_places=5, default=0)
     reorder_quantity = models.DecimalField(max_digits=15, decimal_places=5, default=0)
+    automate_reorder = models.BooleanField(
+        default=False,
+        help_text=_('Allow the background worker to create approval-gated purchase orders at the reorder point.'),
+    )
     minimum_stock_level = models.DecimalField(max_digits=15, decimal_places=5, default=0)
     safety_stock_level = models.DecimalField(max_digits=15, decimal_places=5, default=0)
     default_supplier = models.ForeignKey(
@@ -570,6 +590,65 @@ class InventoryItem(TenantStampedUUIDModel):
         return self.name_snapshot
 
 
+class InventoryItemUnit(TenantStampedUUIDModel):
+    """A product-specific purchasable or sellable unit.
+
+    Stock is always stored in the parent item's ``stock_uom_code``.  The
+    conversion factor is intentionally item-specific because a carton does
+    not contain the same number of units for every product.
+    """
+
+    inventory_item = models.ForeignKey(
+        InventoryItem,
+        on_delete=models.CASCADE,
+        related_name="units",
+    )
+    code = models.CharField(max_length=32)
+    label = models.CharField(max_length=80)
+    conversion_to_stock = models.DecimalField(
+        max_digits=15,
+        decimal_places=5,
+        validators=[MinValueValidator(Decimal("0.00001"))],
+    )
+    is_purchase_unit = models.BooleanField(default=False)
+    is_sale_unit = models.BooleanField(default=True)
+    allows_partial = models.BooleanField(default=False)
+    decimal_places = models.PositiveSmallIntegerField(default=0)
+    selling_price = models.DecimalField(max_digits=15, decimal_places=2, null=True, blank=True)
+    metadata = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        ordering = ["code"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["inventory_item", "code"],
+                name="unique_inventory_item_unit_code",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(conversion_to_stock__gt=0),
+                name="inventory_item_unit_positive_conversion",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(decimal_places__lte=5),
+                name="inventory_item_unit_decimal_places_lte_5",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["profile_id", "inventory_item", "code"]),
+            models.Index(fields=["profile_id", "code"]),
+        ]
+
+    def clean(self):
+        super().clean()
+        if self.conversion_to_stock is None or self.conversion_to_stock <= 0:
+            raise ValidationError({"conversion_to_stock": "Conversion factor must be greater than zero."})
+        if self.decimal_places > 5:
+            raise ValidationError({"decimal_places": "Decimal precision cannot exceed five places."})
+
+    def __str__(self):
+        return f"{self.inventory_item.name_snapshot} ({self.code})"
+
+
 class InventoryPlacement(TenantStampedUUIDModel):
     inventory_item = models.ForeignKey(
         InventoryItem,
@@ -589,6 +668,11 @@ class InventoryPlacement(TenantStampedUUIDModel):
     purchaseable_override = models.BooleanField(null=True, blank=True, verbose_name=_("Purchaseable Override"))
     reorder_point_override = models.DecimalField(max_digits=15, decimal_places=5, null=True, blank=True)
     reorder_quantity_override = models.DecimalField(max_digits=15, decimal_places=5, null=True, blank=True)
+    automate_reorder_override = models.BooleanField(
+        null=True,
+        blank=True,
+        help_text=_('Override the inventory item automatic-reorder setting for this structural location.'),
+    )
     minimum_stock_level_override = models.DecimalField(max_digits=15, decimal_places=5, null=True, blank=True)
     safety_stock_level_override = models.DecimalField(max_digits=15, decimal_places=5, null=True, blank=True)
     allow_negative_stock_override = models.BooleanField(null=True, blank=True, verbose_name=_("Allow Negative Stock Override"))
@@ -628,4 +712,126 @@ class InventoryPlacement(TenantStampedUUIDModel):
         return f"{self.inventory_item.name_snapshot} @ {self.location_name_snapshot or self.structural_location_id}"
 
 
-registerable_models = [InventoryCategory, InventoryItem, InventoryPlacement]
+class AutomatedReorderDecision(TenantStampedUUIDModel):
+    """Durable, idempotent record of an automatic replenishment decision.
+
+    One open decision is allowed for an item/location pair. This prevents a
+    polling worker from creating duplicate purchase orders while an earlier
+    system-curated order is awaiting approval, issue, or receipt.
+    """
+
+    class Status(models.TextChoices):
+        OPEN = 'open', _('Open')
+        RESOLVED = 'resolved', _('Resolved')
+        SKIPPED = 'skipped', _('Skipped')
+
+    inventory_item = models.ForeignKey(
+        InventoryItem,
+        on_delete=models.CASCADE,
+        related_name='automated_reorder_decisions',
+    )
+    structural_location = TreeForeignKey(
+        'stock.StockLocation',
+        on_delete=models.PROTECT,
+        related_name='automated_reorder_decisions',
+    )
+    purchase_order = models.ForeignKey(
+        'orders.PurchaseOrder',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='automated_reorder_decisions',
+    )
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.OPEN, db_index=True)
+    quantity_on_hand = models.DecimalField(max_digits=15, decimal_places=5, default=0)
+    reorder_point = models.DecimalField(max_digits=15, decimal_places=5, default=0)
+    reorder_quantity = models.DecimalField(max_digits=15, decimal_places=5, default=0)
+    supplier_id_snapshot = models.CharField(max_length=64, null=True, blank=True)
+    idempotency_key = models.CharField(max_length=255, unique=True)
+    metadata = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['profile_id', 'status', 'inventory_item']),
+            models.Index(fields=['profile_id', 'structural_location', 'status']),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=['inventory_item', 'structural_location'],
+                condition=models.Q(status='open'),
+                name='unique_open_reorder_decision_item_location',
+            ),
+        ]
+
+
+class OperationalAutomationAlert(TenantStampedUUIDModel):
+    """Durable, workspace-scoped alert emitted by the operations evaluator."""
+
+    class Kind(models.TextChoices):
+        EXPIRY = 'expiry', _('Expiry')
+        PO_PENDING = 'purchase_order_pending', _('Purchase order pending approval')
+        PO_OVERDUE = 'purchase_order_overdue', _('Purchase order overdue')
+        PO_PARTIAL = 'purchase_order_partial', _('Purchase order partially received')
+        STOCK_INTEGRITY = 'stock_integrity', _('Stock integrity')
+
+    class Status(models.TextChoices):
+        OPEN = 'open', _('Open')
+        RESOLVED = 'resolved', _('Resolved')
+
+    kind = models.CharField(max_length=32, choices=Kind.choices, db_index=True)
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.OPEN, db_index=True)
+    severity = models.CharField(max_length=16, default='warning')
+    inventory_item = models.ForeignKey(
+        InventoryItem,
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name='operational_automation_alerts',
+    )
+    stock_lot = models.ForeignKey(
+        'stock.StockLot',
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name='operational_automation_alerts',
+    )
+    stock_balance = models.ForeignKey(
+        'stock.StockBalance',
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name='operational_automation_alerts',
+    )
+    purchase_order = models.ForeignKey(
+        'orders.PurchaseOrder',
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name='operational_automation_alerts',
+    )
+    structural_location = TreeForeignKey(
+        'stock.StockLocation',
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name='operational_automation_alerts',
+    )
+    dedupe_key = models.CharField(max_length=255, unique=True)
+    metadata = models.JSONField(default=dict, blank=True)
+    last_notified_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['profile_id', 'status', 'kind']),
+            models.Index(fields=['profile_id', 'purchase_order', 'status']),
+        ]
+
+
+registerable_models = [
+    InventoryCategory,
+    InventoryItem,
+    InventoryItemUnit,
+    InventoryPlacement,
+    AutomatedReorderDecision,
+    OperationalAutomationAlert,
+]

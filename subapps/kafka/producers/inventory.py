@@ -149,6 +149,20 @@ def _build_purchase_price_snapshot(goods_receipt_line: GoodsReceiptLine) -> dict
         ),
         "profile_id": inventory_item.profile_id,
         "inventory_item_id": str(inventory_item.id),
+        "stock_uom_code": inventory_item.stock_uom_code or inventory_item.default_uom_code or "unit",
+        "units": [
+            {
+                "code": unit.code,
+                "label": unit.label,
+                "conversion_to_stock": unit.conversion_to_stock,
+                "selling_price": unit.selling_price,
+                "is_purchase_unit": unit.is_purchase_unit,
+                "is_sale_unit": unit.is_sale_unit,
+                "allows_partial": unit.allows_partial,
+                "decimal_places": unit.decimal_places,
+            }
+            for unit in inventory_item.units.filter(is_sale_unit=True).order_by("code")
+        ],
         "goods_receipt_line_id": str(goods_receipt_line.id),
         "goods_receipt_reference": goods_receipt.reference if goods_receipt else "",
         "purchase_order_reference": purchase_order.reference if purchase_order else "",
@@ -202,6 +216,16 @@ def _build_location_breakdown(
     balances,
 ) -> list[dict[str, Any]]:
     grouped: dict[str, dict[str, Any]] = {}
+    placements_by_location_id = {
+        str(placement.structural_location_id): placement
+        for placement in inventory_item.placements.select_related("structural_location").filter(active=True)
+    }
+
+    def is_salable_at_location(location_id: str) -> bool:
+        placement = placements_by_location_id.get(location_id)
+        if placement is not None and placement.salable_override is not None:
+            return bool(placement.salable_override)
+        return bool(inventory_item.salable)
 
     for balance in balances:
         structural_location = resolve_structural_location(
@@ -221,6 +245,7 @@ def _build_location_breakdown(
                 "total_quantity": Decimal("0"),
                 "reserved_quantity": Decimal("0"),
                 "available_quantity": Decimal("0"),
+                "is_salable": is_salable_at_location(key),
             }
             grouped[key] = entry
 
@@ -228,7 +253,7 @@ def _build_location_breakdown(
         entry["reserved_quantity"] += _to_decimal(balance.quantity_reserved)
         entry["available_quantity"] += _to_decimal(balance.quantity_available)
 
-    for placement in inventory_item.placements.select_related("structural_location").filter(active=True):
+    for placement in placements_by_location_id.values():
         key = str(placement.structural_location_id)
         grouped.setdefault(
             key,
@@ -239,6 +264,7 @@ def _build_location_breakdown(
                 "total_quantity": Decimal("0"),
                 "reserved_quantity": Decimal("0"),
                 "available_quantity": Decimal("0"),
+                "is_salable": is_salable_at_location(key),
             },
         )
 
@@ -252,6 +278,7 @@ def _build_location_breakdown(
                 "total_quantity": Decimal("0"),
                 "reserved_quantity": Decimal("0"),
                 "available_quantity": Decimal("0"),
+                "is_salable": bool(inventory_item.salable),
             }
 
     ordered = sorted(
@@ -314,7 +341,24 @@ def _build_availability_snapshot(inventory_item: InventoryItem) -> dict[str, Any
         "track_stock": inventory_item.track_stock,
         "track_lot": inventory_item.track_lot,
         "track_serial": inventory_item.track_serial,
+        "is_salable": inventory_item.salable,
+        "is_component": inventory_item.component,
         "inventory_item_status": inventory_item.status,
+        "default_uom_code": inventory_item.default_uom_code or "",
+        "stock_uom_code": inventory_item.stock_uom_code or inventory_item.default_uom_code or "",
+        "units": [
+            {
+                "code": unit.code,
+                "label": unit.label,
+                "conversion_to_stock": unit.conversion_to_stock,
+                "is_purchase_unit": unit.is_purchase_unit,
+                "is_sale_unit": unit.is_sale_unit,
+                "allows_partial": unit.allows_partial,
+                "decimal_places": unit.decimal_places,
+                "selling_price": unit.selling_price,
+            }
+            for unit in inventory_item.units.all()
+        ],
     }
 
 
@@ -333,6 +377,7 @@ def _serialize_reservation(reservation: StockReservation) -> dict[str, Any]:
         "fulfilled_quantity": reservation.fulfilled_quantity,
         "remaining_quantity": reservation.remaining_quantity,
         "expires_at": reservation.expires_at.isoformat() if reservation.expires_at else None,
+        "unit_cost": reservation.stock_lot.unit_cost if reservation.stock_lot_id else None,
     }
 
 
@@ -370,6 +415,9 @@ def publish_inventory_availability_upserted(*, inventory_item_id) -> dict[str, A
         "inventory.availability.upserted",
         payload,
         key=payload["variant_id"],
+        # Availability feeds POS and must survive broker/process interruptions.
+        # The outbox publisher retries delivery after the transaction commits.
+        use_outbox=True,
         envelope_overrides=build_audit_envelope(
             workspace_id=_string(payload.get("profile_id")),
             actor={"user_id": _string(inventory_item.updated_by_user_id or inventory_item.created_by_user_id)},
