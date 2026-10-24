@@ -56,6 +56,8 @@ jobs:
           set -euo pipefail
           /usr/local/bin/interaims-host-init
           cd "${{ env.DEPLOY_PATH }}"
+          docker compose -f "${{ env.COMPOSE_FILE }}" --profile release build web migrate
+          docker compose -f "${{ env.COMPOSE_FILE }}" --profile release run --rm migrate
           docker compose -f "${{ env.COMPOSE_FILE }}" up -d --build --force-recreate --remove-orphans
           docker image prune -f || true
           docker compose -f "${{ env.COMPOSE_FILE }}" ps

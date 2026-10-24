@@ -5,10 +5,11 @@ import secrets
 import uuid
 
 from django.db.models import Count, DecimalField, ExpressionWrapper, F, Q, Sum
+from django.db import transaction
 from django.http import HttpResponse
 from django.utils import timezone
 from django_filters.rest_framework import DjangoFilterBackend
-from rest_framework import filters, status, viewsets
+from rest_framework import filters, permissions, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied
 from rest_framework.response import Response
@@ -24,9 +25,16 @@ from mainapps.stock.models import (
     StockLocationType,
     StockLot,
     StockMovement,
+    StockMovementType,
     StockReservation,
     StockReservationStatus,
     StockSerial,
+    StockLotStatus,
+    WarehouseConfiguration,
+    WarehouseZone,
+    CycleCountSchedule,
+    StockCountSession,
+    StockCountLine,
 )
 from mainapps.stock.serializers import (
     InventoryItemDetailSerializer,
@@ -42,6 +50,11 @@ from mainapps.stock.serializers import (
     StockReservationMutationSerializer,
     StockReservationSerializer,
     StockSerialDetailSerializer,
+    WarehouseConfigurationSerializer,
+    WarehouseZoneSerializer,
+    CycleCountScheduleSerializer,
+    StockCountSessionSerializer,
+    StockCountLineSerializer,
 )
 from subapps.kafka.producers.inventory_admin import (
     publish_inventory_admin_event,
@@ -54,6 +67,7 @@ from subapps.pagination import OptionalPageNumberPagination
 from subapps.permissions.constants import CombinedPermissions
 from subapps.permissions.microservice_permissions import BaseCachePermissionViewset, CachingMixin, PermissionRequiredMixin
 from subapps.services.inventory_read_model import (
+    get_location_stock_summary,
     get_inventory_item_summary_map,
     get_low_stock_rows,
     get_profile_stock_analytics,
@@ -63,6 +77,7 @@ from subapps.services.location_scope import (
     get_location_scope_ids_for_locations,
     resolve_structural_locations,
 )
+from subapps.services.inventory_uom import ensure_base_inventory_unit
 from subapps.services.stock_domain import StockDomainError, StockDomainService
 from subapps.services.pdf.pdf_service import PDFService, PDFServiceUnavailableError
 from subapps.utils.request_context import get_request_profile_id, get_request_user_id, scope_queryset_by_identity
@@ -182,6 +197,9 @@ def filter_inventory_items_for_sales_order(queryset, sales_order_id):
 
 
 class ReadStockLocationType(viewsets.ReadOnlyModelViewSet):
+    # Location types are reference data needed to render location selectors.
+    # They are readable by any authenticated workspace user.
+    permission_classes = [permissions.IsAuthenticated]
     serializer_class = StockLocationTypeSerializer
     queryset = StockLocationType.objects.all()
 
@@ -193,6 +211,14 @@ class StockLocationViewSet(BaseInventoryViewSet):
     search_fields = ['name', 'code', 'description']
     ordering_fields = ['name', 'code', 'created_at']
     ordering = ['name']
+
+    def get_permissions(self):
+        # Every authenticated workspace user must be able to discover the
+        # locations they can operate in. Mutations retain stock_location
+        # permission enforcement through BaseCachePermissionViewset.
+        if self.request.method == 'GET':
+            return [permissions.IsAuthenticated()]
+        return super().get_permissions()
 
     def perform_create(self, serializer):
         from subapps.services.subscription_entitlements import enforce_subscription_limit
@@ -442,6 +468,185 @@ class StockLocationViewSet(BaseInventoryViewSet):
             'from_location': from_location.name,
             'to_location': to_location.name,
         })
+
+    @action(detail=True, methods=['get'], url_path='warehouse-report')
+    def warehouse_report(self, request, pk=None):
+        location = self.get_object()
+        configuration = getattr(location, 'warehouse_configuration', None)
+        stock_summary = get_location_stock_summary(location)
+        zones = list(location.warehouse_zones.filter(active=True).values('id', 'name', 'code', 'kind', 'capacity'))
+        cycle_counts = list(location.cycle_count_schedules.filter(active=True).values('id', 'inventory_item_id', 'frequency_days', 'next_count_at', 'variance_tolerance'))
+        return Response({
+            'location': {'id': str(location.id), 'name': location.name, 'code': location.code},
+            'stock_summary': stock_summary,
+            'configuration': WarehouseConfigurationSerializer(configuration).data if configuration else None,
+            'zones': zones,
+            'cycle_count_schedules': cycle_counts,
+            'capacity': configuration.capacity if configuration else 0,
+        })
+
+
+class WarehouseConfigurationViewSet(BaseInventoryViewSet):
+    required_permission = UNIFIED_PERMISSION_DICT.get('warehouse_settings')
+    queryset = WarehouseConfiguration.objects.select_related('location')
+    serializer_class = WarehouseConfigurationSerializer
+    filterset_fields = ['location']
+
+    def perform_create(self, serializer):
+        profile_id = get_request_profile_id(self.request, required=True, as_str=False)
+        location = serializer.validated_data['location']
+        if location.profile_id != profile_id or not location.structural:
+            from rest_framework.exceptions import ValidationError
+            raise ValidationError({'location': 'Configuration must belong to a structural location in the active workspace.'})
+        serializer.save(profile_id=profile_id)
+
+
+class WarehouseZoneViewSet(BaseInventoryViewSet):
+    required_permission = UNIFIED_PERMISSION_DICT.get('warehouse_settings')
+    queryset = WarehouseZone.objects.select_related('location')
+    serializer_class = WarehouseZoneSerializer
+    filterset_fields = ['location', 'kind', 'active']
+    search_fields = ['name', 'code']
+    ordering_fields = ['name', 'code', 'capacity']
+
+    def perform_create(self, serializer):
+        profile_id = get_request_profile_id(self.request, required=True, as_str=False)
+        location = serializer.validated_data['location']
+        if location.profile_id != profile_id:
+            from rest_framework.exceptions import ValidationError
+            raise ValidationError({'location': 'Zone must belong to the active workspace.'})
+        serializer.save(profile_id=profile_id)
+
+
+class CycleCountScheduleViewSet(BaseInventoryViewSet):
+    required_permission = UNIFIED_PERMISSION_DICT.get('warehouse_settings')
+    queryset = CycleCountSchedule.objects.select_related('location', 'inventory_item')
+    serializer_class = CycleCountScheduleSerializer
+    filterset_fields = ['location', 'inventory_item', 'active']
+    ordering_fields = ['next_count_at', 'frequency_days']
+
+    def perform_create(self, serializer):
+        profile_id = get_request_profile_id(self.request, required=True, as_str=False)
+        location = serializer.validated_data['location']
+        item = serializer.validated_data.get('inventory_item')
+        if location.profile_id != profile_id or (item is not None and item.profile_id != profile_id):
+            from rest_framework.exceptions import ValidationError
+            raise ValidationError({'location': 'All cycle-count records must belong to the active workspace.'})
+        serializer.save(profile_id=profile_id)
+
+
+class StockCountSessionViewSet(BaseInventoryViewSet):
+    required_permission = UNIFIED_PERMISSION_DICT.get('warehouse_settings')
+    queryset = StockCountSession.objects.select_related('location').prefetch_related('lines__inventory_item')
+    serializer_class = StockCountSessionSerializer
+    filterset_fields = ['location', 'status']
+    ordering_fields = ['started_at', 'submitted_at', 'status']
+
+    def perform_create(self, serializer):
+        profile_id = get_request_profile_id(self.request, required=True, as_str=False)
+        location = serializer.validated_data['location']
+        if location.profile_id != profile_id or not location.structural:
+            from rest_framework.exceptions import ValidationError
+            raise ValidationError({'location': 'Counts must target a structural location in the active workspace.'})
+        session = serializer.save(profile_id=profile_id, counted_by_user_id=get_request_user_id(self.request, as_str=False))
+        scoped_ids = _resolve_location_scope_ids(profile_id=profile_id, location_id=location.id)
+        rows = StockBalance.objects.filter(
+            profile_id=profile_id,
+            stock_location_id__in=scoped_ids,
+        ).values('inventory_item_id').annotate(expected_quantity=Sum('quantity_on_hand'))
+        StockCountLine.objects.bulk_create([
+            StockCountLine(
+                profile_id=profile_id,
+                session=session,
+                inventory_item_id=row['inventory_item_id'],
+                expected_quantity=row['expected_quantity'] or Decimal('0'),
+            ) for row in rows
+        ])
+
+    @action(detail=True, methods=['post'])
+    def record_counts(self, request, pk=None):
+        session = self.get_object()
+        if session.status != StockCountSession.Status.OPEN:
+            return Response({'detail': 'Only open count sessions can be recorded.'}, status=status.HTTP_409_CONFLICT)
+        lines = request.data.get('lines')
+        if not isinstance(lines, list):
+            return Response({'lines': 'Provide a list of line counts.'}, status=status.HTTP_400_BAD_REQUEST)
+        for payload in lines:
+            line = session.lines.filter(pk=payload.get('id')).first()
+            if line is None:
+                return Response({'detail': 'A count line does not belong to this session.'}, status=status.HTTP_400_BAD_REQUEST)
+            try:
+                value = Decimal(str(payload.get('counted_quantity')))
+                if value < 0:
+                    raise ValueError
+            except (TypeError, ValueError, ArithmeticError):
+                return Response({'counted_quantity': 'Use a non-negative number.'}, status=status.HTTP_400_BAD_REQUEST)
+            line.counted_quantity = value
+            line.notes = str(payload.get('notes') or '')
+            line.save(update_fields=['counted_quantity', 'notes'])
+        return Response(StockCountSessionSerializer(session, context={'request': request}).data)
+
+    @action(detail=True, methods=['post'])
+    def submit(self, request, pk=None):
+        session = self.get_object()
+        if session.status != StockCountSession.Status.OPEN:
+            return Response({'detail': 'Only open count sessions can be submitted.'}, status=status.HTTP_409_CONFLICT)
+        if session.lines.filter(counted_quantity__isnull=True).exists():
+            return Response({'detail': 'Record every count line before submitting.'}, status=status.HTTP_400_BAD_REQUEST)
+        session.status = StockCountSession.Status.SUBMITTED
+        session.submitted_at = timezone.now()
+        session.save(update_fields=['status', 'submitted_at'])
+        return Response(StockCountSessionSerializer(session, context={'request': request}).data)
+
+    @action(detail=True, methods=['post'])
+    def approve(self, request, pk=None):
+        session = self.get_object()
+        if session.status != StockCountSession.Status.SUBMITTED:
+            return Response({'detail': 'Only submitted count sessions can be approved.'}, status=status.HTTP_409_CONFLICT)
+        target_location_id = request.data.get('stock_location_id')
+        if not target_location_id:
+            return Response({'stock_location_id': 'Provide the operational location where count variances should be posted.'}, status=status.HTTP_400_BAD_REQUEST)
+        target_location = StockLocation.objects.filter(
+            id=target_location_id,
+            profile_id=session.profile_id,
+            structural=False,
+        ).first()
+        if target_location is None or str(target_location.id) not in {str(value) for value in _resolve_location_scope_ids(profile_id=session.profile_id, location_id=session.location_id)}:
+            return Response({'stock_location_id': 'The selected location is not inside this count scope.'}, status=status.HTTP_400_BAD_REQUEST)
+        with transaction.atomic():
+            for line in session.lines.select_related('inventory_item'):
+                variance = line.variance
+                if variance in (None, Decimal('0')):
+                    continue
+                balance, _ = StockBalance.objects.select_for_update().get_or_create(
+                    profile_id=session.profile_id,
+                    inventory_item=line.inventory_item,
+                    stock_location=target_location,
+                    stock_lot=None,
+                    defaults={'quantity_on_hand': Decimal('0'), 'quantity_reserved': Decimal('0')},
+                )
+                new_quantity = balance.quantity_on_hand + variance
+                if new_quantity < balance.quantity_reserved:
+                    return Response({'detail': f'Count variance would reduce {line.inventory_item.name_snapshot} below reserved stock.'}, status=status.HTTP_400_BAD_REQUEST)
+                balance.quantity_on_hand = new_quantity
+                balance.save(update_fields=['quantity_on_hand', 'updated_at'])
+                StockMovement.objects.create(
+                    profile_id=session.profile_id,
+                    inventory_item=line.inventory_item,
+                    to_location=target_location if variance > 0 else None,
+                    from_location=target_location if variance < 0 else None,
+                    movement_type=StockMovementType.ADJUSTMENT,
+                    quantity=abs(variance),
+                    reference_type='stock_count_session',
+                    reference_id=str(session.id),
+                    actor_user_id=get_request_user_id(request, as_str=False),
+                    notes=f'Approved cycle-count variance for {line.inventory_item.name_snapshot}.',
+                )
+            session.status = StockCountSession.Status.APPROVED
+        session.approved_at = timezone.now()
+        session.approved_by_user_id = get_request_user_id(request, as_str=False)
+        session.save(update_fields=['status', 'approved_at', 'approved_by_user_id'])
+        return Response(StockCountSessionSerializer(session, context={'request': request}).data)
 
 
 class BaseInventoryViewSetMixin(CachingMixin, PermissionRequiredMixin, viewsets.ModelViewSet):
@@ -863,6 +1068,12 @@ class InventoryItemViewSet(BaseInventoryViewSetMixin):
                 updated_fields.append('updated_by_user_id')
                 inventory_item.save(update_fields=list(dict.fromkeys(updated_fields)))
 
+        ensure_base_inventory_unit(
+            inventory_item,
+            preferred_code=data.get('stock_uom_code') or data.get('default_uom_code') or 'unit',
+            created_by_user_id=get_request_user_id(request, as_str=False),
+        )
+
         payload = serialize_inventory_item(inventory_item)
         publish_inventory_admin_event(
             event_name='inventory.item.created_from_variant' if created else 'inventory.item.synced_from_variant',
@@ -951,7 +1162,7 @@ class StockBalanceViewSet(BaseInventoryReadOnlyViewSetMixin):
 
 
 class StockLotViewSet(BaseInventoryReadOnlyViewSetMixin):
-    required_permission = UNIFIED_PERMISSION_DICT.get('inventory_item')
+    required_permission = UNIFIED_PERMISSION_DICT.get('stock_lot')
     queryset = StockLot.objects.select_related('inventory_item', 'supplier')
     serializer_class = StockLotDetailSerializer
     filterset_fields = ['inventory_item', 'supplier', 'status']
@@ -978,6 +1189,18 @@ class StockLotViewSet(BaseInventoryReadOnlyViewSetMixin):
             queryset = queryset.filter(expiry_date__lte=date_to)
 
         return queryset
+
+    @action(detail=True, methods=['post'])
+    def set_status(self, request, pk=None):
+        lot = self.get_object()
+        next_status = str(request.data.get('status') or '').strip().lower()
+        allowed = {choice.value for choice in StockLotStatus}
+        if next_status not in allowed:
+            return Response({'status': f'Use one of: {sorted(allowed)}.'}, status=status.HTTP_400_BAD_REQUEST)
+        lot.status = next_status
+        lot.updated_by_user_id = get_request_user_id(request, as_str=False)
+        lot.save(update_fields=['status', 'updated_by_user_id', 'updated_at'])
+        return Response(StockLotDetailSerializer(lot, context={'request': request}).data)
 
 
 class StockSerialViewSet(BaseInventoryReadOnlyViewSetMixin):

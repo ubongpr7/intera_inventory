@@ -1615,7 +1615,13 @@ def _get_po_pipeline_sync(*, principal: InventoryMcpPrincipal, limit: int) -> di
         close_old_connections()
 
 
-def _get_receiving_exceptions_sync(*, principal: InventoryMcpPrincipal, limit: int) -> dict[str, Any]:
+def _get_receiving_exceptions_sync(
+    *,
+    principal: InventoryMcpPrincipal,
+    limit: int,
+    date_from: str | None = None,
+    date_to: str | None = None,
+) -> dict[str, Any]:
     close_old_connections()
     try:
         queryset = (
@@ -1633,6 +1639,10 @@ def _get_receiving_exceptions_sync(*, principal: InventoryMcpPrincipal, limit: i
             ])
             .order_by("-updated_at")
         )
+        if date_from:
+            queryset = queryset.filter(created_at__date__gte=str(date_from).strip())
+        if date_to:
+            queryset = queryset.filter(created_at__date__lte=str(date_to).strip())
         results: list[dict[str, Any]] = []
         for order in queryset:
             open_lines = 0
@@ -3232,11 +3242,15 @@ async def get_po_pipeline(
 )
 async def get_receiving_exceptions(
     limit: int = 20,
+    date_from: str | None = None,
+    date_to: str | None = None,
 ) -> dict[str, Any]:
     principal = get_current_principal(required=True)
     return await sync_to_async(_get_receiving_exceptions_sync, thread_sensitive=True)(
         principal=principal,
         limit=max(1, min(int(limit), 50)),
+        date_from=str(date_from).strip() if date_from else None,
+        date_to=str(date_to).strip() if date_to else None,
     )
 
 

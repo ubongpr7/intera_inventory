@@ -5,7 +5,8 @@ from rest_framework.response import Response
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from django_filters.rest_framework import DjangoFilterBackend
 from django.db.models import Prefetch, Q, Sum, Count, Avg, F, Case, When, Value, IntegerField, DecimalField
-from django.db import transaction
+from django.db.models.functions import TruncDate
+from django.db import IntegrityError, transaction
 from django.http import HttpResponse
 from django.utils import timezone
 from datetime import timedelta, datetime
@@ -21,6 +22,9 @@ from mainapps.orders.serializers import (
     PurchaseOrderLineItemCreateSerializer,
     PurchaseOrderListSerializer,
     ReceiveItemsSerializer,
+    CustomerReturnCompleteSerializer,
+    CustomerReturnCreateSerializer,
+    CustomerReturnSerializer,
     ReturnOrderCreateSerializer,
     ReturnOrderDetailSerializer,
     ReturnOrderListSerializer,
@@ -39,6 +43,7 @@ from mainapps.orders.serializers import (
 from mainapps.stock.models import (
     StockLocation,
     StockLot,
+    StockMovement,
     StockMovementType,
     TrackingType,
     StockReservation,
@@ -73,6 +78,7 @@ from subapps.services.pdf.notification_documents import (
 )
 from subapps.services.identity_directory import IdentityDirectory
 from subapps.services.stock_domain import StockDomainError, StockDomainService
+from mainapps.accounting.services import AccountingService
 from subapps.utils.request_context import (
     get_request_profile_id,
     get_request_user_id,
@@ -85,7 +91,8 @@ from .models import (
     GoodsReceipt, GoodsReceiptLine,
     PurchaseOrder, PurchaseOrderLineItem, PurchaseOrderStatus,
     ReturnOrder, ReturnOrderLineItem, ReturnOrderStatus,
-    SalesOrder, SalesOrderLineItem, SalesOrderShipment, SalesOrderStatus,
+    CustomerReturn, CustomerReturnLine, CustomerReturnStatus,
+    SalesOrder, SalesOrderLineItem, SalesOrderShipment, SalesOrderShipmentLine, SalesOrderStatus,
 )
 logger = logging.getLogger(__name__)
 
@@ -301,7 +308,6 @@ class GoodsReceiptViewSet(BaseCachePermissionViewset):
             }
         )
 
-
 class SalesOrderShipmentViewSet(BaseCachePermissionViewset):
     required_permission = UNIFIED_PERMISSION_DICT.get('sales_order')
     queryset = SalesOrderShipment.objects.select_related(
@@ -423,6 +429,10 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
         if self.action == 'list':
             return PurchaseOrderListSerializer
         return PurchaseOrderDetailSerializer
+
+    def create(self, request, *args, **kwargs):
+        """Create a purchase order; global middleware owns replay protection."""
+        return super().create(request, *args, **kwargs)
     
     def get_queryset(self):
         """Filter by profile and add custom filters"""
@@ -1026,6 +1036,7 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
                 for item_data in received_items:
                     line_item_id = item_data['line_item_id']
                     quantity_received = item_data['quantity_received']
+                    quantity_uom_code = item_data.get('quantity_uom_code', '')
                     location_id = item_data['location_id']
                     
                     # Get line item
@@ -1054,6 +1065,7 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
                         line_item=line_item,
                         stock_location=stock_location,
                         quantity_received=quantity_received,
+                        quantity_uom_code=quantity_uom_code,
                         unit_cost=item_data.get('unit_cost'),
                         actor_user_id=current_user_id,
                         goods_receipt=goods_receipt,
@@ -1417,7 +1429,7 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
         serializer = ReturnOrderCreateSerializer(data=request.data)
         if not serializer.is_valid():
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-        
+
         return_items = serializer.validated_data['return_items']
         return_reason = serializer.validated_data.get('return_reason', '')
         current_user = IdentityDirectory.get_current_user(request) or {}
@@ -1517,11 +1529,12 @@ class PurchaseOrderViewSet(BaseCachePermissionViewset):
                     'return_reason': return_reason
                 })
                 
-                return Response({
+                response = Response({
                     'message': 'Return order created successfully',
                     'return_order_reference': return_order.reference,
                     'return_order_id': return_order.id
                 }, status=status.HTTP_201_CREATED)
+                return response
                 
         except Exception as e:
             logger.error(f"Error creating return order for PO {purchase_order.reference}: {str(e)}")
@@ -2371,6 +2384,11 @@ class SalesOrderViewSet(BaseCachePermissionViewset):
     @action(detail=False, methods=['get'])
     def summary(self, request):
         queryset = self.filter_queryset(self.get_queryset())
+        aggregates = queryset.aggregate(
+            revenue=Sum('shipments__lines__revenue_amount'),
+            cogs=Sum('shipments__lines__cogs_amount'),
+            gross_margin=Sum('shipments__lines__gross_margin'),
+        )
         return Response(
             {
                 'total_orders': queryset.count(),
@@ -2379,8 +2397,52 @@ class SalesOrderViewSet(BaseCachePermissionViewset):
                 'in_progress_orders': queryset.filter(status=SalesOrderStatus.IN_PROGRESS).count(),
                 'shipped_orders': queryset.filter(status=SalesOrderStatus.SHIPPED).count(),
                 'ready_to_close_orders': queryset.filter(status=SalesOrderStatus.SHIPPED).count(),
+                'revenue': aggregates.get('revenue') or Decimal('0'),
+                'cogs': aggregates.get('cogs') or Decimal('0'),
+                'gross_margin': aggregates.get('gross_margin') or Decimal('0'),
             }
         )
+
+    @action(detail=False, methods=['get'])
+    def margin(self, request):
+        """Return gross-margin rollups from immutable shipped-line snapshots."""
+        queryset = self.filter_queryset(self.get_queryset())
+        product_rows = queryset.values(
+            'shipments__lines__sales_order_line__inventory_item_id',
+            'shipments__lines__sales_order_line__inventory_item__name_snapshot',
+        ).annotate(
+            revenue=Sum('shipments__lines__revenue_amount'),
+            cogs=Sum('shipments__lines__cogs_amount'),
+            gross_margin=Sum('shipments__lines__gross_margin'),
+        ).order_by('shipments__lines__sales_order_line__inventory_item__name_snapshot')
+        period_rows = queryset.annotate(
+            period=TruncDate('shipments__shipment_date'),
+        ).values('period').annotate(
+            revenue=Sum('shipments__lines__revenue_amount'),
+            cogs=Sum('shipments__lines__cogs_amount'),
+            gross_margin=Sum('shipments__lines__gross_margin'),
+        ).order_by('period')
+        return Response({
+            'products': [
+                {
+                    'inventory_item_id': row['shipments__lines__sales_order_line__inventory_item_id'],
+                    'inventory_item_name': row['shipments__lines__sales_order_line__inventory_item__name_snapshot'],
+                    'revenue': row['revenue'] or Decimal('0'),
+                    'cogs': row['cogs'] or Decimal('0'),
+                    'gross_margin': row['gross_margin'] or Decimal('0'),
+                }
+                for row in product_rows
+            ],
+            'periods': [
+                {
+                    'period': row['period'],
+                    'revenue': row['revenue'] or Decimal('0'),
+                    'cogs': row['cogs'] or Decimal('0'),
+                    'gross_margin': row['gross_margin'] or Decimal('0'),
+                }
+                for row in period_rows
+            ],
+        })
 
     def perform_create(self, serializer):
         current_user_id = get_request_user_id(self.request, as_str=False)
@@ -2674,9 +2736,10 @@ class SalesOrderViewSet(BaseCachePermissionViewset):
                         else line_item.reservable_quantity
                     )
                     reserve_quantity = Decimal(str(item.get('quantity', default_reserve_quantity)))
+                    reserve_uom_code = str(item.get('quantity_uom_code') or line_item.quantity_uom_code or '').strip()
                     if reserve_quantity <= 0:
                         raise ValueError("Reservation quantity must be greater than zero")
-                    if reserve_quantity > line_item.reservable_quantity:
+                    if not reserve_uom_code and reserve_quantity > line_item.reservable_quantity:
                         raise ValueError(
                             f"Cannot reserve {reserve_quantity}; only {line_item.reservable_quantity} remains reservable"
                         )
@@ -2714,6 +2777,7 @@ class SalesOrderViewSet(BaseCachePermissionViewset):
                         inventory_item=line_item.inventory_item,
                         stock_location=stock_location,
                         quantity=reserve_quantity,
+                        quantity_uom_code=reserve_uom_code,
                         external_order_type='sales_order_line',
                         external_order_id=str(sales_order.id),
                         external_order_line_id=str(line_item.id),
@@ -2724,7 +2788,7 @@ class SalesOrderViewSet(BaseCachePermissionViewset):
                         expires_at=payload.get('expires_at'),
                         notes=item.get('notes') or payload.get('notes', '') or f"Reserved for sales order {sales_order.reference}",
                     )
-                    line_item.reserved_quantity = Decimal(str(line_item.reserved_quantity)) + reserve_quantity
+                    line_item.reserved_quantity = Decimal(str(line_item.reserved_quantity)) + Decimal(str(reservation_result['reservation'].reserved_quantity))
                     line_item.updated_by_user_id = current_user_id
                     line_item.save()
                     reservations.append(str(reservation_result['reservation'].id))
@@ -2744,6 +2808,7 @@ class SalesOrderViewSet(BaseCachePermissionViewset):
                     sales_order.status = SalesOrderStatus.IN_PROGRESS
                     sales_order.updated_by_user_id = current_user_id
                     sales_order.save()
+                AccountingService.post_sale(shipment=shipment, actor_user_id=current_user_id)
                 after = serialize_sales_order(sales_order)
                 publish_order_admin_event(
                     event_name='sales_order.stock_reserved',
@@ -2963,6 +3028,8 @@ class SalesOrderViewSet(BaseCachePermissionViewset):
                     reservation = None
                     stock_lot = None
                     stock_serial = None
+                    ship_stock_quantity = Decimal('0')
+                    movement_unit_cost = Decimal('0')
 
                     if 'reservation_id' in item:
                         reservation = StockReservation.objects.select_related(
@@ -2995,6 +3062,7 @@ class SalesOrderViewSet(BaseCachePermissionViewset):
                             raise ValueError(
                                 f"Cannot ship {ship_quantity}; reservation only has {reservation.remaining_quantity} remaining"
                             )
+                        ship_stock_quantity = ship_quantity
 
                         StockDomainService.fulfill_reservation(
                             reservation=reservation,
@@ -3021,11 +3089,15 @@ class SalesOrderViewSet(BaseCachePermissionViewset):
                             else line_item.remaining_quantity
                         )
                         ship_quantity = Decimal(str(item.get('quantity', default_ship_quantity)))
+                        ship_uom_code = str(item.get('quantity_uom_code') or line_item.quantity_uom_code or '').strip()
+                        if ship_uom_code and line_item.quantity_uom_code and ship_uom_code != line_item.quantity_uom_code:
+                            raise ValueError('Shipment UOM must match the sales-order line UOM.')
+                        ship_stock_quantity = ship_quantity * Decimal(str(line_item.conversion_factor_snapshot or 1))
                         if ship_quantity <= 0:
                             raise ValueError("Shipment quantity must be greater than zero")
-                        if ship_quantity > line_item.remaining_quantity:
+                        if ship_stock_quantity > line_item.remaining_quantity:
                             raise ValueError(
-                                f"Cannot ship {ship_quantity}; only {line_item.remaining_quantity} remains on the line item"
+                                f"Cannot ship {ship_stock_quantity}; only {line_item.remaining_quantity} remains on the line item"
                             )
 
                         stock_location = scope_queryset_by_identity(
@@ -3055,10 +3127,11 @@ class SalesOrderViewSet(BaseCachePermissionViewset):
                             if stock_serial is None:
                                 raise ValueError(f"Stock serial {stock_serial_id} not found")
 
-                        StockDomainService.issue_stock(
+                        issue_result = StockDomainService.issue_stock(
                             inventory_item=line_item.inventory_item,
                             stock_location=stock_location,
                             quantity=ship_quantity,
+                            quantity_uom_code=ship_uom_code,
                             actor_user_id=current_user_id,
                             stock_lot=stock_lot,
                             stock_serial=stock_serial,
@@ -3069,8 +3142,26 @@ class SalesOrderViewSet(BaseCachePermissionViewset):
                             movement_type=StockMovementType.ISSUE,
                             tracking_type=TrackingType.SHIPPED,
                         )
+                        stock_lot = issue_result.get('stock_lot') or stock_lot
 
-                    line_item.shipped_quantity = Decimal(str(line_item.shipped_quantity)) + ship_quantity
+                    if stock_lot is not None:
+                        movement_unit_cost = Decimal(str(stock_lot.unit_cost or 0))
+                    if movement_unit_cost == 0:
+                        movement = StockMovement.objects.filter(
+                            profile_id=profile_id,
+                            reference_type='sales_order_line',
+                            reference_id=str(line_item.id),
+                        ).order_by('-created_at').first()
+                        if movement is not None:
+                            movement_unit_cost = Decimal(str(movement.unit_cost or 0))
+
+                    revenue_amount = (
+                        Decimal(str(line_item.total_price)) * ship_quantity / Decimal(str(line_item.quantity))
+                    ).quantize(Decimal('0.01'))
+                    cogs_amount = (ship_stock_quantity * movement_unit_cost).quantize(Decimal('0.00001'))
+                    gross_margin = (revenue_amount - cogs_amount).quantize(Decimal('0.01'))
+
+                    line_item.shipped_quantity = Decimal(str(line_item.shipped_quantity)) + ship_stock_quantity
                     line_item.updated_by_user_id = current_user_id
                     line_item.save()
 
@@ -3081,6 +3172,10 @@ class SalesOrderViewSet(BaseCachePermissionViewset):
                         stock_serial=stock_serial,
                         reservation=reservation,
                         quantity_shipped=ship_quantity,
+                        unit_cost=movement_unit_cost,
+                        cogs_amount=cogs_amount,
+                        revenue_amount=revenue_amount,
+                        gross_margin=gross_margin,
                         notes=notes,
                         created_by_user_id=current_user_id,
                         updated_by_user_id=current_user_id,
@@ -3323,6 +3418,183 @@ class SalesOrderViewSet(BaseCachePermissionViewset):
         except Exception as exc:
             logger.error(f"Failed to log sales-order activity: {str(exc)}")
 
+class CustomerReturnViewSet(BaseCachePermissionViewset):
+    queryset = CustomerReturn.objects.select_related('sales_order').prefetch_related(
+        'lines', 'lines__shipment_line', 'lines__shipment_line__sales_order_line',
+        'lines__shipment_line__sales_order_line__inventory_item',
+    )
+    serializer_class = CustomerReturnSerializer
+    http_method_names = ['get', 'post', 'head', 'options']
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        profile_id = get_request_profile_id(self.request, as_str=False)
+        if profile_id:
+            queryset = scope_queryset_by_identity(queryset, canonical_field='profile_id', legacy_field='profile', value=profile_id)
+        return queryset
+
+    def get_serializer_class(self):
+        if self.action == 'create':
+            return CustomerReturnCreateSerializer
+        if self.action == 'complete':
+            return CustomerReturnCompleteSerializer
+        return CustomerReturnSerializer
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        profile_id = get_request_profile_id(request, required=True, as_str=False)
+        actor_user_id = get_request_user_id(request, as_str=False)
+        idempotency_key = str(
+            request.headers.get('Idempotency-Key')
+            or request.headers.get('X-Idempotency-Key')
+            or request.data.get('idempotency_key')
+            or ''
+        ).strip()
+        if len(idempotency_key) > 200:
+            return Response(
+                {'error': 'Idempotency-Key must be 200 characters or fewer.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if idempotency_key:
+            existing = CustomerReturn.objects.filter(
+                profile_id=profile_id,
+                idempotency_key=idempotency_key,
+            ).first()
+            if existing is not None:
+                return Response(CustomerReturnSerializer(existing).data, status=status.HTTP_200_OK)
+        with transaction.atomic():
+            shipment_lines = SalesOrderShipmentLine.objects.select_related(
+                'shipment__order', 'sales_order_line', 'sales_order_line__inventory_item',
+            )
+            try:
+                with transaction.atomic():
+                    customer_return = CustomerReturn.objects.create(
+                        profile_id=profile_id,
+                        idempotency_key=idempotency_key,
+                        sales_order_id=serializer.validated_data.get('sales_order_id'),
+                        return_date=serializer.validated_data.get('return_date') or timezone.now().date(),
+                        reason=serializer.validated_data.get('reason') or '',
+                        notes=serializer.validated_data.get('notes') or '',
+                        created_by_user_id=actor_user_id,
+                        updated_by_user_id=actor_user_id,
+                    )
+            except IntegrityError:
+                if not idempotency_key:
+                    raise
+                existing = CustomerReturn.objects.filter(
+                    profile_id=profile_id,
+                    idempotency_key=idempotency_key,
+                ).first()
+                if existing is None:
+                    raise
+                return Response(CustomerReturnSerializer(existing).data, status=status.HTTP_200_OK)
+            for item in serializer.validated_data['return_items']:
+                shipment_line = shipment_lines.filter(id=item['shipment_line_id'], shipment__order__profile_id=profile_id).first()
+                if shipment_line is None:
+                    raise ValueError(f"Shipment line {item['shipment_line_id']} not found in this workspace.")
+                quantity = Decimal(str(item['quantity']))
+                already_returned = sum(
+                    (line.quantity_returned for line in shipment_line.customer_return_lines.all()),
+                    Decimal('0'),
+                )
+                if quantity + already_returned > shipment_line.quantity_shipped:
+                    raise ValueError('Returned quantity exceeds the shipped quantity still available for return.')
+                unit_cost = Decimal(str(shipment_line.unit_cost or 0))
+                conversion_factor = Decimal(str(shipment_line.sales_order_line.conversion_factor_snapshot or 1))
+                stock_quantity = (quantity * conversion_factor).quantize(Decimal('0.00001'))
+                revenue_per_unit = Decimal(str(shipment_line.revenue_amount or 0)) / Decimal(str(shipment_line.quantity_shipped))
+                CustomerReturnLine.objects.create(
+                    profile_id=profile_id,
+                    customer_return=customer_return,
+                    shipment_line=shipment_line,
+                    quantity_returned=quantity,
+                    stock_quantity_returned=stock_quantity,
+                    unit_cost=unit_cost,
+                    cogs_reversal=(stock_quantity * unit_cost).quantize(Decimal('0.00001')),
+                    revenue_reversal=(quantity * revenue_per_unit).quantize(Decimal('0.01')),
+                    reason=item.get('reason') or '',
+                    created_by_user_id=actor_user_id,
+                    updated_by_user_id=actor_user_id,
+                )
+        return Response(CustomerReturnSerializer(customer_return).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=['post'])
+    def complete(self, request, pk=None):
+        customer_return = self.get_object()
+        completion_key = str(
+            request.headers.get('Idempotency-Key')
+            or request.headers.get('X-Idempotency-Key')
+            or request.data.get('idempotency_key')
+            or ''
+        ).strip()
+        if not completion_key:
+            return Response({'error': 'A stable Idempotency-Key is required to complete a customer return.'}, status=status.HTTP_400_BAD_REQUEST)
+        if len(completion_key) > 200:
+            return Response({'error': 'Idempotency-Key must be 200 characters or fewer.'}, status=status.HTTP_400_BAD_REQUEST)
+        if customer_return.status == CustomerReturnStatus.COMPLETED:
+            if customer_return.completion_idempotency_key == completion_key:
+                return Response(CustomerReturnSerializer(customer_return).data)
+            return Response({'error': 'This customer return was already completed by another mutation.'}, status=status.HTTP_409_CONFLICT)
+        if customer_return.status == CustomerReturnStatus.CANCELLED:
+            return Response({'error': 'This customer return is already closed.'}, status=status.HTTP_400_BAD_REQUEST)
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        profile_id = get_request_profile_id(request, required=True, as_str=False)
+        actor_user_id = get_request_user_id(request, as_str=False)
+        stock_location = scope_queryset_by_identity(
+            StockLocation.objects.filter(id=serializer.validated_data['location_id']),
+            canonical_field='profile_id', legacy_field='profile', value=profile_id,
+        ).first()
+        if stock_location is None:
+            return Response({'error': 'Return stock location not found.'}, status=status.HTTP_400_BAD_REQUEST)
+        with transaction.atomic():
+            customer_return = CustomerReturn.objects.select_for_update().get(
+                profile_id=profile_id,
+                id=customer_return.id,
+            )
+            if customer_return.status == CustomerReturnStatus.COMPLETED:
+                if customer_return.completion_idempotency_key == completion_key:
+                    return Response(CustomerReturnSerializer(customer_return).data)
+                return Response({'error': 'This customer return was already completed by another mutation.'}, status=status.HTTP_409_CONFLICT)
+            for line in customer_return.lines.select_related(
+                'shipment_line__sales_order_line__inventory_item', 'shipment_line__stock_lot',
+            ).select_for_update():
+                quantity = line.remaining_quantity
+                stock_quantity = line.remaining_stock_quantity
+                if quantity <= 0 or stock_quantity <= 0:
+                    continue
+                shipment_line = line.shipment_line
+                inventory_item = shipment_line.sales_order_line.inventory_item
+                lot_number = getattr(shipment_line.stock_lot, 'lot_number', '') or f"RETURN-{customer_return.reference}-{line.id}"
+                try:
+                    StockDomainService.receive_stock(
+                        inventory_item=inventory_item,
+                        stock_location=stock_location,
+                        quantity=stock_quantity,
+                        quantity_uom_code=inventory_item.stock_uom_code or '',
+                        unit_cost=line.unit_cost,
+                        actor_user_id=actor_user_id,
+                        lot_number=lot_number,
+                        force_lot=bool(inventory_item.track_lot),
+                        reference_type='customer_return_line',
+                        reference_id=str(line.id),
+                        notes=serializer.validated_data.get('notes') or f"Customer return {customer_return.reference}",
+                    )
+                except StockDomainError as exc:
+                    return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+                line.quantity_received = line.quantity_returned
+                line.stock_quantity_received = line.stock_quantity_returned
+                line.updated_by_user_id = actor_user_id
+                line.save(update_fields=['quantity_received', 'stock_quantity_received', 'updated_by_user_id', 'updated_at'])
+            customer_return.status = CustomerReturnStatus.COMPLETED
+            customer_return.completion_idempotency_key = completion_key
+            customer_return.updated_by_user_id = actor_user_id
+            customer_return.save(update_fields=['status', 'updated_by_user_id', 'updated_at'])
+            AccountingService.post_customer_return(customer_return=customer_return, actor_user_id=actor_user_id)
+        return Response(CustomerReturnSerializer(customer_return).data)
+
+
 class ReturnOrderViewSet(BaseCachePermissionViewset):
     required_permission = UNIFIED_PERMISSION_DICT.get('return_order')
     queryset = ReturnOrder.objects.select_related(
@@ -3405,6 +3677,18 @@ class ReturnOrderViewSet(BaseCachePermissionViewset):
     @action(detail=True, methods=['post'], url_path='dispatch', url_name='dispatch')
     def dispatch_return_order(self, request, pk=None):
         return_order = self.get_object()
+        dispatch_key = str(
+            request.headers.get('Idempotency-Key')
+            or request.headers.get('X-Idempotency-Key')
+            or request.data.get('idempotency_key')
+            or ''
+        ).strip()
+        if not dispatch_key:
+            return Response({'error': 'A stable Idempotency-Key is required to dispatch a return order.'}, status=status.HTTP_400_BAD_REQUEST)
+        if len(dispatch_key) > 200:
+            return Response({'error': 'Idempotency-Key must be 200 characters or fewer.'}, status=status.HTTP_400_BAD_REQUEST)
+        if return_order.dispatch_idempotency_key == dispatch_key and return_order.status in [ReturnOrderStatus.IN_TRANSIT, ReturnOrderStatus.COMPLETED]:
+            return Response(ReturnOrderDetailSerializer(return_order, context={'request': request}).data)
         if return_order.status not in [
             ReturnOrderStatus.PENDING,
             ReturnOrderStatus.AWAITING_PICKUP,
@@ -3424,6 +3708,12 @@ class ReturnOrderViewSet(BaseCachePermissionViewset):
 
         try:
             with transaction.atomic():
+                return_order = ReturnOrder.objects.select_for_update().get(
+                    profile_id=profile_id,
+                    id=return_order.id,
+                )
+                if return_order.dispatch_idempotency_key == dispatch_key and return_order.status in [ReturnOrderStatus.IN_TRANSIT, ReturnOrderStatus.COMPLETED]:
+                    return Response(ReturnOrderDetailSerializer(return_order, context={'request': request}).data)
                 before = serialize_return_order(return_order)
                 processed_count = 0
                 processed_summaries = []
@@ -3512,6 +3802,7 @@ class ReturnOrderViewSet(BaseCachePermissionViewset):
                     })
 
                 return_order.status = ReturnOrderStatus.IN_TRANSIT
+                return_order.dispatch_idempotency_key = dispatch_key
                 if not return_order.issue_date:
                     return_order.issue_date = timezone.now()
                 return_order.updated_by_user_id = current_user_id

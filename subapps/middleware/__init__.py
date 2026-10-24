@@ -8,7 +8,7 @@ from subapps.utils.request_context import (
 
 
 class FrontendOriginMiddleware(MiddlewareMixin):
-    """Expose the validated frontend origin to events emitted during an HTTP request."""
+    """Expose the validated frontend origin during an HTTP request."""
 
     def process_request(self, request):
         request._intera_frontend_origin_token = set_frontend_origin_context(

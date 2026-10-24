@@ -5,6 +5,7 @@ from .views import *
 router = DefaultRouter()
 router.register(r'categories', InventoryCategoryViewSet, basename='inventory-category')
 router.register(r'items', InventoryItemViewSet, basename='inventory-item')
+router.register(r'units', InventoryItemUnitViewSet, basename='inventory-item-unit')
 
 urlpatterns = [
     path('', include(router.urls)),

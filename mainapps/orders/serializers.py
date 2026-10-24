@@ -1,10 +1,12 @@
 # serializers.py
 
 from rest_framework import serializers
+from django.db import transaction
 from django.db.models import Count, Sum, Avg, F
 from decimal import Decimal
 from mainapps.content_type_linking_models.serializers import UserDetailMixin
 from mainapps.inventory.models import InventoryItem
+from mainapps.projections.models import CatalogVariantProjection
 from mainapps.orders.models import (
     GoodsReceipt,
     GoodsReceiptLine,
@@ -12,6 +14,8 @@ from mainapps.orders.models import (
     PurchaseOrderLineItem,
     ReturnOrder,
     ReturnOrderLineItem,
+    CustomerReturn,
+    CustomerReturnLine,
     SalesOrder,
     SalesOrderLineItem,
     SalesOrderShipment,
@@ -111,6 +115,10 @@ class SalesOrderShipmentLineSerializer(StructuralLocationSerializerMixin, serial
             'serial_number',
             'reservation_id',
             'quantity_shipped',
+            'unit_cost',
+            'cogs_amount',
+            'revenue_amount',
+            'gross_margin',
             'notes',
             'created_at',
         ]
@@ -243,6 +251,9 @@ class SalesOrderLineItemSerializer(serializers.ModelSerializer):
             'inventory_item',
             'inventory_name',
             'quantity',
+            'quantity_uom_code',
+            'stock_quantity',
+            'conversion_factor_snapshot',
             'reserved_quantity',
             'shipped_quantity',
             'remaining_quantity',
@@ -504,18 +515,21 @@ class PurchaseOrderLineItemSerializer(UserDetailMixin, serializers.ModelSerializ
     quantity_w_unit = serializers.SerializerMethodField()
     tax_amount = serializers.DecimalField(max_digits=18, decimal_places=2, read_only=True)
     total_price = serializers.DecimalField(max_digits=18, decimal_places=2, read_only=True)
+    structural_location_name = serializers.CharField(source='structural_location.name', read_only=True)
 
     def get_quantity_w_unit(self, obj):
-        unit = obj.inventory_item.stock_uom_code or obj.inventory_item.default_uom_code or ''
+        unit = obj.quantity_uom_code or obj.inventory_item.stock_uom_code or obj.inventory_item.default_uom_code or ''
         return f"{obj.quantity} {unit}"
 
     class Meta:
         model = PurchaseOrderLineItem
         fields = [
             'id', 'purchase_order', 'inventory_item', 'inventory_item_name', 'inventory_item_image_url', 'inventory_item_details',
+            'structural_location', 'structural_location_name',
+            'quantity_uom_code', 'stock_quantity', 'conversion_factor_snapshot',
             'quantity', 'quantity_w_unit', 'unit_price',
             'discount_rate', 'tax_rate', 'description',
-            'batch_number', 'expiry_date', 'manufactured_date', 'quantity_received',
+            'batch_number', 'quantity_received',
             'fully_received', 'tax_amount', 'discount', 'total_price'
         ]
         read_only_fields = ['tax_amount', 'discount', 'total_price']
@@ -609,6 +623,12 @@ class PurchaseOrderDetailSerializer(UserDetailMixin, serializers.ModelSerializer
 class PurchaseOrderLineItemCreateSerializer(serializers.ModelSerializer):
     """Serializer for creating purchase order line items"""
     purchase_order_reference = serializers.CharField(write_only=True, required=False)
+    product_variant_id = serializers.UUIDField(write_only=True, required=False)
+    inventory_item = serializers.PrimaryKeyRelatedField(
+        queryset=InventoryItem.objects.all(),
+        required=False,
+        allow_null=True,
+    )
 
     class Meta:
         model = PurchaseOrderLineItem
@@ -616,15 +636,21 @@ class PurchaseOrderLineItemCreateSerializer(serializers.ModelSerializer):
         read_only_fields = ['tax_amount', 'discount', 'total_price', 'batch_number']
 
     def validate(self, attrs):
+        existing_inventory_item = getattr(self.instance, 'inventory_item', None)
+        if not attrs.get('inventory_item') and not attrs.get('product_variant_id') and existing_inventory_item is None:
+            raise serializers.ValidationError({
+                'inventory_item': 'Select an inventory item or an untracked product variant.'
+            })
+        if attrs.get('inventory_item') and attrs.get('product_variant_id'):
+            raise serializers.ValidationError({
+                'product_variant_id': 'Choose either an inventory item or a product variant, not both.'
+            })
         inventory_item = attrs.get('inventory_item') or getattr(self.instance, 'inventory_item', None)
         quantity = attrs.get('quantity', getattr(self.instance, 'quantity', None))
-        manufactured_date = attrs.get('manufactured_date', getattr(self.instance, 'manufactured_date', None))
-        expiry_date = attrs.get('expiry_date', getattr(self.instance, 'expiry_date', None))
-
-        _validate_inventory_dates(
-            manufactured_date=manufactured_date,
-            expiry_date=expiry_date,
-        )
+        if attrs.get('manufactured_date') or attrs.get('expiry_date'):
+            raise serializers.ValidationError({
+                'expiry_date': 'Manufacture and expiry dates are captured when goods are received, not on a purchase-order line.'
+            })
 
         if inventory_item is not None and quantity is not None:
             reorder_quantity = Decimal(str(inventory_item.reorder_quantity or 0))
@@ -649,7 +675,56 @@ class PurchaseOrderLineItemCreateSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError({
                     'purchase_order_reference': 'Purchase order not found'
                 })
-        return super().create(validated_data)
+        product_variant_id = validated_data.pop('product_variant_id', None)
+        purchase_order = validated_data.get('purchase_order')
+        if purchase_order is None:
+            raise serializers.ValidationError({
+                'purchase_order': 'A purchase order is required to add a line item.'
+            })
+
+        with transaction.atomic():
+            inventory_item = validated_data.get('inventory_item')
+            if inventory_item is not None and inventory_item.profile_id != purchase_order.profile_id:
+                raise serializers.ValidationError({
+                    'inventory_item': 'The inventory item must belong to the purchase order workspace.'
+                })
+
+            if product_variant_id:
+                variant = (
+                    CatalogVariantProjection.objects.select_related('product')
+                    .filter(
+                        profile_id=purchase_order.profile_id,
+                        variant_id=product_variant_id,
+                        is_active=True,
+                        product__is_active=True,
+                    )
+                    .first()
+                )
+                if variant is None:
+                    raise serializers.ValidationError({
+                        'product_variant_id': 'The product variant is not available in this workspace.'
+                    })
+                inventory_item, _ = InventoryItem.objects.get_or_create(
+                    profile_id=purchase_order.profile_id,
+                    product_variant_id=variant.variant_id,
+                    defaults={
+                        'product_template_id': variant.product_id,
+                        'name_snapshot': variant.display_name,
+                        'sku_snapshot': variant.variant_sku or '',
+                        'barcode_snapshot': variant.variant_barcode or '',
+                        'product_variant_image_url': variant.image_url or '',
+                        'inventory_type': 'finished_good',
+                        'track_stock': True,
+                        'metadata': {
+                            'source': 'purchase_order_line_variant',
+                            'catalog_variant_id': str(variant.variant_id),
+                            'catalog_product_id': str(variant.product_id),
+                        },
+                    },
+                )
+                validated_data['inventory_item'] = inventory_item
+
+            return super().create(validated_data)
 
 
 class PurchaseOrderWorkflowSerializer(serializers.Serializer):
@@ -661,6 +736,7 @@ class PurchaseOrderWorkflowSerializer(serializers.Serializer):
 class ReceivedItemSerializer(serializers.Serializer):
     line_item_id = serializers.UUIDField()
     quantity_received = serializers.DecimalField(max_digits=15, decimal_places=5, min_value=Decimal("0.00001"))
+    quantity_uom_code = serializers.CharField(required=False, allow_blank=True, max_length=32)
     location_id = serializers.UUIDField()
     unit_cost = serializers.DecimalField(
         max_digits=15,
@@ -806,6 +882,48 @@ class ReturnOrderProcessSerializer(serializers.Serializer):
             if 'quantity' in item and item['quantity'] <= 0:
                 raise serializers.ValidationError("Quantity must be greater than zero")
         return value
+
+
+class CustomerReturnCreateSerializer(serializers.Serializer):
+    sales_order_id = serializers.UUIDField(required=False, allow_null=True)
+    return_date = serializers.DateField(required=False)
+    reason = serializers.CharField(required=False, allow_blank=True)
+    notes = serializers.CharField(required=False, allow_blank=True)
+    return_items = serializers.ListField(child=serializers.DictField(), allow_empty=False)
+
+    def validate_return_items(self, value):
+        for item in value:
+            if not item.get('shipment_line_id'):
+                raise serializers.ValidationError("Each return item requires shipment_line_id.")
+            if Decimal(str(item.get('quantity') or 0)) <= 0:
+                raise serializers.ValidationError("Returned quantity must be greater than zero.")
+        return value
+
+
+class CustomerReturnCompleteSerializer(serializers.Serializer):
+    location_id = serializers.UUIDField()
+    notes = serializers.CharField(required=False, allow_blank=True)
+
+
+class CustomerReturnLineSerializer(serializers.ModelSerializer):
+    inventory_name = serializers.CharField(source='shipment_line.sales_order_line.inventory_item.name_snapshot', read_only=True)
+    remaining_quantity = serializers.DecimalField(max_digits=15, decimal_places=5, read_only=True)
+
+    class Meta:
+        model = CustomerReturnLine
+        fields = [
+            'id', 'shipment_line', 'inventory_name', 'quantity_returned', 'quantity_received',
+            'remaining_quantity', 'stock_quantity_returned', 'stock_quantity_received',
+            'remaining_stock_quantity', 'unit_cost', 'cogs_reversal', 'revenue_reversal', 'reason',
+        ]
+
+
+class CustomerReturnSerializer(serializers.ModelSerializer):
+    lines = CustomerReturnLineSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = CustomerReturn
+        fields = ['id', 'reference', 'idempotency_key', 'sales_order', 'status', 'return_date', 'reason', 'notes', 'lines', 'created_at']
 
 
 class PurchaseOrderAnalyticsSerializer(serializers.Serializer):

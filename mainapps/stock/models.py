@@ -98,6 +98,87 @@ class StockLocationType(models.Model):
     def __str__(self):
         return self.name
 
+
+class WarehouseConfiguration(ProfileMixin, models.Model):
+    """Persisted operating policy for one structural warehouse location."""
+    RECEIVING_STRATEGIES = [('standard', 'Standard'), ('blind', 'Blind receiving'), ('dock_to_stock', 'Dock to stock')]
+    PICKING_STRATEGIES = [('fifo', 'FIFO'), ('fefo', 'FEFO'), ('lifo', 'LIFO')]
+    PUTAWAY_STRATEGIES = [('manual', 'Manual'), ('nearest', 'Nearest available'), ('fixed', 'Fixed location')]
+
+    location = models.OneToOneField('stock.StockLocation', on_delete=models.CASCADE, related_name='warehouse_configuration')
+    receiving_strategy = models.CharField(max_length=32, choices=RECEIVING_STRATEGIES, default='standard')
+    picking_strategy = models.CharField(max_length=32, choices=PICKING_STRATEGIES, default='fifo')
+    putaway_strategy = models.CharField(max_length=32, choices=PUTAWAY_STRATEGIES, default='manual')
+    capacity = models.DecimalField(max_digits=15, decimal_places=3, default=0)
+    cycle_count_frequency_days = models.PositiveIntegerField(default=0)
+    operating_hours = models.JSONField(default=dict, blank=True)
+    holidays = models.JSONField(default=list, blank=True)
+    default_transfer_mode = models.CharField(max_length=32, default='manual')
+    updated_at = models.DateTimeField(auto_now=True)
+
+
+class WarehouseZone(ProfileMixin, models.Model):
+    """Zone/rack/bin metadata; the existing StockLocation tree remains authoritative."""
+    location = models.ForeignKey('stock.StockLocation', on_delete=models.CASCADE, related_name='warehouse_zones')
+    name = models.CharField(max_length=200)
+    code = models.CharField(max_length=100)
+    kind = models.CharField(max_length=20, default='zone')
+    capacity = models.DecimalField(max_digits=15, decimal_places=3, default=0)
+    active = models.BooleanField(default=True)
+    metadata = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=['profile_id', 'code'], name='unique_warehouse_zone_profile_code')]
+        ordering = ['name']
+
+
+class CycleCountSchedule(ProfileMixin, models.Model):
+    location = models.ForeignKey('stock.StockLocation', on_delete=models.CASCADE, related_name='cycle_count_schedules')
+    inventory_item = models.ForeignKey('inventory.InventoryItem', on_delete=models.CASCADE, null=True, blank=True, related_name='cycle_count_schedules')
+    frequency_days = models.PositiveIntegerField(default=30)
+    next_count_at = models.DateTimeField(null=True, blank=True)
+    last_count_at = models.DateTimeField(null=True, blank=True)
+    variance_tolerance = models.DecimalField(max_digits=15, decimal_places=5, default=0)
+    active = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ['next_count_at', 'location__name']
+
+
+class StockCountSession(ProfileMixin, models.Model):
+    class Status(models.TextChoices):
+        OPEN = 'open', _('Open')
+        SUBMITTED = 'submitted', _('Submitted')
+        APPROVED = 'approved', _('Approved')
+        CANCELLED = 'cancelled', _('Cancelled')
+
+    location = models.ForeignKey('stock.StockLocation', on_delete=models.PROTECT, related_name='stock_count_sessions')
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.OPEN, db_index=True)
+    started_at = models.DateTimeField(default=timezone.now)
+    submitted_at = models.DateTimeField(null=True, blank=True)
+    approved_at = models.DateTimeField(null=True, blank=True)
+    counted_by_user_id = models.BigIntegerField(null=True, blank=True)
+    approved_by_user_id = models.BigIntegerField(null=True, blank=True)
+    notes = models.TextField(blank=True, default='')
+
+
+class StockCountLine(ProfileMixin, models.Model):
+    session = models.ForeignKey(StockCountSession, on_delete=models.CASCADE, related_name='lines')
+    inventory_item = models.ForeignKey('inventory.InventoryItem', on_delete=models.PROTECT, related_name='stock_count_lines')
+    expected_quantity = models.DecimalField(max_digits=15, decimal_places=5, default=0)
+    counted_quantity = models.DecimalField(max_digits=15, decimal_places=5, null=True, blank=True)
+    variance_tolerance = models.DecimalField(max_digits=15, decimal_places=5, default=0)
+    notes = models.TextField(blank=True, default='')
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=['session', 'inventory_item'], name='unique_stock_count_session_item')]
+
+    @property
+    def variance(self):
+        if self.counted_quantity is None:
+            return None
+        return self.counted_quantity - self.expected_quantity
+
 class StockLocation(ProfileMixin, MPTTModel):
     # Opaque reference to the shared subscription address; physical_address remains
     # temporarily for backwards-compatible reads and migration rollback.
@@ -479,6 +560,13 @@ class StockMovement(TenantStampedUUIDModel):
         db_index=True,
     )
     quantity = models.DecimalField(max_digits=15, decimal_places=5)
+    quantity_uom_code = models.CharField(max_length=32, blank=True, default="")
+    conversion_factor_snapshot = models.DecimalField(
+        max_digits=15,
+        decimal_places=5,
+        default=1,
+        help_text="Multiplier from the entered unit to the canonical stock unit.",
+    )
     unit_cost = models.DecimalField(
         max_digits=15,
         decimal_places=5,

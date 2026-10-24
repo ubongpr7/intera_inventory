@@ -10,6 +10,7 @@ from django.core.exceptions import ValidationError
 from django.core.management import call_command
 from django.core.management.base import CommandError
 from django.test import SimpleTestCase, TestCase
+from rest_framework import permissions
 from rest_framework.request import Request
 from rest_framework.test import APIRequestFactory, force_authenticate
 
@@ -18,6 +19,8 @@ from mainapps.stock.models import StockBalance, StockLocation, StockLocationType
 from mainapps.stock.serializers import InventoryItemDetailSerializer, StockLocationListSerializer
 from mainapps.stock.views import (
     AIReportExportView,
+    ReadStockLocationType,
+    StockLocationViewSet,
     StockMovementViewSet,
     StockReservationViewSet,
     filter_inventory_items_for_location,
@@ -101,6 +104,40 @@ class StockViewFilterTests(SimpleTestCase):
 
         queryset.filter.assert_called_once_with(sales_order_lines__sales_order_id="sales-order-id")
         filtered_queryset.distinct.assert_called_once_with()
+
+
+class StockLocationPermissionTests(SimpleTestCase):
+    def test_location_reads_only_require_authentication(self):
+        factory = APIRequestFactory()
+
+        for action in ('list', 'retrieve', 'inventory_items'):
+            view = StockLocationViewSet()
+            view.action = action
+            view.request = factory.get('/stock_api/locations/')
+
+            self.assertEqual(
+                [type(permission) for permission in view.get_permissions()],
+                [permissions.IsAuthenticated],
+                action,
+            )
+
+    def test_location_mutations_keep_existing_permission_gate(self):
+        view = StockLocationViewSet()
+        view.action = 'create'
+        view.request = APIRequestFactory().post('/stock_api/locations/', {}, format='json')
+
+        permission = view.get_permissions()[0]
+
+        self.assertEqual(type(permission).__name__, 'HasModelRequestPermission')
+
+    def test_location_types_are_readable_by_authenticated_users(self):
+        view = ReadStockLocationType()
+        view.request = APIRequestFactory().get('/stock_api/location-types/')
+
+        self.assertEqual(
+            [type(permission) for permission in view.get_permissions()],
+            [permissions.IsAuthenticated],
+        )
 
 
 class StockSummaryViewTests(SimpleTestCase):

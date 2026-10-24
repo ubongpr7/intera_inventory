@@ -11,6 +11,10 @@ router.register(r'lots', StockLotViewSet, basename='stock-lot')
 router.register(r'serials', StockSerialViewSet, basename='stock-serial')
 router.register(r'movements', StockMovementViewSet, basename='stock-movement')
 router.register(r'reservations', StockReservationViewSet, basename='stock-reservation')
+router.register(r'warehouse-configurations', WarehouseConfigurationViewSet, basename='warehouse-configuration')
+router.register(r'warehouse-zones', WarehouseZoneViewSet, basename='warehouse-zone')
+router.register(r'cycle-count-schedules', CycleCountScheduleViewSet, basename='cycle-count-schedule')
+router.register(r'stock-count-sessions', StockCountSessionViewSet, basename='stock-count-session')
 
 
 urlpatterns = [

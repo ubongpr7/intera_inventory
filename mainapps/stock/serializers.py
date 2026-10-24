@@ -18,6 +18,11 @@ from .models import (
     StockMovement,
     StockReservation,
     StockSerial,
+    WarehouseConfiguration,
+    WarehouseZone,
+    CycleCountSchedule,
+    StockCountSession,
+    StockCountLine,
 )
 from subapps.services.catalog_projection import CatalogProjectionLookup
 
@@ -158,6 +163,57 @@ class StockLocationDetailSerializer(UserDetailMixin, serializers.ModelSerializer
     def get_stock_summary(self, obj):
         """Get stock summary for this location"""
         return get_location_stock_summary(obj)
+
+
+class WarehouseConfigurationSerializer(serializers.ModelSerializer):
+    location_name = serializers.CharField(source='location.name', read_only=True)
+
+    class Meta:
+        model = WarehouseConfiguration
+        fields = '__all__'
+        read_only_fields = ['profile_id', 'location_name', 'updated_at']
+
+
+class WarehouseZoneSerializer(serializers.ModelSerializer):
+    location_name = serializers.CharField(source='location.name', read_only=True)
+
+    class Meta:
+        model = WarehouseZone
+        fields = '__all__'
+        read_only_fields = ['profile_id', 'location_name']
+
+
+class CycleCountScheduleSerializer(serializers.ModelSerializer):
+    location_name = serializers.CharField(source='location.name', read_only=True)
+    inventory_item_name = serializers.CharField(source='inventory_item.name_snapshot', read_only=True, allow_null=True)
+
+    class Meta:
+        model = CycleCountSchedule
+        fields = '__all__'
+        read_only_fields = ['profile_id', 'location_name', 'inventory_item_name']
+
+
+class StockCountLineSerializer(serializers.ModelSerializer):
+    inventory_item_name = serializers.CharField(source='inventory_item.name_snapshot', read_only=True)
+    variance = serializers.SerializerMethodField()
+
+    class Meta:
+        model = StockCountLine
+        fields = '__all__'
+        read_only_fields = ['profile_id', 'inventory_item_name', 'variance']
+
+    def get_variance(self, obj):
+        return obj.variance
+
+
+class StockCountSessionSerializer(serializers.ModelSerializer):
+    location_name = serializers.CharField(source='location.name', read_only=True)
+    lines = StockCountLineSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = StockCountSession
+        fields = '__all__'
+        read_only_fields = ['profile_id', 'location_name', 'started_at', 'submitted_at', 'approved_at']
 
 class InventoryItemSummaryMixin:
     def _get_summary(self, obj):

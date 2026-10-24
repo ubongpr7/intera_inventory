@@ -7,7 +7,27 @@ from mainapps.projections.models import CatalogVariantProjection
 from subapps.services.inventory_read_model import get_inventory_item_summary_map
 from subapps.utils.request_context import get_request_profile_id
 
-from .models import InventoryCategory, InventoryItem
+from .models import InventoryCategory, InventoryItem, InventoryItemUnit
+
+
+class InventoryItemUnitSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = InventoryItemUnit
+        fields = [
+            'id', 'code', 'label', 'conversion_to_stock',
+            'is_purchase_unit', 'is_sale_unit', 'allows_partial',
+            'decimal_places', 'selling_price', 'metadata',
+        ]
+        read_only_fields = ['id']
+
+
+class InventoryItemUnitManagementSerializer(InventoryItemUnitSerializer):
+    class Meta(InventoryItemUnitSerializer.Meta):
+        fields = '__all__'
+        read_only_fields = [
+            'id', 'profile_id', 'created_by_user_id', 'updated_by_user_id',
+            'created_at', 'updated_at',
+        ]
 
 
 class InventoryCategoryListSerializer(serializers.ModelSerializer):
@@ -61,6 +81,7 @@ class InventoryListSerializer(InventoryItemSummaryMixin, serializers.ModelSerial
     location_name = serializers.SerializerMethodField()
     location_count = serializers.SerializerMethodField()
     location_breakdown = serializers.SerializerMethodField()
+    units = InventoryItemUnitSerializer(many=True, read_only=True)
 
     class Meta:
         model = InventoryItem
@@ -82,9 +103,13 @@ class InventoryListSerializer(InventoryItemSummaryMixin, serializers.ModelSerial
             'location_name',
             'location_count',
             'location_breakdown',
+            'default_uom_code',
+            'stock_uom_code',
+            'units',
             'minimum_stock_level',
             'reorder_point',
             'reorder_quantity',
+            'automate_reorder',
             'created_at',
         ]
 
@@ -120,6 +145,7 @@ class InventoryDetailSerializer(InventoryItemSummaryMixin, UserDetailMixin, seri
     created_by_details = serializers.SerializerMethodField()
     updated_by_details = serializers.SerializerMethodField()
     stock_analytics = serializers.SerializerMethodField()
+    units = InventoryItemUnitSerializer(many=True, read_only=True)
 
     class Meta:
         model = InventoryItem

@@ -2,12 +2,15 @@ from decimal import Decimal
 
 from django_filters.rest_framework import DjangoFilterBackend
 from django.db import transaction
+from django.db.models import DecimalField, Sum, Value
+from django.db.models.functions import Coalesce
 from rest_framework import filters, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
 
 from mainapps.stock.models import StockLocation
 from mainapps.projections.models import CatalogVariantProjection
+from subapps.kafka.producers.inventory import publish_inventory_availability_upserted
 from subapps.kafka.producers.inventory_admin import (
     publish_inventory_admin_event,
     serialize_inventory_category,
@@ -35,13 +38,14 @@ from subapps.utils.request_context import (
     scope_queryset_by_identity,
 )
 
-from .models import InventoryCategory, InventoryItem
+from .models import InventoryCategory, InventoryItem, InventoryItemUnit, InventoryPlacement
 from .serializers import (
     InventoryCategoryDetailSerializer,
     InventoryCategoryListSerializer,
     InventoryDetailSerializer,
     InventorySetupSummarySerializer,
     InventoryListSerializer,
+    InventoryItemUnitManagementSerializer,
 )
 
 
@@ -100,6 +104,7 @@ _CONTROL_FIELDS = (
     'safety_stock_level',
     'reorder_point',
     'reorder_quantity',
+    'automate_reorder',
     'track_lot',
     'track_serial',
     'track_expiry',
@@ -176,6 +181,31 @@ class BaseInventoryViewSet(BaseCachePermissionViewset):
     def perform_update(self, serializer):
         serializer.save(updated_by_user_id=get_request_user_id(self.request, as_str=False))
         self._invalidate_cache()
+
+
+class InventoryItemUnitViewSet(BaseInventoryViewSet):
+    """Manage the purchase/sale units for inventory items."""
+
+    required_permission = UNIFIED_PERMISSION_DICT.get('inventory_item')
+    queryset = InventoryItemUnit.objects.select_related('inventory_item')
+    filterset_fields = ['inventory_item', 'code', 'is_purchase_unit', 'is_sale_unit']
+    search_fields = ['code', 'label']
+    ordering_fields = ['code', 'created_at']
+
+    def get_serializer_class(self):
+        return InventoryItemUnitManagementSerializer
+
+    def perform_create(self, serializer):
+        profile_id = get_request_profile_id(self.request, required=True, as_str=False)
+        inventory_item = serializer.validated_data.get('inventory_item')
+        if inventory_item.profile_id != profile_id:
+            from rest_framework.exceptions import PermissionDenied
+            raise PermissionDenied('The unit must belong to the active workspace.')
+        serializer.save(
+            profile_id=profile_id,
+            created_by_user_id=get_request_user_id(self.request, required=True, as_str=False),
+            updated_by_user_id=get_request_user_id(self.request, as_str=False),
+        )
 
 
 class InventoryCategoryViewSet(BaseInventoryViewSet):
@@ -288,7 +318,7 @@ class InventoryItemViewSet(BaseInventoryViewSet):
     queryset = InventoryItem.objects.select_related('inventory_category', 'default_supplier')
     filterset_fields = ['status', 'inventory_type', 'inventory_category', 'default_supplier']
     search_fields = ['name_snapshot', 'description', 'sku_snapshot', 'barcode_snapshot']
-    ordering_fields = ['name_snapshot', 'created_at', 'minimum_stock_level', 'reorder_point']
+    ordering_fields = ['name_snapshot', 'created_at', 'minimum_stock_level', 'reorder_point', 'current_stock_level']
     ordering = ['-created_at']
 
     def get_serializer_class(self):
@@ -424,6 +454,13 @@ class InventoryItemViewSet(BaseInventoryViewSet):
                 if scoped_location_ids
                 else queryset.none()
             )
+        queryset = queryset.annotate(
+            current_stock_level=Coalesce(
+                Sum('stock_balances__quantity_available'),
+                Value(0),
+                output_field=DecimalField(max_digits=15, decimal_places=5),
+            )
+        )
         if stock_status:
             stock_location, stock_locations = self._get_inventory_scope()
             summary_map = get_inventory_item_summary_map(
@@ -442,6 +479,8 @@ class InventoryItemViewSet(BaseInventoryViewSet):
                 elif stock_status == 'needs_reorder' and reorder_point > 0 and quantity <= reorder_point:
                     matching_ids.append(item.id)
                 elif stock_status == 'out_of_stock' and quantity <= 0:
+                    matching_ids.append(item.id)
+                elif stock_status == 'in_stock' and quantity > 0:
                     matching_ids.append(item.id)
             queryset = queryset.filter(id__in=matching_ids) if matching_ids else queryset.none()
         return queryset
@@ -470,6 +509,9 @@ class InventoryItemViewSet(BaseInventoryViewSet):
             stock_location_id=self.request.data.get('stock_location_id') or self.request.data.get('structural_location_id'),
             created_by_user_id=user_id,
             updated_by_user_id=user_id,
+        )
+        transaction.on_commit(
+            lambda item_id=inventory_item.id: publish_inventory_availability_upserted(inventory_item_id=item_id)
         )
         payload = serialize_inventory_item(inventory_item)
         publish_inventory_admin_event(
@@ -508,6 +550,9 @@ class InventoryItemViewSet(BaseInventoryViewSet):
                 stock_location_id=self.request.data.get('stock_location_id') or self.request.data.get('structural_location_id'),
                 updated_by_user_id=user_id,
             )
+        transaction.on_commit(
+            lambda item_id=inventory_item.id: publish_inventory_availability_upserted(inventory_item_id=item_id)
+        )
         payload = serialize_inventory_item(inventory_item)
         publish_inventory_admin_event(
             event_name='inventory.item.updated',
@@ -713,6 +758,66 @@ class InventoryItemViewSet(BaseInventoryViewSet):
                 'results': results,
             }
         )
+
+    @action(detail=True, methods=['get', 'patch'], url_path='reorder-policy')
+    def reorder_policy(self, request, pk=None):
+        """Read or update automated-reorder controls for one structural location."""
+        inventory_item = self.get_object()
+        profile_id = get_request_profile_id(request, required=True, as_str=False)
+        structural_location_id = request.data.get('structural_location_id') or request.query_params.get('structural_location_id')
+        if not structural_location_id:
+            return Response({'structural_location_id': 'This field is required.'}, status=status.HTTP_400_BAD_REQUEST)
+        structural_location = resolve_structural_location(
+            profile_id=profile_id,
+            stock_location_id=structural_location_id,
+        )
+        if structural_location is None:
+            return Response({'structural_location_id': 'Structural location not found.'}, status=status.HTTP_404_NOT_FOUND)
+        placement = InventoryPlacement.objects.filter(
+            profile_id=profile_id,
+            inventory_item=inventory_item,
+            structural_location=structural_location,
+        ).first()
+        if placement is None:
+            return Response({'detail': 'The inventory item is not placed at this structural location.'}, status=status.HTTP_404_NOT_FOUND)
+        if request.method == 'GET':
+            return Response({
+                'inventory_item_id': str(inventory_item.id),
+                'structural_location_id': str(structural_location.id),
+                'structural_location_name': structural_location.name,
+                'automate_reorder': placement.automate_reorder_override,
+                'reorder_point': placement.reorder_point_override,
+                'reorder_quantity': placement.reorder_quantity_override,
+                'effective_automate_reorder': placement.automate_reorder_override if placement.automate_reorder_override is not None else inventory_item.automate_reorder,
+                'effective_reorder_point': placement.reorder_point_override if placement.reorder_point_override is not None else inventory_item.reorder_point,
+                'effective_reorder_quantity': placement.reorder_quantity_override if placement.reorder_quantity_override is not None else inventory_item.reorder_quantity,
+            })
+
+        allowed_fields = {
+            'automate_reorder_override',
+            'reorder_point_override',
+            'reorder_quantity_override',
+        }
+        updates = {}
+        for field in allowed_fields:
+            if field in request.data:
+                updates[field] = request.data[field]
+        if not updates:
+            return Response({'detail': 'Provide at least one reorder policy field.'}, status=status.HTTP_400_BAD_REQUEST)
+        for field, value in updates.items():
+            if field == 'automate_reorder_override':
+                if value is not None and not isinstance(value, bool):
+                    return Response({field: 'Use true, false, or null.'}, status=status.HTTP_400_BAD_REQUEST)
+            elif value is not None:
+                try:
+                    if Decimal(str(value)) < 0:
+                        raise ValueError
+                except (TypeError, ValueError):
+                    return Response({field: 'Use a non-negative number or null.'}, status=status.HTTP_400_BAD_REQUEST)
+            setattr(placement, field, value)
+        placement.updated_by_user_id = get_request_user_id(request, as_str=False)
+        placement.save(update_fields=[*updates.keys(), 'updated_by_user_id', 'updated_at'])
+        return Response({'detail': 'Reorder policy updated.', **updates})
 
     @action(detail=True, methods=['get'])
     def stock_summary(self, request, pk=None):

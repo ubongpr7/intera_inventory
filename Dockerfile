@@ -35,4 +35,4 @@ COPY . /app/
 EXPOSE 7002
 
 
-CMD ["sh", "-c", "python manage.py migrate && python manage.py runserver 0.0.0.0:7002"]
+CMD ["sh", "-c", "exec uvicorn core.asgi:application --host 0.0.0.0 --port 7002 --workers ${WEB_CONCURRENCY:-2}"]

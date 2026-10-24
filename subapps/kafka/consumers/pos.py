@@ -104,12 +104,13 @@ def _resolve_item_context(profile_id: int, item_payload: dict[str, Any], *, quan
             raise ValueError(f"Stock location {stock_location_id} was not found for profile {profile_id}.")
 
     if stock_location is None:
+        lookup_quantity = Decimal("0") if _as_str(item_payload.get("quantity_uom_code")) else quantity
         balance = (
             StockBalance.objects.select_related("stock_location", "stock_lot")
             .filter(
                 profile_id=profile_id,
                 inventory_item=inventory_item,
-                quantity_available__gte=quantity,
+                quantity_available__gte=lookup_quantity,
             )
             .order_by("stock_lot__expiry_date", "created_at")
             .first()
@@ -165,6 +166,7 @@ def _handle_reservation_requested(payload: dict[str, Any]) -> bool:
                 inventory_item=inventory_item,
                 stock_location=stock_location,
                 quantity=requested_quantity,
+                quantity_uom_code=_as_str(item_payload.get("quantity_uom_code")),
                 external_order_type="pos_order_item",
                 external_order_id=order_id,
                 external_order_line_id=item_id,

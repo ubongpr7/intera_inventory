@@ -1,6 +1,8 @@
 from django.core.exceptions import ImproperlyConfigured
 from django.test import SimpleTestCase
 
+from django.conf import settings
+
 from core.security import (
     is_production_environment,
     validate_notification_delivery_settings,
@@ -9,6 +11,9 @@ from core.security import (
 
 
 class ProductionSecurityValidationTests(SimpleTestCase):
+    def test_cors_allows_idempotency_key_for_mutations(self):
+        self.assertIn('idempotency-key', settings.CORS_ALLOW_HEADERS)
+
     def test_recognizes_production_environment_names(self):
         self.assertTrue(is_production_environment("production"))
         self.assertTrue(is_production_environment("prod"))

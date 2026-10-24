@@ -9,7 +9,6 @@ from subapps.utils.request_context import (
     get_request_full_name,
     get_request_membership_role,
     get_request_owner_id,
-    get_request_permissions,
     get_request_profile_id,
     get_request_user_id,
 )
@@ -64,7 +63,6 @@ class IdentityDirectory:
             "company_code": get_request_company_code(request),
             "membership_role": get_request_membership_role(request),
             "owner_id": get_request_owner_id(request, as_str=False),
-            "permissions": sorted(get_request_permissions(request)),
         }
 
     @classmethod

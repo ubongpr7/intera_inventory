@@ -95,27 +95,13 @@ def get_request_user_id(request, *, required=False, as_str=True):
 
 
 def get_request_permissions(request):
-    claims = _get_token_payload(request)
-    permissions = _expanded_permissions(claims)
-    context = _get_authorization_context(request)
-    permissions.update(_expanded_permissions(context))
-    return permissions
+    """Return no authorization grants from compact transport tokens.
 
-
-def _expanded_permissions(claims):
-    permissions = set(str(item) for item in (claims.get("permissions") or []) if str(item).strip())
-    wildcard_permissions = claims.get("wildcard_permissions") or {}
-    for wildcard in claims.get("wildcards") or []:
-        permissions.update(str(item) for item in wildcard_permissions.get(wildcard) or [] if str(item).strip())
-    return permissions
-
-
-def _matches_permission(required, granted_permissions):
-    return any(
-        granted == required
-        or (granted.endswith(".*") and str(required).startswith(granted[:-1]))
-        for granted in granted_permissions
-    )
+    Permission decisions are made by Users for the active profile. This helper
+    remains for identity payload compatibility, but token/context permission
+    arrays and wildcard expansions are never an authorization source.
+    """
+    return set()
 
 
 def _permission_cache_version():
@@ -164,9 +150,6 @@ def has_request_permission(request, permission):
     permission = str(permission or "").strip()
     if not permission:
         return False
-    if _matches_permission(permission, get_request_permissions(request)):
-        return True
-
     claims = _get_token_payload(request)
     context = _get_authorization_context(request)
     user_id = get_request_user_id(request)

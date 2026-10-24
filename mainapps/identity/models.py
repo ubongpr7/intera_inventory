@@ -67,3 +67,43 @@ class IdentityMembership(models.Model):
 
     def __str__(self):
         return f"{self.profile_id}:{self.user_id}"
+
+
+class IdempotencyRecord(models.Model):
+    """Durable replay record for mutating API requests.
+
+    The record is deliberately scoped to a workspace/profile and operation. A
+    client retry must either replay the original response or fail with a
+    payload conflict; it must never execute the mutation a second time.
+    """
+
+    STATUS_PROCESSING = "processing"
+    STATUS_COMPLETED = "completed"
+    STATUS_FAILED = "failed"
+
+    profile_id = models.BigIntegerField(db_index=True)
+    operation = models.CharField(max_length=160)
+    key = models.CharField(max_length=255)
+    request_hash = models.CharField(max_length=64)
+    status = models.CharField(max_length=20, default=STATUS_PROCESSING)
+    response_status = models.PositiveSmallIntegerField(null=True, blank=True)
+    response_body = models.JSONField(null=True, blank=True)
+    resource_type = models.CharField(max_length=120, blank=True, default="")
+    resource_id = models.CharField(max_length=120, blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["profile_id", "operation", "key"],
+                name="unique_idempotency_profile_operation_key",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["profile_id", "status"]),
+            models.Index(fields=["created_at"]),
+        ]
+
+    def __str__(self):
+        return f"{self.profile_id}:{self.operation}:{self.key}"

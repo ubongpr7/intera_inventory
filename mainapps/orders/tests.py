@@ -11,12 +11,15 @@ from django.core import mail
 from django.test import SimpleTestCase, TestCase, override_settings
 from django.template.loader import get_template, render_to_string
 from django.utils import timezone
+from rest_framework.exceptions import ValidationError as DRFValidationError
 
 from mainapps.inventory.models import InventoryItem
+from mainapps.projections.models import CatalogProductProjection, CatalogVariantProjection
 from mainapps.orders.models import PurchaseOrder, PurchaseOrderLineItem, PurchaseOrderStatus, SalesOrder, SalesOrderLineItem, SalesOrderStatus
 from mainapps.orders.serializers import (
     GoodsReceiptLineSerializer,
     GoodsReceiptListSerializer,
+    PurchaseOrderLineItemCreateSerializer,
     ReceiveItemsSerializer,
     SalesOrderShipmentLineSerializer,
     SalesOrderShipmentListSerializer,
@@ -55,6 +58,72 @@ class OrderLineItemInventoryItemTests(SimpleTestCase):
 
         with self.assertRaises(ValidationError):
             line_item.clean()
+
+
+class PurchaseOrderUntrackedVariantTests(TestCase):
+    def setUp(self):
+        self.product = CatalogProductProjection.objects.create(
+            product_id="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            profile_id=1,
+            name="QA Untracked Product",
+            is_active=True,
+        )
+        self.variant = CatalogVariantProjection.objects.create(
+            variant_id="bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+            product=self.product,
+            profile_id=1,
+            display_name="QA Untracked Product - Blue",
+            variant_sku="QA-UNTRACKED-BLUE",
+            variant_barcode="QA-UNTRACKED-001",
+            image_url="https://example.com/qa-untracked-blue.jpg",
+            is_active=True,
+        )
+        self.purchase_order = PurchaseOrder.objects.create(profile_id=1)
+
+    def test_purchase_line_tracks_variant_and_preserves_value(self):
+        serializer = PurchaseOrderLineItemCreateSerializer(data={
+            "product_variant_id": str(self.variant.variant_id),
+            "quantity": 12,
+            "unit_price": "1250.00",
+        })
+
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        line_item = serializer.save(purchase_order=self.purchase_order)
+
+        tracked_item = InventoryItem.objects.get(product_variant_id=self.variant.variant_id)
+        self.assertEqual(line_item.inventory_item_id, tracked_item.id)
+        self.assertEqual(tracked_item.profile_id, 1)
+        self.assertEqual(tracked_item.barcode_snapshot, "QA-UNTRACKED-001")
+        self.assertEqual(line_item.quantity, 12)
+        self.assertEqual(line_item.unit_price, Decimal("1250.00"))
+
+    def test_existing_inventory_item_from_another_workspace_is_rejected(self):
+        foreign_item = InventoryItem.objects.create(
+            profile_id=2,
+            name_snapshot="Foreign item",
+            inventory_type="finished_good",
+        )
+        serializer = PurchaseOrderLineItemCreateSerializer(data={
+            "inventory_item": str(foreign_item.id),
+            "quantity": 1,
+            "unit_price": "10.00",
+        })
+
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        with self.assertRaisesMessage(DRFValidationError, "purchase order workspace"):
+            serializer.save(purchase_order=self.purchase_order)
+
+    def test_purchase_line_serializer_does_not_accept_batch_dates(self):
+        serializer = PurchaseOrderLineItemCreateSerializer(data={
+            "product_variant_id": str(self.variant.variant_id),
+            "quantity": 3,
+            "unit_price": "9.00",
+            "manufactured_date": date.today().isoformat(),
+        })
+
+        self.assertFalse(serializer.is_valid())
+        self.assertIn("expiry_date", serializer.errors)
+        self.assertIn("captured when goods are received", str(serializer.errors))
 
 
 class _FakeAncestorChain:
@@ -144,6 +213,10 @@ class OrderStructuralLocationSerializerTests(SimpleTestCase):
             stock_serial=None,
             reservation=None,
             quantity_shipped=Decimal("3"),
+            unit_cost=Decimal("4.50"),
+            cogs_amount=Decimal("13.50"),
+            revenue_amount=Decimal("30.00"),
+            gross_margin=Decimal("16.50"),
             notes="Packed for dispatch",
             created_at=None,
         )
@@ -153,6 +226,10 @@ class OrderStructuralLocationSerializerTests(SimpleTestCase):
         self.assertEqual(payload["location_name"], "Retail Shelf A")
         self.assertEqual(payload["structural_location_name"], "Airport Road, Oshodi Store")
         self.assertEqual(str(payload["structural_location_id"]), str(self.structural_root.id))
+        self.assertEqual(payload["unit_cost"], "4.50000")
+        self.assertEqual(payload["cogs_amount"], "13.50000")
+        self.assertEqual(payload["revenue_amount"], "30.00")
+        self.assertEqual(payload["gross_margin"], "16.50")
 
     def test_goods_receipt_list_serializer_builds_structural_preview(self):
         serializer = GoodsReceiptListSerializer()
@@ -248,7 +325,7 @@ class OrderStructuralLocationSerializerTests(SimpleTestCase):
         with self.assertRaises(ValidationError):
             line_item.clean()
 
-    def test_purchase_line_rejects_future_manufactured_date(self):
+    def test_purchase_line_rejects_manufacture_date_before_receipt(self):
         self.inventory_item.reorder_quantity = Decimal("0")
         line_item = PurchaseOrderLineItem(
             purchase_order=self.purchase_order,
@@ -258,10 +335,10 @@ class OrderStructuralLocationSerializerTests(SimpleTestCase):
             manufactured_date=date.today() + timedelta(days=1),
         )
 
-        with self.assertRaises(ValidationError):
+        with self.assertRaisesMessage(ValidationError, "captured when goods are received"):
             line_item.clean()
 
-    def test_purchase_line_rejects_non_future_expiry_date(self):
+    def test_purchase_line_rejects_expiry_date_before_receipt(self):
         self.inventory_item.reorder_quantity = Decimal("0")
         line_item = PurchaseOrderLineItem(
             purchase_order=self.purchase_order,
@@ -271,9 +348,8 @@ class OrderStructuralLocationSerializerTests(SimpleTestCase):
             expiry_date=date.today(),
         )
 
-        with self.assertRaises(ValidationError):
+        with self.assertRaisesMessage(ValidationError, "captured when goods are received"):
             line_item.clean()
-
 
 class PurchaseOrderReceiveItemsSerializerTests(SimpleTestCase):
     def test_receive_items_serializer_coerces_date_strings(self):

@@ -123,9 +123,11 @@ THIRD_PARTY_APPS=[
 ]
 CORE_APPS = [
     'mainapps.company',
+    'mainapps.accounting',
     'mainapps.content_type_linking_models',
     'mainapps.identity',
     'mainapps.inventory',
+    'mainapps.manufacturing',
     'mainapps.kafka_reliability',
     'mainapps.orders',
     'mainapps.projections',
@@ -149,6 +151,7 @@ MIDDLEWARE = [
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
     'corsheaders.middleware.CorsMiddleware',
     'subapps.middleware.FrontendOriginMiddleware',
+    'subapps.middleware.idempotency.IdempotencyMiddleware',
    
 ]
 
@@ -174,6 +177,7 @@ WSGI_APPLICATION = 'core.wsgi.application'
 
 DATABASE_CONN_MAX_AGE = int(os.getenv("DATABASE_CONN_MAX_AGE", "600"))
 DATABASE_CONN_HEALTH_CHECKS = os.getenv("DATABASE_CONN_HEALTH_CHECKS", "True") == "True"
+DATABASE_DISABLE_SERVER_SIDE_CURSORS = os.getenv("DATABASE_DISABLE_SERVER_SIDE_CURSORS", "True") == "True"
 DATABASE_CONNECT_TIMEOUT = int(os.getenv("DATABASE_CONNECT_TIMEOUT", "10"))
 
 DATABASES = {
@@ -183,6 +187,7 @@ DATABASES = {
         conn_health_checks=DATABASE_CONN_HEALTH_CHECKS,
     )
 }
+DATABASES["default"]["DISABLE_SERVER_SIDE_CURSORS"] = DATABASE_DISABLE_SERVER_SIDE_CURSORS
 if DATABASE_CONNECT_TIMEOUT > 0:
     DATABASES["default"].setdefault("OPTIONS", {})["connect_timeout"] = DATABASE_CONNECT_TIMEOUT
 AUTH_PASSWORD_VALIDATORS = [
@@ -419,6 +424,7 @@ CORS_ALLOW_HEADERS = [
     'x-intera-authorization-context',
     'x-intera-frontend-origin',
     'x-device-id',
+    'idempotency-key',
 ]
 
 _default_cors_allowed_origins = [
@@ -436,6 +442,11 @@ _default_cors_allowed_origins = [
     'https://ospirator.com',
     'https://dev.ospirator.com',
 ]
+if IS_PRODUCTION:
+    _default_cors_allowed_origins = [
+        origin for origin in _default_cors_allowed_origins
+        if origin.startswith("https://")
+    ]
 _configured_cors_allowed_origins = _split_csv_env("CORS_ALLOWED_ORIGINS", [])
 CORS_ALLOWED_ORIGINS = list(dict.fromkeys([*_default_cors_allowed_origins, *_configured_cors_allowed_origins]))
 CSRF_TRUSTED_ORIGINS = _split_csv_env("CSRF_TRUSTED_ORIGINS", CORS_ALLOWED_ORIGINS)

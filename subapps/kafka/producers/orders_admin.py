@@ -147,6 +147,8 @@ def serialize_purchase_order_line_item(line_item: PurchaseOrderLineItem) -> dict
         "inventory_barcode": inventory_item.barcode_snapshot or "",
         "product_variant_image_url": inventory_item.product_variant_image_url or "",
         "display_image": inventory_item.product_variant_image_url or "",
+        "structural_location_id": str(line_item.structural_location_id or ""),
+        "structural_location_name": _string(getattr(line_item.structural_location, "name", "")),
         "quantity": _json_decimal(line_item.quantity),
         "quantity_received": _json_decimal(line_item.quantity_received),
         "remaining_quantity": _json_decimal(line_item.remaining_quantity),

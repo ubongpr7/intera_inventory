@@ -58,8 +58,6 @@ class PurchaseOrderLineItemCreateUpdatePayload(BaseModel):
     discount_rate: Decimal = Field(Decimal("0"), ge=0, le=100, description="Discount percentage")
     tax_rate: Decimal = Field(Decimal("0"), ge=0, le=100, description="Tax percentage")
     description: Optional[str] = Field(None, description="Line item description")
-    expiry_date: Optional[date] = Field(None, description="Expiry date for batch")
-    manufactured_date: Optional[date] = Field(None, description="Manufacturing date")
     batch_number: Optional[str] = Field(None, max_length=30, description="Batch/lot number (auto-generated if not provided)")
 
     @field_validator("quantity_received")

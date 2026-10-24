@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import uuid
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 
 from django.db import models, transaction
 from django.utils import timezone
 
-from mainapps.inventory.models import InventoryItem
+from mainapps.inventory.models import InventoryItem, InventoryItemUnit
 from mainapps.orders.models import (
     GoodsReceipt,
     GoodsReceiptLine,
@@ -37,6 +37,42 @@ def _to_decimal(value) -> Decimal:
     if isinstance(value, Decimal):
         return value
     return Decimal(str(value))
+
+
+def _normalize_item_quantity(
+    inventory_item: InventoryItem,
+    quantity,
+    *,
+    uom_code: str = "",
+) -> tuple[Decimal, Decimal, str]:
+    """Convert an entered quantity to the item's canonical stock unit."""
+    try:
+        entered_quantity = _to_decimal(quantity)
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise StockDomainError("Quantity must be a valid decimal number.") from exc
+    if entered_quantity <= 0:
+        raise StockDomainError("Quantity must be greater than zero.")
+
+    code = (uom_code or inventory_item.stock_uom_code or inventory_item.default_uom_code or "").strip()
+    if not code:
+        return entered_quantity, Decimal("1"), ""
+
+    unit = InventoryItemUnit.objects.filter(inventory_item=inventory_item, code=code).first()
+    if unit is None:
+        # Existing records historically used a free-form unit label. Preserve
+        # that behavior until an explicit unit definition is configured.
+        if code in {inventory_item.stock_uom_code, inventory_item.default_uom_code}:
+            return entered_quantity, Decimal("1"), code
+        raise StockDomainError(f"UOM '{code}' is not configured for this inventory item.")
+
+    precision = Decimal("1").scaleb(-unit.decimal_places)
+    if entered_quantity.quantize(precision) != entered_quantity:
+        raise StockDomainError(
+            f"Quantity for UOM '{code}' supports at most {unit.decimal_places} decimal places."
+        )
+    if not unit.allows_partial and entered_quantity != entered_quantity.to_integral_value():
+        raise StockDomainError(f"Partial quantities are not allowed for UOM '{code}'.")
+    return entered_quantity * unit.conversion_to_stock, unit.conversion_to_stock, code
 
 
 def _coerce_profile_id(value):
@@ -108,6 +144,7 @@ class StockDomainService:
         line_item: PurchaseOrderLineItem,
         stock_location: StockLocation,
         quantity_received,
+        quantity_uom_code: str = "",
         unit_cost=None,
         actor_user_id=None,
         goods_receipt: GoodsReceipt | None = None,
@@ -118,14 +155,23 @@ class StockDomainService:
         notes: str = "",
     ):
         stock_location = cls._ensure_operational_stock_location(stock_location, label="Receiving location")
-        quantity_received = _to_decimal(quantity_received)
-        if quantity_received <= 0:
-            raise StockDomainError("Received quantity must be greater than zero.")
+        entered_quantity = _to_decimal(quantity_received)
+        quantity_received, conversion_factor, resolved_uom_code = _normalize_item_quantity(
+            line_item.inventory_item,
+            entered_quantity,
+            uom_code=quantity_uom_code,
+        )
+        if line_item.quantity_uom_code and line_item.quantity_uom_code != resolved_uom_code:
+            raise StockDomainError("A purchase line cannot be received using a different UOM.")
+        if not line_item.quantity_uom_code:
+            line_item.quantity_uom_code = resolved_uom_code
+            line_item.conversion_factor_snapshot = conversion_factor
+            line_item.stock_quantity = Decimal(str(line_item.quantity)) * conversion_factor
         resolved_unit_cost = _to_decimal(unit_cost if unit_cost is not None else line_item.unit_price)
         if resolved_unit_cost < 0:
             raise StockDomainError("Unit cost cannot be negative.")
 
-        if line_item.quantity_received + quantity_received > line_item.quantity:
+        if line_item.quantity_received + quantity_received > line_item.ordered_stock_quantity:
             raise StockDomainError(
                 f"Cannot receive {quantity_received}; only {line_item.remaining_quantity} remains open."
             )
@@ -150,8 +196,10 @@ class StockDomainService:
             )
 
         line_lot_number = lot_number or line_item.batch_number or ""
-        line_manufactured_date = manufactured_date or line_item.manufactured_date
-        line_expiry_date = expiry_date or line_item.expiry_date
+        # Dates describe the physical batch that arrived. They must come from
+        # this receipt, never from the purchase-order line.
+        line_manufactured_date = manufactured_date
+        line_expiry_date = expiry_date
         received_serial_numbers = _normalize_serial_numbers(serial_numbers)
         try:
             _validate_inventory_dates(
@@ -241,6 +289,8 @@ class StockDomainService:
                     to_location=stock_location,
                     movement_type=StockMovementType.RECEIPT,
                     quantity=Decimal("1"),
+                    quantity_uom_code=resolved_uom_code,
+                    conversion_factor_snapshot=conversion_factor,
                     unit_cost=resolved_unit_cost,
                     reference_type="goods_receipt_line",
                     reference_id=str(goods_receipt_line.id),
@@ -257,6 +307,8 @@ class StockDomainService:
                 to_location=stock_location,
                 movement_type=StockMovementType.RECEIPT,
                 quantity=quantity_received,
+                quantity_uom_code=resolved_uom_code,
+                conversion_factor_snapshot=conversion_factor,
                 unit_cost=resolved_unit_cost,
                 reference_type="goods_receipt_line",
                 reference_id=str(goods_receipt_line.id),
@@ -274,6 +326,86 @@ class StockDomainService:
             "stock_serials": stock_serials,
             "balance": balance,
         }
+
+    @classmethod
+    @transaction.atomic
+    def receive_stock(
+        cls,
+        *,
+        inventory_item: InventoryItem,
+        stock_location: StockLocation,
+        quantity,
+        quantity_uom_code: str = "",
+        unit_cost=0,
+        actor_user_id=None,
+        lot_number: str = "",
+        manufactured_date=None,
+        expiry_date=None,
+        force_lot: bool = False,
+        reference_type: str = "",
+        reference_id: str = "",
+        notes: str = "",
+    ):
+        """Receive stock that was produced internally rather than purchased."""
+        stock_location = cls._ensure_operational_stock_location(stock_location, label="Production location")
+        quantity, conversion_factor, resolved_uom_code = _normalize_item_quantity(
+            inventory_item,
+            quantity,
+            uom_code=quantity_uom_code,
+        )
+        if inventory_item.track_serial:
+            raise StockDomainError("Production receipt for serial-tracked items requires serial allocation.")
+        resolved_unit_cost = _to_decimal(unit_cost)
+        if resolved_unit_cost < 0:
+            raise StockDomainError("Unit cost cannot be negative.")
+        profile_id = cls._resolve_profile_id(inventory_item)
+        stock_lot = StockLot.objects.create(
+            profile_id=profile_id,
+            inventory_item=inventory_item,
+            lot_number=lot_number,
+            manufactured_date=manufactured_date,
+            expiry_date=expiry_date,
+            unit_cost=resolved_unit_cost,
+            received_quantity=quantity,
+            remaining_quantity=quantity,
+            created_by_user_id=actor_user_id,
+            updated_by_user_id=actor_user_id,
+        ) if (force_lot or inventory_item.track_lot or lot_number or manufactured_date or expiry_date) else None
+        balance = cls._get_locked_balance(
+            profile_id=profile_id,
+            inventory_item=inventory_item,
+            stock_location=stock_location,
+            stock_lot=stock_lot,
+            actor_user_id=actor_user_id,
+        )
+        balance.quantity_on_hand = _to_decimal(balance.quantity_on_hand) + quantity
+        balance.updated_by_user_id = actor_user_id
+        balance.save()
+        ensure_inventory_item_placement(
+            inventory_item,
+            stock_location=stock_location,
+            created_by_user_id=actor_user_id,
+            updated_by_user_id=actor_user_id,
+        )
+        movement = StockMovement.objects.create(
+            profile_id=profile_id,
+            inventory_item=inventory_item,
+            stock_lot=stock_lot,
+            to_location=stock_location,
+            movement_type=StockMovementType.RECEIPT,
+            quantity=quantity,
+            quantity_uom_code=resolved_uom_code,
+            conversion_factor_snapshot=conversion_factor,
+            unit_cost=resolved_unit_cost,
+            reference_type=reference_type,
+            reference_id=reference_id,
+            actor_user_id=actor_user_id,
+            notes=notes or f"Received internally for {reference_type}:{reference_id}",
+            created_by_user_id=actor_user_id,
+            updated_by_user_id=actor_user_id,
+        )
+        cls._publish_inventory_availability_on_commit(inventory_item.id)
+        return {"stock_lot": stock_lot, "balance": balance, "movement": movement}
 
     @classmethod
     @transaction.atomic
@@ -550,6 +682,7 @@ class StockDomainService:
         inventory_item: InventoryItem,
         stock_location: StockLocation,
         quantity,
+        quantity_uom_code: str = "",
         external_order_type: str,
         external_order_id: str,
         external_order_line_id: str = "",
@@ -561,9 +694,12 @@ class StockDomainService:
         notes: str = "",
     ):
         stock_location = cls._ensure_operational_stock_location(stock_location)
-        quantity = _to_decimal(quantity)
-        if quantity <= 0:
-            raise StockDomainError("Reservation quantity must be greater than zero.")
+        entered_quantity = _to_decimal(quantity)
+        quantity, conversion_factor, resolved_uom_code = _normalize_item_quantity(
+            inventory_item,
+            entered_quantity,
+            uom_code=quantity_uom_code,
+        )
 
         profile_id = cls._resolve_profile_id(inventory_item)
         if inventory_item.track_serial:
@@ -651,6 +787,8 @@ class StockDomainService:
             from_location=stock_location,
             movement_type=StockMovementType.RESERVATION,
             quantity=quantity,
+            quantity_uom_code=resolved_uom_code,
+            conversion_factor_snapshot=conversion_factor,
             reference_type=external_order_type,
             reference_id=external_order_line_id or external_order_id,
             actor_user_id=actor_user_id,
@@ -674,6 +812,7 @@ class StockDomainService:
         inventory_item: InventoryItem,
         stock_location: StockLocation,
         quantity,
+        quantity_uom_code: str = "",
         actor_user_id=None,
         stock_lot: StockLot | None = None,
         stock_serial: StockSerial | None = None,
@@ -685,9 +824,12 @@ class StockDomainService:
         tracking_type: int = TrackingType.SHIPPED,
     ):
         stock_location = cls._ensure_operational_stock_location(stock_location)
-        quantity = _to_decimal(quantity)
-        if quantity <= 0:
-            raise StockDomainError("Issue quantity must be greater than zero.")
+        entered_quantity = _to_decimal(quantity)
+        quantity, conversion_factor, resolved_uom_code = _normalize_item_quantity(
+            inventory_item,
+            entered_quantity,
+            uom_code=quantity_uom_code,
+        )
 
         profile_id = cls._resolve_profile_id(inventory_item)
         if inventory_item.track_serial:
@@ -790,6 +932,8 @@ class StockDomainService:
             from_location=stock_location,
             movement_type=movement_type,
             quantity=quantity,
+            quantity_uom_code=resolved_uom_code,
+            conversion_factor_snapshot=conversion_factor,
             unit_cost=cls._resolve_inventory_unit_cost(
                 inventory_item=inventory_item,
                 stock_lot=stock_lot,

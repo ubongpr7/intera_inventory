@@ -10,6 +10,7 @@ from mainapps.projections.models import CatalogProductProjection, CatalogVariant
 from subapps.kafka.producers.inventory import publish_inventory_availability_upserted
 from subapps.services.inventory_variant_cleanup import delete_inventory_item_if_safe
 from subapps.services.location_scope import ensure_inventory_item_placement
+from subapps.services.inventory_uom import ensure_base_inventory_unit
 
 
 def _coerce_bool(value: Any, default: bool = True) -> bool:
@@ -100,6 +101,7 @@ def _ensure_inventory_item_for_variant(variant: CatalogVariantProjection) -> Inv
         if changed_fields:
             inventory_item.save(update_fields=[*changed_fields, "updated_at"])
 
+    ensure_base_inventory_unit(inventory_item)
     ensure_inventory_item_placement(inventory_item)
     return inventory_item
 

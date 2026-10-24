@@ -3,7 +3,9 @@ from __future__ import annotations
 import logging
 import time
 import uuid
-from datetime import timedelta
+from collections.abc import Mapping
+from datetime import date, datetime, time as datetime_time, timedelta
+from decimal import Decimal
 from typing import Any, Iterable
 
 from django.db import DatabaseError, close_old_connections, connections, transaction
@@ -12,6 +14,27 @@ from django.utils import timezone
 from subapps.kafka.config import get_kafka_settings
 
 logger = logging.getLogger(__name__)
+
+
+def _json_safe(value: Any) -> Any:
+    """Normalize event data before storing it in a JSONField.
+
+    Kafka serialization already uses ``default=str``. The durable outbox must
+    apply the same rule before PostgreSQL sees the JSON payload, otherwise a
+    Decimal produced by an aggregate or price field can roll back the whole
+    transaction that created the event.
+    """
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, (datetime, date, datetime_time)):
+        return value.isoformat()
+    if isinstance(value, (uuid.UUID,)):
+        return str(value)
+    if isinstance(value, Mapping):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(item) for item in value]
+    return value
 
 
 def _reset_database_connections() -> None:
@@ -72,7 +95,7 @@ def enqueue_outbox_event(
                 "event_key": key or "",
                 "source_service": str(envelope.get("source_service") or ""),
                 "event_version": int(envelope.get("event_version") or 1),
-                "message_json": envelope,
+                "message_json": _json_safe(envelope),
                 "headers_json": _normalize_headers_for_storage(headers),
                 "status": KafkaOutboxStatus.PENDING,
                 "next_attempt_at": timezone.now(),

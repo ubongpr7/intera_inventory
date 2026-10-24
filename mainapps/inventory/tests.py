@@ -9,7 +9,7 @@ from django.db import IntegrityError, transaction
 from django.test import SimpleTestCase, TestCase
 from rest_framework.test import APIRequestFactory, force_authenticate
 
-from mainapps.inventory.models import InventoryCategory, InventoryItem, InventoryPlacement
+from mainapps.inventory.models import InventoryCategory, InventoryItem, InventoryItemUnit, InventoryPlacement
 from mainapps.company.models import Company
 from mainapps.company.views import CompanyViewSet
 from mainapps.projections.models import CatalogProductProjection, CatalogVariantProjection
@@ -18,6 +18,45 @@ from mainapps.inventory.views import BaseInventoryViewSet, InventoryItemViewSet,
 from subapps.kafka.consumers.catalog import handle_catalog_variant_event
 from subapps.kafka.producers.inventory import _resolve_catalog_variant
 from subapps.services.location_scope import ensure_inventory_item_placement, get_workspace_default_structural_location
+from subapps.services.stock_domain import StockDomainError, _normalize_item_quantity
+
+
+class InventoryUnitConversionTests(TestCase):
+    def setUp(self):
+        self.item = InventoryItem.objects.create(
+            profile_id=1,
+            name_snapshot="Bottled Water",
+            stock_uom_code="piece",
+            default_uom_code="piece",
+        )
+        InventoryItemUnit.objects.create(
+            profile_id=1,
+            inventory_item=self.item,
+            code="piece",
+            label="Piece",
+            conversion_to_stock=Decimal("1"),
+            is_purchase_unit=True,
+            is_sale_unit=True,
+        )
+        InventoryItemUnit.objects.create(
+            profile_id=1,
+            inventory_item=self.item,
+            code="carton",
+            label="Carton",
+            conversion_to_stock=Decimal("24"),
+            is_purchase_unit=True,
+            is_sale_unit=True,
+        )
+
+    def test_carton_quantity_is_normalized_to_stock_units(self):
+        self.assertEqual(
+            _normalize_item_quantity(self.item, "2", uom_code="carton"),
+            (Decimal("48"), Decimal("24"), "carton"),
+        )
+
+    def test_unknown_unit_is_rejected(self):
+        with self.assertRaises(StockDomainError):
+            _normalize_item_quantity(self.item, "1", uom_code="pallet")
 from subapps.services.inventory_read_model import get_inventory_item_summary_map, get_low_stock_rows
 from subapps.services.inventory_variant_cleanup import delete_inventory_item_if_safe
 from subapps.utils.request_context import scope_queryset_by_identity
@@ -146,6 +185,26 @@ class InventoryListServerFilterTests(TestCase):
         self.assertEqual(response.data["count"], 1)
         self.assertEqual(response.data["page"], 1)
         self.assertEqual(response.data["page_size"], 20)
+        self.assertEqual(response.data["results"][0]["id"], str(matching_item.id))
+
+    def test_list_search_matches_inventory_item_barcode(self):
+        matching_item = InventoryItem.objects.create(
+            profile_id=1,
+            name_snapshot="Barcode item",
+            barcode_snapshot="6947164190250",
+        )
+        InventoryItem.objects.create(
+            profile_id=1,
+            name_snapshot="Different item",
+            barcode_snapshot="0000000000000",
+        )
+
+        response = InventoryItemViewSet.as_view({"get": "list"})(
+            self._request("/inventory_api/items/?page=1&page_size=20&search=6947164190250")
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["count"], 1)
         self.assertEqual(response.data["results"][0]["id"], str(matching_item.id))
 
     @patch("mainapps.inventory.views.get_inventory_item_summary_map")
@@ -359,6 +418,9 @@ class CatalogVariantInventoryLinkTests(TestCase):
         self.assertTrue(item.track_stock)
         self.assertEqual(item.status, "active")
         self.assertEqual(item.metadata["source"], "catalog_variant_projection")
+        self.assertEqual(item.stock_uom_code, "unit")
+        self.assertEqual(item.default_uom_code, "unit")
+        self.assertTrue(item.units.filter(code="unit", is_sale_unit=True, is_purchase_unit=True).exists())
         self.assertTrue(placement.structural_location.structural)
         self.assertEqual(placement.structural_location.profile_id, 7)
         publish_availability.assert_called_once_with(inventory_item_id=item.id)
