@@ -366,7 +366,10 @@ SIMPLE_JWT = {
     # Treat empty strings as unset so we don't enforce/emit `aud`/`iss` with "".
     'AUDIENCE': os.getenv("JWT_AUDIENCE") or None,
     'ISSUER': os.getenv("JWT_ISSUER") or None,
-    'JWK_URL': os.getenv("JWT_JWK_URL") or None,
+    # Users' access tokens currently rely on the shared static public key and
+    # do not carry a ``kid`` header. Prefer that key when configured; otherwise
+    # fall back to JWKS discovery for deployments that use key identifiers.
+    'JWK_URL': None if JWT_VERIFYING_KEY else (os.getenv("JWT_JWK_URL") or None),
     'LEEWAY': 0,
 
     'AUTH_HEADER_TYPES': ('Bearer',),
