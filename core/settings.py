@@ -93,6 +93,13 @@ ALLOWED_HOSTS = (
     if _allowed_hosts_env
     else _default_allowed_hosts
 )
+# The subscription service reaches this app through the shared Docker network.
+# Keep the internal alias allowed even when production ALLOWED_HOSTS is supplied
+# through the environment; otherwise Django rejects the request with HTTP 400
+# before the internal usage endpoint can run.
+for _internal_host in ("inventory", "interaims-dev-inventory-web"):
+    if _internal_host not in ALLOWED_HOSTS:
+        ALLOWED_HOSTS.append(_internal_host)
 
 
 # ALLOWED_HOSTS = ['*']
