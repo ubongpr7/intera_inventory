@@ -109,7 +109,7 @@ class KafkaSettings:
             commit_failed_messages=_parse_bool(os.getenv("KAFKA_COMMIT_FAILED_MESSAGES"), True),
             dlq_suffix=os.getenv("KAFKA_DLQ_SUFFIX", ".dlq"),
             outbox_batch_size=_parse_int(os.getenv("KAFKA_OUTBOX_BATCH_SIZE"), 100),
-            outbox_poll_interval_seconds=_parse_float(os.getenv("KAFKA_OUTBOX_POLL_INTERVAL"), 2.0),
+            outbox_poll_interval_seconds=_parse_float(os.getenv("KAFKA_OUTBOX_POLL_INTERVAL"), 30.0),
             outbox_retry_delay_seconds=_parse_int(os.getenv("KAFKA_OUTBOX_RETRY_DELAY_SECONDS"), 30),
         )
 
