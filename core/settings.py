@@ -93,6 +93,13 @@ ALLOWED_HOSTS = (
     if _allowed_hosts_env
     else _default_allowed_hosts
 )
+# The subscription service reaches this app through the shared Docker network.
+# Keep the internal alias allowed even when production ALLOWED_HOSTS is supplied
+# through the environment; otherwise Django rejects the request with HTTP 400
+# before the internal usage endpoint can run.
+for _internal_host in ("inventory", "interaims-dev-inventory-web"):
+    if _internal_host not in ALLOWED_HOSTS:
+        ALLOWED_HOSTS.append(_internal_host)
 
 
 # ALLOWED_HOSTS = ['*']
@@ -175,8 +182,8 @@ TEMPLATES = [
 
 WSGI_APPLICATION = 'core.wsgi.application'
 
-DATABASE_CONN_MAX_AGE = int(os.getenv("DATABASE_CONN_MAX_AGE", "600"))
-DATABASE_CONN_HEALTH_CHECKS = os.getenv("DATABASE_CONN_HEALTH_CHECKS", "True") == "True"
+DATABASE_CONN_MAX_AGE = int(os.getenv("DATABASE_CONN_MAX_AGE", "0"))
+DATABASE_CONN_HEALTH_CHECKS = os.getenv("DATABASE_CONN_HEALTH_CHECKS", "False") == "True"
 DATABASE_DISABLE_SERVER_SIDE_CURSORS = os.getenv("DATABASE_DISABLE_SERVER_SIDE_CURSORS", "True") == "True"
 DATABASE_CONNECT_TIMEOUT = int(os.getenv("DATABASE_CONNECT_TIMEOUT", "10"))
 
@@ -366,7 +373,10 @@ SIMPLE_JWT = {
     # Treat empty strings as unset so we don't enforce/emit `aud`/`iss` with "".
     'AUDIENCE': os.getenv("JWT_AUDIENCE") or None,
     'ISSUER': os.getenv("JWT_ISSUER") or None,
-    'JWK_URL': os.getenv("JWT_JWK_URL") or None,
+    # Users' access tokens currently rely on the shared static public key and
+    # do not carry a ``kid`` header. Prefer that key when configured; otherwise
+    # fall back to JWKS discovery for deployments that use key identifiers.
+    'JWK_URL': None if JWT_VERIFYING_KEY else (os.getenv("JWT_JWK_URL") or None),
     'LEEWAY': 0,
 
     'AUTH_HEADER_TYPES': ('Bearer',),

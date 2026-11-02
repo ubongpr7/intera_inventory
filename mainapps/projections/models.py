@@ -12,6 +12,8 @@ class CatalogProductProjection(models.Model):
     category_name = models.CharField(max_length=255, blank=True, default="")
     tax_rate = models.DecimalField(max_digits=5, decimal_places=2, default=0)
     track_stock = models.BooleanField(default=True)
+    measurement_type = models.CharField(max_length=20, default="count")
+    uom_definitions = models.JSONField(default=list, blank=True)
     is_active = models.BooleanField(default=True, db_index=True)
     synced_at = models.DateTimeField(auto_now=True)
 
