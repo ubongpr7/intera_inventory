@@ -24,11 +24,18 @@ def _get_authorization_context(request):
     if not token:
         return {}
     try:
+        simple_jwt = getattr(settings, "SIMPLE_JWT", {})
+        algorithm = getattr(settings, "JWT_ALGORITHM", None) or simple_jwt.get("ALGORITHM", "RS256")
+        verifying_key = getattr(settings, "JWT_VERIFYING_KEY", None) or simple_jwt.get("VERIFYING_KEY")
+        audience = getattr(settings, "JWT_AUDIENCE", None) or simple_jwt.get("AUDIENCE")
+        issuer = getattr(settings, "JWT_ISSUER", None) or simple_jwt.get("ISSUER")
         context = jwt.decode(
             token,
-            getattr(settings, "JWT_VERIFYING_KEY", None),
-            algorithms=[getattr(settings, "JWT_ALGORITHM", "RS256")],
-            options={"verify_aud": False, "verify_iss": False},
+            verifying_key,
+            algorithms=[algorithm],
+            audience=audience,
+            issuer=issuer,
+            options={"verify_aud": bool(audience), "verify_iss": bool(issuer)},
         )
         access = _get_token_payload(request)
         if context.get("token_type") != "intera_authorization_context" or str(context.get("user_id") or "") not in {
@@ -37,6 +44,21 @@ def _get_authorization_context(request):
         }:
             return {}
         if str(context.get("profile_id") or "") != str(access.get("profile_id") or ""):
+            return {}
+        expected_hash = hashlib.sha256(
+            json.dumps(
+                {
+                    "profile_id": str(access.get("profile_id") or ""),
+                    "platform": str(access.get("platform") or "intera_ims"),
+                    "session_version": str(access.get("session_version") or ""),
+                    "user_id": str(access.get("user_id") or access.get("sub") or getattr(request.user, "id", "")),
+                    "access_token_id": str(access.get("jti") or ""),
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        if context.get("access_context_hash") != expected_hash:
             return {}
         return context
     except Exception:

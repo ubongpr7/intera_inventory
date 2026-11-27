@@ -22,10 +22,10 @@ env:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    environment:
-      name: ${{ inputs.target_environment || (github.ref_name == 'main' && 'prod' || 'dev') }}
+    environment: ${{ inputs.target_environment || (github.ref_name == 'main' && 'prod' || 'dev') }}
+
     steps:
-      - name: Checkout
+      - name: Check out source
         uses: actions/checkout@v4
 
       - name: Configure SSH
@@ -60,13 +60,8 @@ jobs:
           set -euo pipefail
           ssh "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}" "mkdir -p '${{ env.DEPLOY_PATH }}'"
           rsync -az --delete -e "ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=10" \
-            --exclude='.git' \
-            --exclude='.github' \
-            --exclude='.venv' \
-            --exclude='.env' \
-            --exclude='.env.*' \
-            --exclude='__pycache__' \
-            --exclude='*.pyc' \
+            --exclude='.git' --exclude='.github' --exclude='.venv' \
+            --exclude='.env' --exclude='.env.*' --exclude='__pycache__' --exclude='*.pyc' \
             ./ "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:${{ env.DEPLOY_PATH }}/"
 
       - name: Write environment file
@@ -90,29 +85,19 @@ jobs:
           set -euo pipefail
           /usr/local/bin/interaims-host-init
           cd "${DEPLOY_PATH}"
-
+          docker compose -f "${COMPOSE_FILE}" --profile release build
           case "${REPOSITORY_NAME}" in
-            inventory_notification_service|inventory_audit_service)
-              docker compose -f "${COMPOSE_FILE}" build
-              docker compose -f "${COMPOSE_FILE}" run --rm migrate
-              docker compose -f "${COMPOSE_FILE}" up -d --build --force-recreate --remove-orphans
-              ;;
             kafka_a2a)
-              docker compose -f "${COMPOSE_FILE}" up -d --build --force-recreate --remove-orphans
               ;;
-            intera_users|subscriptions)
-              docker compose -f "${COMPOSE_FILE}" --profile release build web migrate release-tasks
+            subscriptions)
               docker compose -f "${COMPOSE_FILE}" --profile release run --rm migrate
               docker compose -f "${COMPOSE_FILE}" --profile release run --rm release-tasks
-              docker compose -f "${COMPOSE_FILE}" up -d --build --force-recreate --remove-orphans
               ;;
             *)
-              docker compose -f "${COMPOSE_FILE}" --profile release build web migrate
               docker compose -f "${COMPOSE_FILE}" --profile release run --rm migrate
-              docker compose -f "${COMPOSE_FILE}" up -d --build --force-recreate --remove-orphans
               ;;
           esac
-
+          docker compose -f "${COMPOSE_FILE}" up -d --build --force-recreate --remove-orphans
           docker image prune -f || true
           expected_services=()
           expected_services+=("web")
@@ -134,5 +119,6 @@ jobs:
         run: |
           ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=10 "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}" \
             "cd '${{ env.DEPLOY_PATH }}' && for service in web consumer reorder-worker outbox mcp; do cid=\$(docker compose -f '${{ env.COMPOSE_FILE }}' ps -q \\"${service}\\"); test -n \\"${cid}\\" || exit 1; test \\"\$(docker inspect -f '{{.State.Status}}' \\"${cid}\\")\\" = running || exit 1; done; docker compose -f '${{ env.COMPOSE_FILE }}' ps"
+
 
 
