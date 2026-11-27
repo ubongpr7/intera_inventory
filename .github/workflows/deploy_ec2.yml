@@ -114,6 +114,18 @@ jobs:
           esac
 
           docker image prune -f || true
+          expected_services=()
+          expected_services+=("web")
+          expected_services+=("consumer")
+          expected_services+=("reorder-worker")
+          expected_services+=("outbox")
+          expected_services+=("mcp")
+          for service in "${expected_services[@]}"; do
+            container_id="$(docker compose -f "${COMPOSE_FILE}" ps -q "${service}")"
+            test -n "${container_id}" || { echo "Missing container for ${service}"; docker compose -f "${COMPOSE_FILE}" ps -a; exit 1; }
+            state="$(docker inspect -f '{{.State.Status}}' "${container_id}")"
+            test "${state}" = running || { echo "Service ${service} is ${state}"; docker compose -f "${COMPOSE_FILE}" ps -a; docker compose -f "${COMPOSE_FILE}" logs --tail=80 "${service}"; exit 1; }
+          done
           docker compose -f "${COMPOSE_FILE}" ps
           LOCKED
           REMOTE
@@ -121,5 +133,6 @@ jobs:
       - name: Verify deployment
         run: |
           ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=10 "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}" \
-            "docker compose -f '${{ env.DEPLOY_PATH }}/${{ env.COMPOSE_FILE }}' ps"
+            "cd '${{ env.DEPLOY_PATH }}' && for service in web consumer reorder-worker outbox mcp; do cid=\$(docker compose -f '${{ env.COMPOSE_FILE }}' ps -q \\"${service}\\"); test -n \\"${cid}\\" || exit 1; test \\"\$(docker inspect -f '{{.State.Status}}' \\"${cid}\\")\\" = running || exit 1; done; docker compose -f '${{ env.COMPOSE_FILE }}' ps"
+
 
