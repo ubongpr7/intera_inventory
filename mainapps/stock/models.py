@@ -7,6 +7,7 @@ from mainapps.company.models import Company
 from django.core.validators import MinValueValidator
 from django.core.exceptions import ValidationError
 from django.db import models
+import uuid
 from mptt.models import MPTTModel, TreeForeignKey
 from mainapps.content_type_linking_models.models import ProfileMixin, TenantStampedUUIDModel, _sync_identity_fields
 
@@ -74,6 +75,40 @@ class StockReservationStatus(models.TextChoices):
     FULFILLED = 'fulfilled', _('Fulfilled')
     RELEASED = 'released', _('Released')
     EXPIRED = 'expired', _('Expired')
+
+
+class InventoryMcpWorkflow(models.Model):
+    """Durable MCP workflow state owned by the inventory service."""
+
+    STATUS_ACTIVE = "active"
+    STATUS_SUCCEEDED = "succeeded"
+    STATUS_FAILED = "failed"
+    STATUS_CANCELLED = "cancelled"
+    STATUS_CHOICES = (
+        (STATUS_ACTIVE, "Active"),
+        (STATUS_SUCCEEDED, "Succeeded"),
+        (STATUS_FAILED, "Failed"),
+        (STATUS_CANCELLED, "Cancelled"),
+    )
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    workflow_type = models.CharField(max_length=80, db_index=True)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_ACTIVE, db_index=True)
+    step = models.CharField(max_length=80, db_index=True)
+    user_id = models.CharField(max_length=255, db_index=True)
+    profile_id = models.BigIntegerField(db_index=True)
+    state = models.JSONField(default=dict, blank=True)
+    expires_at = models.DateTimeField(db_index=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-updated_at"]
+        indexes = [
+            models.Index(fields=["profile_id", "workflow_type", "status"]),
+            models.Index(fields=["user_id", "workflow_type", "status"]),
+        ]
+
 
 class StockLocationType(models.Model):
     name = models.CharField(
