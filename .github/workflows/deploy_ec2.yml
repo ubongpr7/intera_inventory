@@ -42,7 +42,14 @@ jobs:
           if [ -n "${SSH_KNOWN_HOSTS}" ]; then
             printf '%s\n' "${SSH_KNOWN_HOSTS}" > ~/.ssh/known_hosts
           else
-            ssh-keyscan -H "${{ secrets.EC2_HOST }}" > ~/.ssh/known_hosts
+            : > ~/.ssh/known_hosts
+            for attempt in $(seq 1 30); do
+              if ssh-keyscan -T 5 -H "${{ secrets.EC2_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null && [ -s ~/.ssh/known_hosts ]; then
+                break
+              fi
+              sleep 5
+            done
+            test -s ~/.ssh/known_hosts || { echo "SSH host is not ready"; exit 1; }
           fi
           chmod 600 ~/.ssh/known_hosts
           printf '%s\n' 'Host *' '  IdentityFile ~/.ssh/deploy_key' '  IdentitiesOnly yes' > ~/.ssh/config
