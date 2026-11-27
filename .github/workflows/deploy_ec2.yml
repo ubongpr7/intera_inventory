@@ -116,6 +116,10 @@ jobs:
               ;;
           esac
           docker compose -f "${COMPOSE_FILE}" up -d --build --force-recreate --remove-orphans
+          # Re-resolve Docker service aliases after recreation so Caddy does not retain old container IPs.
+          if docker inspect caddy >/dev/null 2>&1; then
+            docker exec caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile || docker restart caddy
+          fi
           docker image prune -f || true
           expected_services=()
           expected_services+=("web")
