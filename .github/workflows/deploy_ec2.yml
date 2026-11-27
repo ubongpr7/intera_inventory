@@ -32,10 +32,11 @@ jobs:
         env:
           SSH_PRIVATE_KEY: ${{ secrets.EC2_SSH_KEY || secrets.EC2_PRIVATE_KEY }}
           SSH_KNOWN_HOSTS: ${{ secrets.EC2_KNOWN_HOSTS }}
+          DEPLOY_HOST: ${{ secrets.EC2_HOST }}
         run: |
           set -euo pipefail
           test -n "${SSH_PRIVATE_KEY}" || { echo "An EC2 SSH key is required"; exit 1; }
-          test -n "${{ secrets.EC2_HOST }}" || { echo "EC2_HOST is required"; exit 1; }
+          test -n "${DEPLOY_HOST}" || { echo "EC2_HOST is required"; exit 1; }
           mkdir -p ~/.ssh
           printf '%s\n' "${SSH_PRIVATE_KEY}" > ~/.ssh/deploy_key
           chmod 400 ~/.ssh/deploy_key
@@ -43,8 +44,8 @@ jobs:
             printf '%s\n' "${SSH_KNOWN_HOSTS}" > ~/.ssh/known_hosts
           else
             : > ~/.ssh/known_hosts
-            for attempt in $(seq 1 30); do
-              if ssh-keyscan -T 5 -H "${{ secrets.EC2_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null && [ -s ~/.ssh/known_hosts ]; then
+            for _ in $(seq 1 30); do
+              if ssh-keyscan -T 5 -H "${DEPLOY_HOST}" >> ~/.ssh/known_hosts 2>/dev/null && [ -s ~/.ssh/known_hosts ]; then
                 break
               fi
               sleep 5
@@ -56,29 +57,46 @@ jobs:
           chmod 600 ~/.ssh/config
 
       - name: Sync repository
+        env:
+          DEPLOY_USER: ${{ secrets.EC2_USER }}
+          DEPLOY_HOST: ${{ secrets.EC2_HOST }}
         run: |
           set -euo pipefail
-          ssh "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}" "mkdir -p '${{ env.DEPLOY_PATH }}'"
+          test -n "${DEPLOY_USER}" || { echo "EC2_USER is required"; exit 1; }
+          test -n "${DEPLOY_HOST}" || { echo "EC2_HOST is required"; exit 1; }
+          ssh_target="${DEPLOY_USER}@${DEPLOY_HOST}"
+          ssh_opts=(-o ServerAliveInterval=30 -o ServerAliveCountMax=10)
+          ssh "${ssh_opts[@]}" "${ssh_target}" "mkdir -p '${{ env.DEPLOY_PATH }}'"
           rsync -az --delete -e "ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=10" \
             --exclude='.git' --exclude='.github' --exclude='.venv' \
             --exclude='.env' --exclude='.env.*' --exclude='__pycache__' --exclude='*.pyc' \
-            ./ "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:${{ env.DEPLOY_PATH }}/"
+            ./ "${ssh_target}:${{ env.DEPLOY_PATH }}/"
 
       - name: Write environment file
         env:
           ENV_FILE: ${{ secrets.ENV_FILE }}
+          DEPLOY_USER: ${{ secrets.EC2_USER }}
+          DEPLOY_HOST: ${{ secrets.EC2_HOST }}
         run: |
           set -euo pipefail
           test -n "${ENV_FILE}" || { echo "ENV_FILE is required"; exit 1; }
-          printf '%s' "${ENV_FILE}" | ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=10 "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}" \
+          test -n "${DEPLOY_USER}" || { echo "EC2_USER is required"; exit 1; }
+          test -n "${DEPLOY_HOST}" || { echo "EC2_HOST is required"; exit 1; }
+          ssh_target="${DEPLOY_USER}@${DEPLOY_HOST}"
+          printf '%s' "${ENV_FILE}" | ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=10 "${ssh_target}" \
             "cat > '${{ env.DEPLOY_PATH }}/.env' && chmod 600 '${{ env.DEPLOY_PATH }}/.env'"
 
       - name: Deploy with migrations
         env:
           REPOSITORY_NAME: ${{ github.event.repository.name }}
+          DEPLOY_USER: ${{ secrets.EC2_USER }}
+          DEPLOY_HOST: ${{ secrets.EC2_HOST }}
         run: |
           set -euo pipefail
-          ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=10 "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}" \
+          test -n "${DEPLOY_USER}" || { echo "EC2_USER is required"; exit 1; }
+          test -n "${DEPLOY_HOST}" || { echo "EC2_HOST is required"; exit 1; }
+          ssh_target="${DEPLOY_USER}@${DEPLOY_HOST}"
+          ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=10 "${ssh_target}" \
             "DEPLOY_PATH='${{ env.DEPLOY_PATH }}' COMPOSE_FILE='${{ env.COMPOSE_FILE }}' REPOSITORY_NAME='${REPOSITORY_NAME}' bash -s" <<'REMOTE'
           set -euo pipefail
           flock /tmp/interaims-ec2-deploy.lock bash <<'LOCKED'
@@ -104,8 +122,15 @@ jobs:
           REMOTE
 
       - name: Verify deployment
+        env:
+          DEPLOY_USER: ${{ secrets.EC2_USER }}
+          DEPLOY_HOST: ${{ secrets.EC2_HOST }}
         run: |
-          ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=10 "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}" \
+          set -euo pipefail
+          test -n "${DEPLOY_USER}" || { echo "EC2_USER is required"; exit 1; }
+          test -n "${DEPLOY_HOST}" || { echo "EC2_HOST is required"; exit 1; }
+          ssh_target="${DEPLOY_USER}@${DEPLOY_HOST}"
+          ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=10 "${ssh_target}" \
             "docker compose -f '${{ env.DEPLOY_PATH }}/${{ env.COMPOSE_FILE }}' ps"
 
 
