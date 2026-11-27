@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import base64
 import os
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -17,7 +17,8 @@ os.environ.setdefault("DJANGO_SETTINGS_MODULE", "core.settings")
 
 import django
 from django.apps import apps
-from django.db import close_old_connections
+from django.db import close_old_connections, transaction
+from django.utils import timezone
 from asgiref.sync import sync_to_async
 
 if not apps.ready:
@@ -42,6 +43,7 @@ from mainapps.inventory.views import (
     InventoryItemViewSet as InventoryCatalogItemViewSet,
 )
 from mainapps.stock.models import (
+    InventoryMcpWorkflow,
     StockBalance,
     StockLocation,
     StockLocationType,
@@ -179,6 +181,21 @@ def get_current_principal(*, required: bool = False) -> InventoryMcpPrincipal | 
     return principal
 
 
+def require_agent_access(principal: InventoryMcpPrincipal) -> None:
+    """Require the explicit workspace permission for agent-driven MCP work."""
+    if principal.claims.get("client_id") != "intera-cli" or principal.claims.get("token_use") != "mcp":
+        raise PermissionError("This access token was not issued for the Intera MCP client.")
+    permissions = principal.permissions
+    if (
+        "interact_with_agent" in permissions
+        or "*" in permissions
+        or principal.claims.get("is_superuser")
+        or principal.claims.get("is_staff")
+    ):
+        return
+    raise PermissionError("You do not have permission to use Intera AI in this workspace.")
+
+
 def _merge_authorization_context(claims: dict[str, Any], context_token: str | None) -> dict[str, Any]:
     if not context_token:
         return claims
@@ -245,8 +262,9 @@ class InventoryMcpAuthMiddleware:
 
         try:
             principal = _build_principal_from_token(token, headers.get("x-intera-authorization-context"))
+            require_agent_access(principal)
         except Exception as exc:
-            response = JSONResponse({"detail": str(exc)}, status_code=401)
+            response = JSONResponse({"detail": str(exc)}, status_code=403 if isinstance(exc, PermissionError) else 401)
             await response(scope, receive, send)
             return
 
@@ -2066,6 +2084,11 @@ def _invoke_view_action_sync(
     close_old_connections()
     factory = APIRequestFactory()
     http_method = method.lower().strip()
+    if http_method not in {"get", "head", "options"}:
+        # The safe manifest is a discovery boundary, not an authorization
+        # boundary. Enforce the workspace-level agent grant here as well so a
+        # caller cannot opt into a full profile and bypass the permission.
+        require_agent_access(principal)
     path = "/mcp/internal"
     request_headers = {
         "HTTP_AUTHORIZATION": f"Bearer {principal.token}",
@@ -2454,34 +2477,43 @@ def _adjust_inventory_item_stock_via_view_sync(
 ) -> dict[str, Any]:
     request_data = dict(data)
     adjustments = request_data.get("adjustments")
-    if isinstance(adjustments, list) and adjustments:
-        first_adjustment = adjustments[0] if isinstance(adjustments[0], dict) else {}
-        stock_location_id = first_adjustment.get("stock_location_id")
-        structural_location_id = first_adjustment.get("structural_location_id")
-        quantity = first_adjustment.get("quantity")
-        adjustment_type = str(first_adjustment.get("adjustment_type") or "").strip().lower()
-        if stock_location_id and "location_id" not in request_data:
-            request_data["location_id"] = stock_location_id
-        if structural_location_id and "structural_location_id" not in request_data:
-            request_data["structural_location_id"] = structural_location_id
-        if quantity not in (None, "") and "quantity_change" not in request_data:
-            quantity_change = Decimal(str(quantity))
-            if adjustment_type == "remove" and quantity_change > 0:
-                quantity_change = -quantity_change
-            request_data["quantity_change"] = str(quantity_change)
-        if first_adjustment.get("notes") and "notes" not in request_data:
-            request_data["notes"] = first_adjustment.get("notes")
-    payload = _invoke_view_action_sync(
-        principal=principal,
-        viewset_cls=InventoryCatalogItemViewSet,
-        action="adjust_stock",
-        method="post",
-        pk=inventory_item_id,
-        data=request_data,
-    )
+    if not isinstance(adjustments, list) or not adjustments:
+        adjustments = [{}]
+    payloads: list[Any] = []
+    with (transaction.atomic() if len(adjustments) > 1 else nullcontext()):
+        for adjustment in adjustments:
+            line = adjustment if isinstance(adjustment, dict) else {}
+            line_request = {key: value for key, value in request_data.items() if key != "adjustments"}
+            stock_location_id = line.get("stock_location_id")
+            structural_location_id = line.get("structural_location_id") or line_request.get("structural_location_id")
+            quantity = line.get("quantity")
+            adjustment_type = str(line.get("adjustment_type") or "").strip().lower()
+            if stock_location_id:
+                line_request["location_id"] = stock_location_id
+            if structural_location_id:
+                line_request["structural_location_id"] = structural_location_id
+            if quantity not in (None, ""):
+                quantity_change = Decimal(str(quantity))
+                if adjustment_type == "remove" and quantity_change > 0:
+                    quantity_change = -quantity_change
+                line_request["quantity_change"] = str(quantity_change)
+            if line.get("notes"):
+                line_request["notes"] = line["notes"]
+            target_item_id = str(line.get("inventory_item_id") or inventory_item_id or "").strip()
+            if not target_item_id:
+                raise ValueError("Each adjustment line requires inventory_item_id.")
+            payloads.append(_invoke_view_action_sync(
+                principal=principal,
+                viewset_cls=InventoryCatalogItemViewSet,
+                action="adjust_stock",
+                method="post",
+                pk=target_item_id,
+                data=line_request,
+            ))
     return {
         "profile_id": principal.profile_id,
-        "inventory_adjustment": payload,
+        "inventory_adjustment": payloads[0] if len(payloads) == 1 else None,
+        "inventory_adjustments": payloads,
     }
 
 
@@ -2493,32 +2525,1384 @@ def _transfer_stock_via_view_sync(
 ) -> dict[str, Any]:
     request_data = dict(data)
     transfers = request_data.get("transfers")
-    if isinstance(transfers, list) and transfers:
-        first_transfer = transfers[0] if isinstance(transfers[0], dict) else {}
-        for source_key, target_key in (
-            ("inventory_item_id", "inventory_item_id"),
-            ("to_location_id", "to_location_id"),
-            ("stock_lot_id", "stock_lot_id"),
-            ("stock_serial_id", "stock_serial_id"),
-            ("quantity", "quantity"),
-            ("notes", "notes"),
-        ):
-            if first_transfer.get(source_key) not in (None, "") and target_key not in request_data:
-                request_data[target_key] = first_transfer.get(source_key)
-        if first_transfer.get("structural_location_id") not in (None, "") and "structural_location_id" not in request_data:
-            request_data["structural_location_id"] = first_transfer.get("structural_location_id")
-    payload = _invoke_view_action_sync(
-        principal=principal,
-        viewset_cls=StockLocationViewSet,
-        action="transfer_stock",
-        method="post",
-        pk=location_id,
-        data=request_data,
-    )
+    if not isinstance(transfers, list) or not transfers:
+        transfers = [{}]
+    payloads: list[Any] = []
+    with (transaction.atomic() if len(transfers) > 1 else nullcontext()):
+        for transfer in transfers:
+            line = transfer if isinstance(transfer, dict) else {}
+            line_request = {key: value for key, value in request_data.items() if key != "transfers"}
+            for key in ("inventory_item_id", "to_location_id", "stock_lot_id", "stock_serial_id", "quantity", "notes", "serial_number"):
+                if line.get(key) not in (None, ""):
+                    line_request[key] = line[key]
+            structural_location_id = line.get("structural_location_id") or line_request.get("structural_location_id")
+            if structural_location_id:
+                line_request["structural_location_id"] = structural_location_id
+            source_location_id = str(line.get("from_location_id") or location_id or "").strip()
+            if not source_location_id:
+                raise ValueError("Each transfer line requires from_location_id.")
+            if location_id and source_location_id != str(location_id):
+                raise ValueError("All transfer lines must use the workflow source location.")
+            payloads.append(_invoke_view_action_sync(
+                principal=principal,
+                viewset_cls=StockLocationViewSet,
+                action="transfer_stock",
+                method="post",
+                pk=source_location_id,
+                data=line_request,
+            ))
     return {
         "profile_id": principal.profile_id,
-        "stock_transfer": payload,
+        "stock_transfer": payloads[0] if len(payloads) == 1 else None,
+        "stock_transfers": payloads,
     }
+
+
+INVENTORY_ADJUSTMENT_WORKFLOW = "inventory_adjustment"
+INVENTORY_TRANSFER_WORKFLOW = "inventory_transfer"
+INVENTORY_ITEM_CREATION_WORKFLOW = "inventory_item_creation"
+INVENTORY_CATEGORY_CREATION_WORKFLOW = "inventory_category_creation"
+STOCK_LOCATION_CREATION_WORKFLOW = "stock_location_creation"
+INVENTORY_ITEM_UPDATE_WORKFLOW = "inventory_item_update"
+INVENTORY_CATEGORY_UPDATE_WORKFLOW = "inventory_category_update"
+STOCK_LOCATION_UPDATE_WORKFLOW = "stock_location_update"
+INVENTORY_ITEM_CONTROLS_UPDATE_WORKFLOW = "inventory_item_controls_update"
+INVENTORY_ITEM_STATUS_UPDATE_WORKFLOW = "inventory_item_status_update"
+PURCHASE_ORDER_RECEIVING_WORKFLOW = "purchase_order_receiving"
+PURCHASE_ORDER_CREATION_WORKFLOW = "purchase_order_creation"
+PURCHASE_ORDER_LINE_ITEM_ADD_WORKFLOW = "purchase_order_line_item_add"
+INVENTORY_WORKFLOW_TTL = timedelta(minutes=30)
+
+
+def _inventory_item_creation_start_sync(*, principal: InventoryMcpPrincipal, payload: dict[str, Any]) -> dict[str, Any]:
+    """Validate and stage an inventory item definition for explicit confirmation."""
+    require_agent_access(principal)
+    close_old_connections()
+    try:
+        normalized = inventory_payloads.InventoryItemCreatePayload.model_validate(
+            payload or {}
+        ).model_dump(mode="json", exclude_none=True)
+        workflow = InventoryMcpWorkflow.objects.create(
+            workflow_type=INVENTORY_ITEM_CREATION_WORKFLOW,
+            status=InventoryMcpWorkflow.STATUS_ACTIVE,
+            step="awaiting_confirmation",
+            user_id=str(principal.user_id),
+            profile_id=principal.profile_id,
+            state={"draft": normalized, "confirmation_token": str(uuid.uuid4())},
+            expires_at=timezone.now() + INVENTORY_WORKFLOW_TTL,
+        )
+        workflow.state = _inventory_workflow_event(
+            workflow.state,
+            "created",
+            to_step="awaiting_confirmation",
+            metadata={"operation": "create_inventory_item"},
+        )
+        workflow.save(update_fields=["state", "updated_at"])
+        return _inventory_workflow_envelope(
+            workflow,
+            interaction={
+                "interaction_type": "confirmation_request",
+                "title": "Review inventory item",
+                "description": "Create this inventory item definition?",
+                "details": "Review the item identity, stock controls, tracking flags, and category before creating it.",
+                "action_type": "create_inventory_item",
+                "approve_text": "Create inventory item",
+                "deny_text": "Cancel",
+                "allow_input": False,
+                "inventory_item": normalized,
+                "confirmation_token": workflow.state["confirmation_token"],
+            },
+        )
+    finally:
+        close_old_connections()
+
+
+def _inventory_item_creation_confirm_sync(
+    *, principal: InventoryMcpPrincipal, workflow_id: str, confirmation_token: str
+) -> dict[str, Any]:
+    require_agent_access(principal)
+    close_old_connections()
+    try:
+        with transaction.atomic():
+            workflow = InventoryMcpWorkflow.objects.select_for_update().filter(
+                id=workflow_id,
+                workflow_type=INVENTORY_ITEM_CREATION_WORKFLOW,
+                user_id=str(principal.user_id),
+                profile_id=principal.profile_id,
+            ).first()
+            if workflow is None:
+                raise InventoryMcpWorkflow.DoesNotExist("Workflow does not exist or is not accessible.")
+            if workflow.status != InventoryMcpWorkflow.STATUS_ACTIVE or workflow.step != "awaiting_confirmation":
+                raise ValueError("Inventory item creation workflow is not awaiting confirmation.")
+            if workflow.expires_at <= timezone.now():
+                workflow.status = InventoryMcpWorkflow.STATUS_FAILED
+                workflow.step = "expired"
+                workflow.state = _inventory_workflow_event(
+                    {**(workflow.state or {}), "confirmation_token": None, "error": "Workflow expired."},
+                    "expired", from_step="awaiting_confirmation", to_step="expired",
+                )
+                workflow.save(update_fields=["status", "step", "state", "updated_at"])
+                raise ValueError("Workflow expired. Start a new inventory item draft.")
+            if str(confirmation_token or "") != str((workflow.state or {}).get("confirmation_token") or ""):
+                raise ValueError("Invalid or already-used confirmation token.")
+            workflow.step = "running"
+            workflow.state = _inventory_workflow_event(
+                {**(workflow.state or {}), "confirmation_token": None},
+                "confirmed", from_step="awaiting_confirmation", to_step="running",
+            )
+            workflow.save(update_fields=["step", "state", "updated_at"])
+            try:
+                result = _inventory_item_crud_action_sync(
+                    principal=principal,
+                    action="create",
+                    method="post",
+                    data=dict((workflow.state or {}).get("draft") or {}),
+                )
+            except Exception:
+                workflow.status = InventoryMcpWorkflow.STATUS_FAILED
+                workflow.step = "failed"
+                workflow.state = _inventory_workflow_event(
+                    {
+                        **(workflow.state or {}),
+                        "error": {
+                            "code": "inventory_item_creation_failed",
+                            "message": "The inventory item could not be created. Review the draft and try again.",
+                            "retryable": True,
+                        },
+                    },
+                    "failed", from_step="running", to_step="failed",
+                )
+                workflow.save(update_fields=["status", "step", "state", "updated_at"])
+                return _inventory_workflow_envelope(
+                    workflow,
+                    interaction=_inventory_workflow_failed_interaction(
+                        workflow,
+                        title="Inventory item creation failed",
+                        description="The inventory item could not be created. Review the draft and try again.",
+                    ),
+                )
+            workflow.status = InventoryMcpWorkflow.STATUS_SUCCEEDED
+            workflow.step = "succeeded"
+            workflow.state = _inventory_workflow_event(
+                {**(workflow.state or {}), "result": result},
+                "succeeded", from_step="running", to_step="succeeded",
+            )
+            workflow.save(update_fields=["status", "step", "state", "updated_at"])
+            return _inventory_workflow_envelope(
+                workflow,
+                interaction={
+                    "interaction_type": "workflow_result",
+                    "title": "Inventory item created",
+                    "result": result,
+                },
+            )
+    finally:
+        close_old_connections()
+
+
+def _inventory_setup_creation_start_sync(
+    *,
+    principal: InventoryMcpPrincipal,
+    payload: dict[str, Any],
+    workflow_type: str,
+    payload_model: Any,
+    action_type: str,
+    title: str,
+    description: str,
+    details: str,
+) -> dict[str, Any]:
+    """Stage a validated inventory setup definition for confirmation."""
+    require_agent_access(principal)
+    close_old_connections()
+    try:
+        normalized = payload_model.model_validate(payload or {}).model_dump(
+            mode="json", exclude_none=True
+        )
+        workflow = InventoryMcpWorkflow.objects.create(
+            workflow_type=workflow_type,
+            status=InventoryMcpWorkflow.STATUS_ACTIVE,
+            step="awaiting_confirmation",
+            user_id=str(principal.user_id),
+            profile_id=principal.profile_id,
+            state={"draft": normalized, "confirmation_token": str(uuid.uuid4())},
+            expires_at=timezone.now() + INVENTORY_WORKFLOW_TTL,
+        )
+        workflow.state = _inventory_workflow_event(
+            workflow.state,
+            "created",
+            to_step="awaiting_confirmation",
+            metadata={"operation": action_type},
+        )
+        workflow.save(update_fields=["state", "updated_at"])
+        return _inventory_workflow_envelope(
+            workflow,
+            interaction={
+                "interaction_type": "confirmation_request",
+                "title": title,
+                "description": description,
+                "details": details,
+                "action_type": action_type,
+                "approve_text": f"Create {action_type.replace('_', ' ')}",
+                "deny_text": "Cancel",
+                "allow_input": False,
+                "draft": normalized,
+                "confirmation_token": workflow.state["confirmation_token"],
+            },
+        )
+    finally:
+        close_old_connections()
+
+
+def _inventory_setup_creation_confirm_sync(
+    *,
+    principal: InventoryMcpPrincipal,
+    workflow_id: str,
+    confirmation_token: str,
+    workflow_type: str,
+    action_type: str,
+    action_sync: Any,
+    result_key: str,
+    success_title: str,
+) -> dict[str, Any]:
+    require_agent_access(principal)
+    close_old_connections()
+    try:
+        with transaction.atomic():
+            workflow = InventoryMcpWorkflow.objects.select_for_update().filter(
+                id=workflow_id,
+                workflow_type=workflow_type,
+                user_id=str(principal.user_id),
+                profile_id=principal.profile_id,
+            ).first()
+            if workflow is None:
+                raise InventoryMcpWorkflow.DoesNotExist("Workflow does not exist or is not accessible.")
+            if workflow.status != InventoryMcpWorkflow.STATUS_ACTIVE or workflow.step != "awaiting_confirmation":
+                raise ValueError(f"{action_type.replace('_', ' ').capitalize()} workflow is not awaiting confirmation.")
+            if workflow.expires_at <= timezone.now():
+                workflow.status = InventoryMcpWorkflow.STATUS_FAILED
+                workflow.step = "expired"
+                workflow.state = _inventory_workflow_event(
+                    {**(workflow.state or {}), "confirmation_token": None, "error": "Workflow expired."},
+                    "expired", from_step="awaiting_confirmation", to_step="expired",
+                )
+                workflow.save(update_fields=["status", "step", "state", "updated_at"])
+                raise ValueError(f"Workflow expired. Start a new {action_type.replace('_', ' ')} draft.")
+            if str(confirmation_token or "") != str((workflow.state or {}).get("confirmation_token") or ""):
+                raise ValueError("Invalid or already-used confirmation token.")
+            workflow.step = "running"
+            workflow.state = _inventory_workflow_event(
+                {**(workflow.state or {}), "confirmation_token": None},
+                "confirmed", from_step="awaiting_confirmation", to_step="running",
+            )
+            workflow.save(update_fields=["step", "state", "updated_at"])
+            try:
+                result = action_sync(
+                    principal=principal,
+                    action="create",
+                    method="post",
+                    data=dict((workflow.state or {}).get("draft") or {}),
+                )
+            except Exception:
+                workflow.status = InventoryMcpWorkflow.STATUS_FAILED
+                workflow.step = "failed"
+                workflow.state = _inventory_workflow_event(
+                    {
+                        **(workflow.state or {}),
+                        "error": {
+                            "code": f"{action_type}_failed",
+                            "message": f"The {action_type.replace('_', ' ')} could not be created. Review the draft and try again.",
+                            "retryable": True,
+                        },
+                    },
+                    "failed", from_step="running", to_step="failed",
+                )
+                workflow.save(update_fields=["status", "step", "state", "updated_at"])
+                return _inventory_workflow_envelope(
+                    workflow,
+                    interaction=_inventory_workflow_failed_interaction(
+                        workflow,
+                        title=f"{action_type.replace('_', ' ').capitalize()} failed",
+                        description=f"The {action_type.replace('_', ' ')} could not be created. Review the draft and try again.",
+                    ),
+                )
+            workflow.status = InventoryMcpWorkflow.STATUS_SUCCEEDED
+            workflow.step = "succeeded"
+            workflow.state = _inventory_workflow_event(
+                {**(workflow.state or {}), "result": result},
+                "succeeded", from_step="running", to_step="succeeded",
+            )
+            workflow.save(update_fields=["status", "step", "state", "updated_at"])
+            return _inventory_workflow_envelope(
+                workflow,
+                interaction={
+                    "interaction_type": "workflow_result",
+                    "title": success_title,
+                    result_key: result,
+                },
+            )
+    finally:
+        close_old_connections()
+
+
+def _inventory_setup_update_start_sync(
+    *,
+    principal: InventoryMcpPrincipal,
+    target_id: str | None,
+    payload: dict[str, Any],
+    workflow_type: str,
+    payload_model: Any,
+    action_type: str,
+    target_key: str | None,
+    title: str,
+    description: str,
+    action_name: str = "partial_update",
+    action_method: str = "patch",
+) -> dict[str, Any]:
+    """Stage a validated inventory setup update, including its target."""
+    require_agent_access(principal)
+    close_old_connections()
+    try:
+        if target_key and not str(target_id or "").strip():
+            raise ValueError(f"{target_key} is required")
+        normalized = payload_model.model_validate(payload or {}).model_dump(
+            mode="json", exclude_none=True
+        )
+        state: dict[str, Any] = {
+            "draft": normalized,
+            "confirmation_token": str(uuid.uuid4()),
+            "action_name": action_name,
+            "action_method": action_method,
+        }
+        if target_key:
+            state["target_id"] = str(target_id).strip()
+        workflow = InventoryMcpWorkflow.objects.create(
+            workflow_type=workflow_type,
+            status=InventoryMcpWorkflow.STATUS_ACTIVE,
+            step="awaiting_confirmation",
+            user_id=str(principal.user_id),
+            profile_id=principal.profile_id,
+            state=state,
+            expires_at=timezone.now() + INVENTORY_WORKFLOW_TTL,
+        )
+        workflow.state = _inventory_workflow_event(
+            workflow.state,
+            "created",
+            to_step="awaiting_confirmation",
+            metadata={"operation": action_type},
+        )
+        workflow.save(update_fields=["state", "updated_at"])
+        return _inventory_workflow_envelope(
+            workflow,
+            interaction={
+                "interaction_type": "confirmation_request",
+                "title": title,
+                "description": description,
+                "action_type": action_type,
+                "approve_text": "Apply update",
+                "deny_text": "Cancel",
+                "allow_input": False,
+                "target_id": state.get("target_id"),
+                "draft": normalized,
+                "confirmation_token": state["confirmation_token"],
+            },
+        )
+    finally:
+        close_old_connections()
+
+
+def _inventory_setup_update_confirm_sync(
+    *,
+    principal: InventoryMcpPrincipal,
+    workflow_id: str,
+    confirmation_token: str,
+    workflow_type: str,
+    action_type: str,
+    action_sync: Any,
+    target_key: str | None,
+    result_key: str,
+    success_title: str,
+) -> dict[str, Any]:
+    require_agent_access(principal)
+    close_old_connections()
+    try:
+        with transaction.atomic():
+            workflow = InventoryMcpWorkflow.objects.select_for_update().filter(
+                id=workflow_id,
+                workflow_type=workflow_type,
+                user_id=str(principal.user_id),
+                profile_id=principal.profile_id,
+            ).first()
+            if workflow is None:
+                raise InventoryMcpWorkflow.DoesNotExist("Workflow does not exist or is not accessible.")
+            if workflow.status != InventoryMcpWorkflow.STATUS_ACTIVE or workflow.step != "awaiting_confirmation":
+                raise ValueError(f"{action_type.replace('_', ' ').capitalize()} workflow is not awaiting confirmation.")
+            if workflow.expires_at <= timezone.now():
+                workflow.status = InventoryMcpWorkflow.STATUS_FAILED
+                workflow.step = "expired"
+                workflow.state = _inventory_workflow_event(
+                    {**(workflow.state or {}), "confirmation_token": None, "error": "Workflow expired."},
+                    "expired", from_step="awaiting_confirmation", to_step="expired",
+                )
+                workflow.save(update_fields=["status", "step", "state", "updated_at"])
+                raise ValueError(f"Workflow expired. Start a new {action_type.replace('_', ' ')} draft.")
+            if str(confirmation_token or "") != str((workflow.state or {}).get("confirmation_token") or ""):
+                raise ValueError("Invalid or already-used confirmation token.")
+            workflow.step = "running"
+            workflow.state = _inventory_workflow_event(
+                {**(workflow.state or {}), "confirmation_token": None},
+                "confirmed", from_step="awaiting_confirmation", to_step="running",
+            )
+            workflow.save(update_fields=["step", "state", "updated_at"])
+            try:
+                call_kwargs: dict[str, Any] = {
+                    "principal": principal,
+                    "data": dict((workflow.state or {}).get("draft") or {}),
+                }
+                if target_key:
+                    call_kwargs[target_key] = str((workflow.state or {}).get("target_id") or "")
+                    call_kwargs.update({
+                        "action": str((workflow.state or {}).get("action_name") or "partial_update"),
+                        "method": str((workflow.state or {}).get("action_method") or "patch"),
+                    })
+                result = action_sync(**call_kwargs)
+            except Exception:
+                workflow.status = InventoryMcpWorkflow.STATUS_FAILED
+                workflow.step = "failed"
+                workflow.state = _inventory_workflow_event(
+                    {
+                        **(workflow.state or {}),
+                        "error": {
+                            "code": f"{action_type}_failed",
+                            "message": f"The {action_type.replace('_', ' ')} could not be applied. Review the draft and try again.",
+                            "retryable": True,
+                        },
+                    },
+                    "failed", from_step="running", to_step="failed",
+                )
+                workflow.save(update_fields=["status", "step", "state", "updated_at"])
+                return _inventory_workflow_envelope(
+                    workflow,
+                    interaction=_inventory_workflow_failed_interaction(
+                        workflow,
+                        title=f"{action_type.replace('_', ' ').capitalize()} failed",
+                        description=f"The {action_type.replace('_', ' ')} could not be applied. Review the draft and try again.",
+                    ),
+                )
+            workflow.status = InventoryMcpWorkflow.STATUS_SUCCEEDED
+            workflow.step = "succeeded"
+            workflow.state = _inventory_workflow_event(
+                {**(workflow.state or {}), "result": result},
+                "succeeded", from_step="running", to_step="succeeded",
+            )
+            workflow.save(update_fields=["status", "step", "state", "updated_at"])
+            return _inventory_workflow_envelope(
+                workflow,
+                interaction={
+                    "interaction_type": "workflow_result",
+                    "title": success_title,
+                    result_key: result,
+                },
+            )
+    finally:
+        close_old_connections()
+
+
+def _inventory_workflow_event(state: dict[str, Any], event_type: str, *, from_step: str = "", to_step: str = "", metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+    history = list(state.get("history") or [])
+    history.append({"event_type": event_type, "from_step": from_step, "to_step": to_step, "metadata": metadata or {}, "created_at": timezone.now().isoformat()})
+    state["history"] = history[-25:]
+    return state
+
+
+def _inventory_workflow_progress(workflow: InventoryMcpWorkflow) -> dict[str, Any] | None:
+    """Expose normalized line progress for multi-line inventory workflows."""
+    state = workflow.state or {}
+    lines = state.get("lines") or []
+    if not isinstance(lines, list) or not lines:
+        return None
+    total = len(lines)
+    completed = total if workflow.status == InventoryMcpWorkflow.STATUS_SUCCEEDED else 0
+    failed = total if workflow.status == InventoryMcpWorkflow.STATUS_FAILED else 0
+    if workflow.status == InventoryMcpWorkflow.STATUS_SUCCEEDED:
+        phase = "completed"
+    elif workflow.status == InventoryMcpWorkflow.STATUS_FAILED:
+        phase = "failed"
+    elif workflow.status == InventoryMcpWorkflow.STATUS_CANCELLED:
+        phase = "cancelled"
+    elif workflow.step == "running":
+        phase = "applying"
+    else:
+        phase = "preparing"
+    return {
+        "phase": phase,
+        "step": workflow.step,
+        "completed": completed,
+        "total": total,
+        "succeeded": completed,
+        "failed": failed,
+        "percent": round((completed / total) * 100),
+        "indeterminate": False,
+    }
+
+
+def _inventory_workflow_envelope(workflow: InventoryMcpWorkflow, *, interaction: dict[str, Any] | None = None) -> dict[str, Any]:
+    workflow_id = str(workflow.id)
+    correlation_id = f"mcp-workflow:{workflow_id}"
+    profile_id = str(getattr(workflow, "profile_id", "") or "")
+    result = {
+        "schema_version": 1,
+        "contract": "intera.workflow.v1",
+        "workflow_id": workflow_id,
+        "workflow_type": workflow.workflow_type,
+        "profile_id": profile_id,
+        "correlation_id": correlation_id,
+        "status": workflow.status,
+        "step": workflow.step,
+        "expires_at": workflow.expires_at.isoformat(),
+        "state": workflow.state,
+        "history": (workflow.state or {}).get("history") or [],
+    }
+    progress = _inventory_workflow_progress(workflow)
+    if progress is not None:
+        result["progress"] = progress
+    if interaction is not None:
+        result["interaction"] = {
+            **interaction,
+            "schema_version": 1,
+            "contract": "intera.workflow.v1",
+            "workflow_id": workflow_id,
+            "workflow_type": workflow.workflow_type,
+            "profile_id": profile_id,
+            "correlation_id": correlation_id,
+            "workflow_status": workflow.status,
+            "workflow_step": workflow.step,
+            "workflow_expires_at": workflow.expires_at.isoformat(),
+            "workflow_history": (workflow.state or {}).get("history") or [],
+        }
+        if progress is not None:
+            result["interaction"]["progress"] = progress
+    return result
+
+
+def _inventory_workflow_failed_interaction(
+    workflow: InventoryMcpWorkflow, *, title: str, description: str
+) -> dict[str, Any]:
+    error = (workflow.state or {}).get("error")
+    retryable = bool(error.get("retryable")) if isinstance(error, dict) else False
+    return {
+        "interaction_type": "workflow_failed",
+        "title": title,
+        "description": description,
+        "error": error,
+        "retry_available": retryable,
+        "retry_workflow_id": str(workflow.id) if retryable else None,
+    }
+
+
+def _purchase_order_creation_start_sync(
+    *, principal: InventoryMcpPrincipal, payload: dict[str, Any]
+) -> dict[str, Any]:
+    require_agent_access(principal)
+    close_old_connections()
+    try:
+        normalized = orders_payloads.PurchaseOrderCreateUpdatePayload.model_validate(
+            payload or {}
+        ).model_dump(mode="json", exclude_none=True)
+        # Creation is intentionally limited to a pending draft. Approval and
+        # issue are separate governed operations on the existing order flow.
+        normalized["status"] = orders_payloads.PurchaseOrderStatus.PENDING.value
+        normalized["workflow_state"] = orders_payloads.WorkflowState.DRAFT.value
+        workflow = InventoryMcpWorkflow.objects.create(
+            workflow_type=PURCHASE_ORDER_CREATION_WORKFLOW,
+            status=InventoryMcpWorkflow.STATUS_ACTIVE,
+            step="awaiting_confirmation",
+            user_id=str(principal.user_id),
+            profile_id=principal.profile_id,
+            state={"draft": normalized, "confirmation_token": str(uuid.uuid4())},
+            expires_at=timezone.now() + INVENTORY_WORKFLOW_TTL,
+        )
+        workflow.state = _inventory_workflow_event(
+            workflow.state,
+            "created",
+            to_step="awaiting_confirmation",
+            metadata={"operation": "create_purchase_order"},
+        )
+        workflow.save(update_fields=["state", "updated_at"])
+        return _inventory_workflow_envelope(
+            workflow,
+            interaction={
+                "interaction_type": "confirmation_request",
+                "title": "Review purchase-order draft",
+                "description": "Create this purchase order as a pending draft?",
+                "details": normalized.get("description") or normalized.get("notes") or "Review the supplier, delivery date, and order details before creating it.",
+                "action_type": "create_purchase_order",
+                "approve_text": "Create purchase order",
+                "deny_text": "Cancel",
+                "allow_input": False,
+                "purchase_order": normalized,
+                "confirmation_token": workflow.state["confirmation_token"],
+            },
+        )
+    finally:
+        close_old_connections()
+
+
+def _purchase_order_creation_confirm_sync(
+    *, principal: InventoryMcpPrincipal, workflow_id: str, confirmation_token: str
+) -> dict[str, Any]:
+    require_agent_access(principal)
+    close_old_connections()
+    try:
+        with transaction.atomic():
+            workflow = (
+                InventoryMcpWorkflow.objects.select_for_update()
+                .filter(
+                    id=workflow_id,
+                    workflow_type=PURCHASE_ORDER_CREATION_WORKFLOW,
+                    user_id=str(principal.user_id),
+                    profile_id=principal.profile_id,
+                )
+                .first()
+            )
+            if workflow is None:
+                raise InventoryMcpWorkflow.DoesNotExist("Workflow does not exist or is not accessible.")
+            if workflow.status != InventoryMcpWorkflow.STATUS_ACTIVE or workflow.step != "awaiting_confirmation":
+                raise ValueError("Purchase-order creation workflow is not awaiting confirmation.")
+            if workflow.expires_at <= timezone.now():
+                workflow.status = InventoryMcpWorkflow.STATUS_FAILED
+                workflow.step = "expired"
+                workflow.state = _inventory_workflow_event(
+                    {**(workflow.state or {}), "confirmation_token": None, "error": "Workflow expired."},
+                    "expired",
+                    from_step="awaiting_confirmation",
+                    to_step="expired",
+                )
+                workflow.save(update_fields=["status", "step", "state", "updated_at"])
+                raise ValueError("Workflow expired. Start a new purchase-order draft.")
+            if str(confirmation_token or "") != str((workflow.state or {}).get("confirmation_token") or ""):
+                raise ValueError("Invalid or already-used confirmation token.")
+            workflow.step = "running"
+            workflow.save(update_fields=["step", "updated_at"])
+            workflow.state = _inventory_workflow_event(
+                {**(workflow.state or {}), "confirmation_token": None},
+                "confirmed",
+                from_step="awaiting_confirmation",
+                to_step="running",
+            )
+            workflow.save(update_fields=["state", "updated_at"])
+            try:
+                from mainapps.orders.views import PurchaseOrderViewSet
+
+                result = _invoke_view_action_sync(
+                    principal=principal,
+                    viewset_cls=PurchaseOrderViewSet,
+                    action="create",
+                    method="post",
+                    data=dict((workflow.state or {}).get("draft") or {}),
+                )
+            except Exception:
+                workflow.status = InventoryMcpWorkflow.STATUS_FAILED
+                workflow.step = "failed"
+                workflow.state = _inventory_workflow_event(
+                    {
+                        **(workflow.state or {}),
+                        "error": {
+                            "code": "purchase_order_creation_failed",
+                            "message": "The purchase order could not be created. Review the draft and try again.",
+                            "retryable": True,
+                        },
+                    },
+                    "failed",
+                    from_step="running",
+                    to_step="failed",
+                )
+                workflow.save(update_fields=["status", "step", "state", "updated_at"])
+                return _inventory_workflow_envelope(
+                    workflow,
+                    interaction=_inventory_workflow_failed_interaction(
+                        workflow,
+                        title="Purchase-order creation failed",
+                        description="The purchase order could not be created. Review the draft and try again.",
+                    ),
+                )
+            workflow.status = InventoryMcpWorkflow.STATUS_SUCCEEDED
+            workflow.step = "succeeded"
+            workflow.state = _inventory_workflow_event(
+                {**(workflow.state or {}), "result": result},
+                "succeeded",
+                from_step="running",
+                to_step="succeeded",
+            )
+            workflow.save(update_fields=["status", "step", "state", "updated_at"])
+            return _inventory_workflow_envelope(
+                workflow,
+                interaction={
+                    "interaction_type": "workflow_result",
+                    "title": "Purchase order created",
+                    "result": result,
+                },
+            )
+    finally:
+        close_old_connections()
+
+
+def _purchase_order_creation_retry_sync(
+    *, principal: InventoryMcpPrincipal, workflow_id: str
+) -> dict[str, Any]:
+    require_agent_access(principal)
+    close_old_connections()
+    try:
+        workflow = (
+            InventoryMcpWorkflow.objects.filter(
+                id=workflow_id,
+                workflow_type=PURCHASE_ORDER_CREATION_WORKFLOW,
+                user_id=str(principal.user_id),
+                profile_id=principal.profile_id,
+            ).first()
+        )
+        if workflow is None:
+            raise InventoryMcpWorkflow.DoesNotExist("Workflow does not exist or is not accessible.")
+        if workflow.status != InventoryMcpWorkflow.STATUS_FAILED:
+            raise ValueError("Only a failed purchase-order creation workflow can be retried.")
+        draft = dict((workflow.state or {}).get("draft") or {})
+        if not draft:
+            raise ValueError("This workflow has no purchase-order draft to retry.")
+        workflow.status = InventoryMcpWorkflow.STATUS_ACTIVE
+        workflow.step = "awaiting_confirmation"
+        workflow.expires_at = timezone.now() + INVENTORY_WORKFLOW_TTL
+        workflow.state = _inventory_workflow_event(
+            {
+                **(workflow.state or {}),
+                "draft": draft,
+                "confirmation_token": str(uuid.uuid4()),
+                "error": None,
+            },
+            "retry_requested",
+            from_step="failed",
+            to_step="awaiting_confirmation",
+            metadata={"operation": "create_purchase_order"},
+        )
+        workflow.save(update_fields=["status", "step", "expires_at", "state", "updated_at"])
+        return _inventory_workflow_envelope(
+            workflow,
+            interaction={
+                "interaction_type": "confirmation_request",
+                "title": "Retry purchase-order creation",
+                "description": "Retry creating this purchase order as a pending draft?",
+                "action_type": "create_purchase_order",
+                "approve_text": "Create purchase order",
+                "deny_text": "Cancel",
+                "allow_input": False,
+                "purchase_order": draft,
+                "confirmation_token": workflow.state["confirmation_token"],
+            },
+        )
+    finally:
+        close_old_connections()
+
+
+def _purchase_order_line_item_add_start_sync(
+    *, principal: InventoryMcpPrincipal, purchase_order_id: str, payload: dict[str, Any]
+) -> dict[str, Any]:
+    require_agent_access(principal)
+    close_old_connections()
+    try:
+        target_order_id = str(purchase_order_id or "").strip()
+        if not target_order_id:
+            raise ValueError("purchase_order_id is required")
+        if not isinstance(payload, dict) or not payload:
+            raise ValueError("payload must be a non-empty object")
+
+        # Validate the fields exposed by the MCP contract before creating a
+        # durable workflow. The purchase-order serializer remains the source
+        # of truth for workspace, reorder-quantity, and model validation when
+        # the confirmed mutation is applied.
+        normalized = orders_payloads.PurchaseOrderLineItemActionPayload.model_validate(
+            payload
+        ).model_dump(mode="json", exclude_none=True)
+        if not normalized.get("inventory_item_id") and not payload.get("product_variant_id"):
+            raise ValueError("inventory_item_id or product_variant_id is required")
+        if normalized.get("quantity") is None:
+            raise ValueError("quantity is required")
+        if normalized.get("unit_price") is None:
+            raise ValueError("unit_price is required")
+        normalized["product_variant_id"] = str(payload["product_variant_id"]) if payload.get("product_variant_id") else None
+
+        # Resolve the order through the same scoped view path used by the
+        # mutation, so the confirmation preview cannot be created for another
+        # workspace or a missing purchase order.
+        order_result = _purchase_order_admin_action_sync(
+            principal=principal,
+            action="retrieve",
+            method="get",
+            purchase_order_id=target_order_id,
+        )
+        workflow = InventoryMcpWorkflow.objects.create(
+            workflow_type=PURCHASE_ORDER_LINE_ITEM_ADD_WORKFLOW,
+            status=InventoryMcpWorkflow.STATUS_ACTIVE,
+            step="awaiting_confirmation",
+            user_id=str(principal.user_id),
+            profile_id=principal.profile_id,
+            state={
+                "purchase_order_id": target_order_id,
+                "purchase_order": order_result.get("purchase_order") if isinstance(order_result, dict) else order_result,
+                "line_item": normalized,
+                "confirmation_token": str(uuid.uuid4()),
+            },
+            expires_at=timezone.now() + INVENTORY_WORKFLOW_TTL,
+        )
+        workflow.state = _inventory_workflow_event(
+            workflow.state,
+            "created",
+            to_step="awaiting_confirmation",
+            metadata={"operation": "add_purchase_order_line_item"},
+        )
+        workflow.save(update_fields=["state", "updated_at"])
+        return _inventory_workflow_envelope(
+            workflow,
+            interaction={
+                "interaction_type": "confirmation_request",
+                "title": "Review purchase-order line item",
+                "description": "Add this item to the pending purchase order?",
+                "details": "Review the item, quantity, price, and tax before adding it.",
+                "action_type": "add_purchase_order_line_item",
+                "approve_text": "Add line item",
+                "deny_text": "Cancel",
+                "allow_input": False,
+                "purchase_order_id": target_order_id,
+                "purchase_order": workflow.state["purchase_order"],
+                "line_item": normalized,
+                "confirmation_token": workflow.state["confirmation_token"],
+            },
+        )
+    finally:
+        close_old_connections()
+
+
+def _purchase_order_line_item_add_confirm_sync(
+    *, principal: InventoryMcpPrincipal, workflow_id: str, confirmation_token: str
+) -> dict[str, Any]:
+    require_agent_access(principal)
+    close_old_connections()
+    try:
+        with transaction.atomic():
+            workflow = InventoryMcpWorkflow.objects.select_for_update().filter(
+                id=workflow_id,
+                workflow_type=PURCHASE_ORDER_LINE_ITEM_ADD_WORKFLOW,
+                user_id=str(principal.user_id),
+                profile_id=principal.profile_id,
+            ).first()
+            if workflow is None:
+                raise InventoryMcpWorkflow.DoesNotExist("Workflow does not exist or is not accessible.")
+            if workflow.status != InventoryMcpWorkflow.STATUS_ACTIVE or workflow.step != "awaiting_confirmation":
+                raise ValueError("Purchase-order line-item workflow is not awaiting confirmation.")
+            if workflow.expires_at <= timezone.now():
+                workflow.status = InventoryMcpWorkflow.STATUS_FAILED
+                workflow.step = "expired"
+                workflow.state = _inventory_workflow_event(
+                    {**(workflow.state or {}), "confirmation_token": None, "error": "Workflow expired."},
+                    "expired",
+                    from_step="awaiting_confirmation",
+                    to_step="expired",
+                )
+                workflow.save(update_fields=["status", "step", "state", "updated_at"])
+                raise ValueError("Workflow expired. Start a new line-item draft.")
+            if str(confirmation_token or "") != str((workflow.state or {}).get("confirmation_token") or ""):
+                raise ValueError("Invalid or already-used confirmation token.")
+
+            workflow.step = "running"
+            workflow.state = _inventory_workflow_event(
+                {**(workflow.state or {}), "confirmation_token": None},
+                "confirmed",
+                from_step="awaiting_confirmation",
+                to_step="running",
+            )
+            workflow.save(update_fields=["step", "state", "updated_at"])
+            try:
+                result = _purchase_order_line_item_action_sync(
+                    principal=principal,
+                    purchase_order_id=str((workflow.state or {}).get("purchase_order_id") or ""),
+                    action="add_line_item",
+                    method="post",
+                    data=dict((workflow.state or {}).get("line_item") or {}),
+                )
+            except Exception:
+                workflow.status = InventoryMcpWorkflow.STATUS_FAILED
+                workflow.step = "failed"
+                workflow.state = _inventory_workflow_event(
+                    {
+                        **(workflow.state or {}),
+                        "error": {
+                            "code": "purchase_order_line_item_add_failed",
+                            "message": "The purchase-order line item could not be added. Review the item and try again.",
+                            "retryable": True,
+                        },
+                    },
+                    "failed",
+                    from_step="running",
+                    to_step="failed",
+                )
+                workflow.save(update_fields=["status", "step", "state", "updated_at"])
+                return _inventory_workflow_envelope(
+                    workflow,
+                    interaction=_inventory_workflow_failed_interaction(
+                        workflow,
+                        title="Purchase-order line item failed",
+                        description="The line item could not be added. Review the item and try again.",
+                    ),
+                )
+
+            workflow.status = InventoryMcpWorkflow.STATUS_SUCCEEDED
+            workflow.step = "succeeded"
+            workflow.state = _inventory_workflow_event(
+                {**(workflow.state or {}), "result": result},
+                "succeeded",
+                from_step="running",
+                to_step="succeeded",
+            )
+            workflow.save(update_fields=["status", "step", "state", "updated_at"])
+            return _inventory_workflow_envelope(
+                workflow,
+                interaction={
+                    "interaction_type": "workflow_result",
+                    "title": "Purchase-order line item added",
+                    "result": result,
+                },
+            )
+    finally:
+        close_old_connections()
+
+
+def _purchase_order_line_item_add_retry_sync(
+    *, principal: InventoryMcpPrincipal, workflow_id: str
+) -> dict[str, Any]:
+    require_agent_access(principal)
+    close_old_connections()
+    try:
+        workflow = InventoryMcpWorkflow.objects.filter(
+            id=workflow_id,
+            workflow_type=PURCHASE_ORDER_LINE_ITEM_ADD_WORKFLOW,
+            user_id=str(principal.user_id),
+            profile_id=principal.profile_id,
+        ).first()
+        if workflow is None:
+            raise InventoryMcpWorkflow.DoesNotExist("Workflow does not exist or is not accessible.")
+        if workflow.status != InventoryMcpWorkflow.STATUS_FAILED:
+            raise ValueError("Only a failed line-item workflow can be retried.")
+        workflow.status = InventoryMcpWorkflow.STATUS_ACTIVE
+        workflow.step = "awaiting_confirmation"
+        workflow.expires_at = timezone.now() + INVENTORY_WORKFLOW_TTL
+        workflow.state = _inventory_workflow_event(
+            {**(workflow.state or {}), "confirmation_token": str(uuid.uuid4()), "error": None},
+            "retry_requested",
+            from_step="failed",
+            to_step="awaiting_confirmation",
+            metadata={"operation": "add_purchase_order_line_item"},
+        )
+        workflow.save(update_fields=["status", "step", "expires_at", "state", "updated_at"])
+        return _inventory_workflow_envelope(
+            workflow,
+            interaction={
+                "interaction_type": "confirmation_request",
+                "title": "Retry purchase-order line item",
+                "description": "Retry adding this line item to the purchase order?",
+                "action_type": "add_purchase_order_line_item",
+                "approve_text": "Add line item",
+                "deny_text": "Cancel",
+                "allow_input": False,
+                "purchase_order_id": workflow.state.get("purchase_order_id"),
+                "purchase_order": workflow.state.get("purchase_order"),
+                "line_item": workflow.state.get("line_item"),
+                "confirmation_token": workflow.state["confirmation_token"],
+            },
+        )
+    finally:
+        close_old_connections()
+
+
+def _inventory_adjustment_start_sync(*, principal: InventoryMcpPrincipal, inventory_item_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    require_agent_access(principal)
+    close_old_connections()
+    try:
+        item = _inventory_item_queryset(principal=principal).filter(id=inventory_item_id).first()
+        normalized = stock_payloads.InventoryAdjustmentRequestPayload.model_validate(payload or {}).model_dump(mode="json", exclude_none=True)
+        adjustments = normalized.get("adjustments") or []
+        if not adjustments:
+            raise ValueError("At least one adjustment line is required.")
+        if len(adjustments) > 50:
+            raise ValueError("An adjustment workflow may contain at most 50 lines.")
+        normalized_lines: list[dict[str, Any]] = []
+        for index, raw_line in enumerate(adjustments):
+            line = dict(raw_line)
+            target_item_id = str(line.get("inventory_item_id") or (inventory_item_id if index == 0 else "")).strip()
+            if not target_item_id:
+                raise ValueError("Each adjustment line requires inventory_item_id.")
+            target_item = _inventory_item_queryset(principal=principal).filter(id=target_item_id).first()
+            if target_item is None:
+                raise ValueError(f"Inventory item {target_item_id} not found.")
+            line["inventory_item_id"] = target_item_id
+            line["inventory_item_name"] = target_item.name_snapshot
+            normalized_lines.append(line)
+        if item is None and inventory_item_id:
+            raise ValueError("Inventory item not found.")
+        item = _inventory_item_queryset(principal=principal).filter(id=normalized_lines[0]["inventory_item_id"]).first()
+        workflow = InventoryMcpWorkflow.objects.create(workflow_type=INVENTORY_ADJUSTMENT_WORKFLOW, status=InventoryMcpWorkflow.STATUS_ACTIVE, step="awaiting_confirmation", user_id=str(principal.user_id), profile_id=principal.profile_id, state={"inventory_item_id": normalized_lines[0]["inventory_item_id"], "inventory_item_name": item.name_snapshot, "request": normalized, "line": normalized_lines[0], "confirmation_token": str(uuid.uuid4())}, expires_at=timezone.now() + INVENTORY_WORKFLOW_TTL)
+        workflow.state["lines"] = normalized_lines
+        workflow.state["inventory_item_id"] = normalized_lines[0]["inventory_item_id"]
+        workflow.state["inventory_item_name"] = item.name_snapshot
+        workflow.state = _inventory_workflow_event(workflow.state, "created", to_step="awaiting_confirmation", metadata={"operation": "adjust_stock"})
+        workflow.save(update_fields=["state", "updated_at"])
+        return _inventory_workflow_envelope(workflow, interaction={"interaction_type": "confirmation_request", "title": "Review stock adjustments", "description": f"Apply {len(normalized_lines)} stock adjustment(s)?", "details": str(normalized.get("reason") or normalized.get("notes") or "Review every item, location, quantity, and reason before applying."), "action_type": "adjust_stock", "approve_text": "Apply adjustments", "deny_text": "Cancel", "allow_input": False, "adjustment": normalized_lines[0] if len(normalized_lines) == 1 else None, "adjustments": normalized_lines, "confirmation_token": workflow.state["confirmation_token"]})
+    finally:
+        close_old_connections()
+
+
+def _inventory_adjustment_confirm_sync(*, principal: InventoryMcpPrincipal, workflow_id: str, confirmation_token: str) -> dict[str, Any]:
+    require_agent_access(principal)
+    close_old_connections()
+    try:
+        with transaction.atomic():
+            workflow = InventoryMcpWorkflow.objects.select_for_update().filter(id=workflow_id, workflow_type=INVENTORY_ADJUSTMENT_WORKFLOW, user_id=str(principal.user_id), profile_id=principal.profile_id).first()
+            if workflow is None:
+                raise InventoryMcpWorkflow.DoesNotExist("Workflow does not exist or is not accessible.")
+            if workflow.status != InventoryMcpWorkflow.STATUS_ACTIVE or workflow.step != "awaiting_confirmation":
+                raise ValueError("Inventory adjustment workflow is not awaiting confirmation.")
+            if workflow.expires_at <= timezone.now():
+                workflow.status = InventoryMcpWorkflow.STATUS_FAILED
+                workflow.step = "expired"
+                workflow.state = _inventory_workflow_event({**(workflow.state or {}), "confirmation_token": None, "error": "Workflow expired."}, "expired", from_step="awaiting_confirmation", to_step="expired")
+                workflow.save(update_fields=["status", "step", "state", "updated_at"])
+                raise ValueError("Workflow expired. Start a new stock adjustment.")
+            if str(confirmation_token or "") != str((workflow.state or {}).get("confirmation_token") or ""):
+                raise ValueError("Invalid or already-used confirmation token.")
+            workflow.step = "running"
+            workflow.state = _inventory_workflow_event(dict(workflow.state or {}), "confirmed", from_step="awaiting_confirmation", to_step="running")
+            workflow.save(update_fields=["step", "state", "updated_at"])
+            try:
+                request = dict((workflow.state or {}).get("request") or {})
+                request["adjustments"] = list((workflow.state or {}).get("lines") or request.get("adjustments") or [])
+                result = _adjust_inventory_item_stock_via_view_sync(principal=principal, inventory_item_id=str((workflow.state or {}).get("inventory_item_id") or ""), data=request)
+            except Exception:
+                workflow.status = InventoryMcpWorkflow.STATUS_FAILED
+                workflow.step = "failed"
+                workflow.state = _inventory_workflow_event({**(workflow.state or {}), "confirmation_token": None, "error": {"code": "stock_adjustment_failed", "message": "The stock adjustment could not be applied.", "retryable": True}}, "failed", from_step="running", to_step="failed")
+                workflow.save(update_fields=["status", "step", "state", "updated_at"])
+                return _inventory_workflow_envelope(workflow, interaction=_inventory_workflow_failed_interaction(workflow, title="Stock adjustment failed", description="The stock adjustment could not be applied."))
+            workflow.status = InventoryMcpWorkflow.STATUS_SUCCEEDED
+            workflow.step = "succeeded"
+            workflow.state = _inventory_workflow_event({**(workflow.state or {}), "confirmation_token": None, "result": result}, "succeeded", from_step="running", to_step="succeeded")
+            workflow.save(update_fields=["status", "step", "state", "updated_at"])
+            return _inventory_workflow_envelope(workflow, interaction={"interaction_type": "workflow_result", "title": "Stock adjusted", "result": result})
+    finally:
+        close_old_connections()
+
+
+def _inventory_transfer_start_sync(*, principal: InventoryMcpPrincipal, location_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    require_agent_access(principal)
+    close_old_connections()
+    try:
+        normalized = stock_payloads.StockTransferRequestPayload.model_validate(payload or {}).model_dump(mode="json", exclude_none=True)
+        transfers = normalized.get("transfers") or []
+        if not transfers:
+            raise ValueError("At least one transfer line is required.")
+        if len(transfers) > 50:
+            raise ValueError("A transfer workflow may contain at most 50 lines.")
+        normalized_lines: list[dict[str, Any]] = []
+        for index, raw_line in enumerate(transfers):
+            line = dict(raw_line)
+            source_location_id = str(line.get("from_location_id") or (location_id if index == 0 else "")).strip()
+            if source_location_id != str(location_id):
+                raise ValueError("Each transfer line must match location_id.")
+            if not line.get("to_location_id"):
+                raise ValueError("to_location_id is required for every transfer line.")
+            if str(line.get("to_location_id")) == str(location_id):
+                raise ValueError("Source and destination locations must be different.")
+            item = None
+            if line.get("inventory_item_id"):
+                item = _inventory_item_queryset(principal=principal).filter(id=line["inventory_item_id"]).first()
+                if item is None:
+                    raise ValueError(f"Inventory item {line['inventory_item_id']} not found.")
+            line["from_location_id"] = str(location_id)
+            line["inventory_item_name"] = getattr(item, "name_snapshot", "")
+            normalized_lines.append(line)
+        line = normalized_lines[0]
+        item = _inventory_item_queryset(principal=principal).filter(id=line.get("inventory_item_id")).first() if line.get("inventory_item_id") else None
+        workflow = InventoryMcpWorkflow.objects.create(workflow_type=INVENTORY_TRANSFER_WORKFLOW, status=InventoryMcpWorkflow.STATUS_ACTIVE, step="awaiting_confirmation", user_id=str(principal.user_id), profile_id=principal.profile_id, state={"location_id": str(location_id), "inventory_item_id": str(line.get("inventory_item_id") or ""), "inventory_item_name": getattr(item, "name_snapshot", ""), "request": normalized, "line": line, "confirmation_token": str(uuid.uuid4())}, expires_at=timezone.now() + INVENTORY_WORKFLOW_TTL)
+        workflow.state["lines"] = normalized_lines
+        workflow.state = _inventory_workflow_event(workflow.state, "created", to_step="awaiting_confirmation", metadata={"operation": "transfer_stock"})
+        workflow.save(update_fields=["state", "updated_at"])
+        return _inventory_workflow_envelope(workflow, interaction={"interaction_type": "confirmation_request", "title": "Review stock transfers", "description": f"Apply {len(normalized_lines)} stock transfer(s)?", "details": str(normalized.get("reason") or normalized.get("notes") or "Review every item, source, destination, and quantity before applying."), "action_type": "transfer_stock", "approve_text": "Apply transfers", "deny_text": "Cancel", "allow_input": False, "transfer": normalized_lines[0] if len(normalized_lines) == 1 else None, "transfers": normalized_lines, "confirmation_token": workflow.state["confirmation_token"]})
+    finally:
+        close_old_connections()
+
+
+def _inventory_transfer_confirm_sync(*, principal: InventoryMcpPrincipal, workflow_id: str, confirmation_token: str) -> dict[str, Any]:
+    require_agent_access(principal)
+    close_old_connections()
+    try:
+        with transaction.atomic():
+            workflow = InventoryMcpWorkflow.objects.select_for_update().filter(id=workflow_id, workflow_type=INVENTORY_TRANSFER_WORKFLOW, user_id=str(principal.user_id), profile_id=principal.profile_id).first()
+            if workflow is None:
+                raise InventoryMcpWorkflow.DoesNotExist("Workflow does not exist or is not accessible.")
+            if workflow.status != InventoryMcpWorkflow.STATUS_ACTIVE or workflow.step != "awaiting_confirmation":
+                raise ValueError("Inventory transfer workflow is not awaiting confirmation.")
+            if workflow.expires_at <= timezone.now():
+                workflow.status = InventoryMcpWorkflow.STATUS_FAILED
+                workflow.step = "expired"
+                workflow.state = _inventory_workflow_event({**(workflow.state or {}), "confirmation_token": None, "error": "Workflow expired."}, "expired", from_step="awaiting_confirmation", to_step="expired")
+                workflow.save(update_fields=["status", "step", "state", "updated_at"])
+                raise ValueError("Workflow expired. Start a new stock transfer.")
+            if str(confirmation_token or "") != str((workflow.state or {}).get("confirmation_token") or ""):
+                raise ValueError("Invalid or already-used confirmation token.")
+            workflow.step = "running"
+            workflow.state = _inventory_workflow_event(dict(workflow.state or {}), "confirmed", from_step="awaiting_confirmation", to_step="running")
+            workflow.save(update_fields=["step", "state", "updated_at"])
+            try:
+                request = dict((workflow.state or {}).get("request") or {})
+                request["transfers"] = list((workflow.state or {}).get("lines") or request.get("transfers") or [])
+                result = _transfer_stock_via_view_sync(principal=principal, location_id=str((workflow.state or {}).get("location_id") or ""), data=request)
+            except Exception:
+                workflow.status = InventoryMcpWorkflow.STATUS_FAILED
+                workflow.step = "failed"
+                workflow.state = _inventory_workflow_event({**(workflow.state or {}), "confirmation_token": None, "error": {"code": "stock_transfer_failed", "message": "The stock transfer could not be applied.", "retryable": True}}, "failed", from_step="running", to_step="failed")
+                workflow.save(update_fields=["status", "step", "state", "updated_at"])
+                return _inventory_workflow_envelope(workflow, interaction=_inventory_workflow_failed_interaction(workflow, title="Stock transfer failed", description="The stock transfer could not be applied."))
+            workflow.status = InventoryMcpWorkflow.STATUS_SUCCEEDED
+            workflow.step = "succeeded"
+            workflow.state = _inventory_workflow_event({**(workflow.state or {}), "confirmation_token": None, "result": result}, "succeeded", from_step="running", to_step="succeeded")
+            workflow.save(update_fields=["status", "step", "state", "updated_at"])
+            return _inventory_workflow_envelope(workflow, interaction={"interaction_type": "workflow_result", "title": "Stock transferred", "result": result})
+    finally:
+        close_old_connections()
+
+
+def _inventory_workflow_status_sync(*, principal: InventoryMcpPrincipal, workflow_id: str) -> dict[str, Any]:
+    require_agent_access(principal)
+    close_old_connections()
+    try:
+        workflow = InventoryMcpWorkflow.objects.filter(id=workflow_id, user_id=str(principal.user_id), profile_id=principal.profile_id).first()
+        if workflow is None:
+            raise InventoryMcpWorkflow.DoesNotExist("Workflow does not exist or is not accessible.")
+        if workflow.status == InventoryMcpWorkflow.STATUS_ACTIVE and workflow.expires_at <= timezone.now():
+            prior_step = workflow.step
+            workflow.status = InventoryMcpWorkflow.STATUS_FAILED
+            workflow.step = "expired"
+            workflow.state = _inventory_workflow_event({**(workflow.state or {}), "confirmation_token": None, "error": "Workflow expired."}, "expired", from_step=prior_step, to_step="expired")
+            workflow.save(update_fields=["status", "step", "state", "updated_at"])
+        return _inventory_workflow_envelope(workflow)
+    finally:
+        close_old_connections()
+
+
+def _inventory_workflow_cancel_sync(*, principal: InventoryMcpPrincipal, workflow_id: str, reason: str | None = None) -> dict[str, Any]:
+    require_agent_access(principal)
+    close_old_connections()
+    try:
+        with transaction.atomic():
+            workflow = InventoryMcpWorkflow.objects.select_for_update().filter(id=workflow_id, user_id=str(principal.user_id), profile_id=principal.profile_id).first()
+            if workflow is None:
+                raise InventoryMcpWorkflow.DoesNotExist("Workflow does not exist or is not accessible.")
+            if workflow.status != InventoryMcpWorkflow.STATUS_ACTIVE or workflow.step != "awaiting_confirmation":
+                raise ValueError("Only a workflow awaiting confirmation can be cancelled.")
+            prior_step = workflow.step
+            workflow.status = InventoryMcpWorkflow.STATUS_CANCELLED
+            workflow.step = "cancelled"
+            workflow.state = _inventory_workflow_event({**(workflow.state or {}), "confirmation_token": None, "cancellation_reason": reason or "Cancelled by user."}, "cancelled", from_step=prior_step, to_step="cancelled")
+            workflow.save(update_fields=["status", "step", "state", "updated_at"])
+            return _inventory_workflow_envelope(workflow, interaction={"interaction_type": "workflow_cancelled", "title": "Workflow cancelled", "description": "No inventory mutation was applied.", "mutation_applied": False})
+    finally:
+        close_old_connections()
+
+
+def _inventory_workflow_retry_sync(*, principal: InventoryMcpPrincipal, workflow_id: str) -> dict[str, Any]:
+    """Reopen a retryable inventory workflow with a fresh one-time token."""
+    require_agent_access(principal)
+    close_old_connections()
+    try:
+        workflow = InventoryMcpWorkflow.objects.filter(
+            id=workflow_id,
+            user_id=str(principal.user_id),
+            profile_id=principal.profile_id,
+            workflow_type__in={
+                INVENTORY_ADJUSTMENT_WORKFLOW,
+                INVENTORY_TRANSFER_WORKFLOW,
+                INVENTORY_ITEM_CREATION_WORKFLOW,
+                INVENTORY_CATEGORY_CREATION_WORKFLOW,
+                STOCK_LOCATION_CREATION_WORKFLOW,
+                INVENTORY_ITEM_UPDATE_WORKFLOW,
+                INVENTORY_CATEGORY_UPDATE_WORKFLOW,
+                STOCK_LOCATION_UPDATE_WORKFLOW,
+                INVENTORY_ITEM_CONTROLS_UPDATE_WORKFLOW,
+                INVENTORY_ITEM_STATUS_UPDATE_WORKFLOW,
+                PURCHASE_ORDER_RECEIVING_WORKFLOW,
+            },
+        ).first()
+        if workflow is None:
+            raise InventoryMcpWorkflow.DoesNotExist("Workflow does not exist or is not accessible.")
+        if workflow.status != InventoryMcpWorkflow.STATUS_FAILED:
+            raise ValueError("Only a failed inventory workflow can be retried.")
+        error = (workflow.state or {}).get("error")
+        if isinstance(error, dict) and error.get("retryable") is False:
+            raise ValueError("This inventory workflow is not safe to retry.")
+
+        token = str(uuid.uuid4())
+        state = {**(workflow.state or {}), "confirmation_token": token, "error": None}
+        if workflow.workflow_type == INVENTORY_ITEM_CREATION_WORKFLOW:
+            title = "Retry inventory item creation"
+            description = "Retry creating this inventory item definition?"
+            interaction = {
+                "action_type": "create_inventory_item",
+                "approve_text": "Create inventory item",
+                "inventory_item": state.get("draft") or {},
+            }
+        elif workflow.workflow_type == INVENTORY_CATEGORY_CREATION_WORKFLOW:
+            title = "Retry inventory category creation"
+            description = "Retry creating this inventory category?"
+            interaction = {
+                "action_type": "create_inventory_category",
+                "approve_text": "Create inventory category",
+                "draft": state.get("draft") or {},
+            }
+        elif workflow.workflow_type == STOCK_LOCATION_CREATION_WORKFLOW:
+            title = "Retry stock location creation"
+            description = "Retry creating this stock location?"
+            interaction = {
+                "action_type": "create_stock_location",
+                "approve_text": "Create stock location",
+                "draft": state.get("draft") or {},
+            }
+        elif workflow.workflow_type == INVENTORY_ITEM_UPDATE_WORKFLOW:
+            title = "Retry inventory item update"
+            description = "Retry applying this inventory item update?"
+            interaction = {"action_type": "update_inventory_item", "approve_text": "Apply update", "target_id": state.get("target_id"), "draft": state.get("draft") or {}}
+        elif workflow.workflow_type == INVENTORY_CATEGORY_UPDATE_WORKFLOW:
+            title = "Retry inventory category update"
+            description = "Retry applying this inventory category update?"
+            interaction = {"action_type": "update_inventory_category", "approve_text": "Apply update", "target_id": state.get("target_id"), "draft": state.get("draft") or {}}
+        elif workflow.workflow_type == STOCK_LOCATION_UPDATE_WORKFLOW:
+            title = "Retry stock location update"
+            description = "Retry applying this stock location update?"
+            interaction = {"action_type": "update_stock_location", "approve_text": "Apply update", "target_id": state.get("target_id"), "draft": state.get("draft") or {}}
+        elif workflow.workflow_type == INVENTORY_ITEM_CONTROLS_UPDATE_WORKFLOW:
+            title = "Retry inventory control update"
+            description = "Retry applying these inventory control updates?"
+            interaction = {"action_type": "bulk_update_inventory_item_controls", "approve_text": "Apply updates", "draft": state.get("draft") or {}}
+        elif workflow.workflow_type == INVENTORY_ITEM_STATUS_UPDATE_WORKFLOW:
+            title = "Retry inventory status update"
+            description = "Retry applying this inventory item status change?"
+            interaction = {"action_type": "update_inventory_item_status", "approve_text": "Apply status", "target_id": state.get("target_id"), "draft": state.get("draft") or {}}
+        elif workflow.workflow_type == INVENTORY_ADJUSTMENT_WORKFLOW:
+            title = "Retry stock adjustments"
+            description = f"Retry applying {len(state.get('lines') or [state.get('line')])} stock adjustment(s)?"
+            interaction = {
+                "action_type": "adjust_stock",
+                "approve_text": "Apply adjustments",
+                "adjustment": (state.get("lines") or [state.get("line")])[0] if (state.get("lines") or [state.get("line")]) else None,
+                "adjustments": state.get("lines") or [state.get("line")],
+            }
+        elif workflow.workflow_type == INVENTORY_TRANSFER_WORKFLOW:
+            title = "Retry stock transfers"
+            description = f"Retry applying {len(state.get('lines') or [state.get('line')])} stock transfer(s)?"
+            interaction = {
+                "action_type": "transfer_stock",
+                "approve_text": "Apply transfers",
+                "transfer": (state.get("lines") or [state.get("line")])[0] if (state.get("lines") or [state.get("line")]) else None,
+                "transfers": state.get("lines") or [state.get("line")],
+            }
+        else:
+            items = list((state.get("request") or {}).get("items") or [])
+            title = "Retry purchase-order receipt"
+            description = f"Retry receiving {len(items)} item(s) against purchase order {state.get('purchase_order_id')}?"
+            interaction = {
+                "action_type": "receive_purchase_order_items",
+                "approve_text": "Confirm receipt",
+                "items": items,
+                "purchase_order": state.get("purchase_order"),
+            }
+
+        workflow.status = InventoryMcpWorkflow.STATUS_ACTIVE
+        workflow.step = "awaiting_confirmation"
+        workflow.expires_at = timezone.now() + INVENTORY_WORKFLOW_TTL
+        workflow.state = _inventory_workflow_event(
+            state,
+            "retry_requested",
+            from_step="failed",
+            to_step="awaiting_confirmation",
+            metadata={"operation": workflow.workflow_type},
+        )
+        workflow.save(update_fields=["status", "step", "expires_at", "state", "updated_at"])
+        return _inventory_workflow_envelope(
+            workflow,
+            interaction={
+                "interaction_type": "confirmation_request",
+                "title": title,
+                "description": description,
+                "details": "Review the original workflow details before retrying.",
+                "deny_text": "Cancel",
+                "allow_input": False,
+                **interaction,
+                "confirmation_token": token,
+            },
+        )
+    finally:
+        close_old_connections()
+
+
+def _purchase_order_receiving_start_sync(*, principal: InventoryMcpPrincipal, purchase_order_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    require_agent_access(principal)
+    close_old_connections()
+    try:
+        normalized = orders_payloads.PurchaseOrderReceiveItemsPayload.model_validate(payload or {}).model_dump(mode="json", exclude_none=True)
+        items = normalized.get("items") or []
+        if not items:
+            raise ValueError("At least one purchase-order item is required.")
+        if len(items) > 50:
+            raise ValueError("A receipt can contain at most 50 items.")
+        purchase_order = _get_purchase_order_details_sync(principal=principal, purchase_order_id=purchase_order_id)
+        workflow = InventoryMcpWorkflow.objects.create(workflow_type=PURCHASE_ORDER_RECEIVING_WORKFLOW, status=InventoryMcpWorkflow.STATUS_ACTIVE, step="awaiting_confirmation", user_id=str(principal.user_id), profile_id=principal.profile_id, state={"purchase_order_id": str(purchase_order_id), "request": normalized, "purchase_order": purchase_order.get("purchase_order"), "confirmation_token": str(uuid.uuid4())}, expires_at=timezone.now() + INVENTORY_WORKFLOW_TTL)
+        workflow.state = _inventory_workflow_event(workflow.state, "created", to_step="awaiting_confirmation", metadata={"operation": "receive_purchase_order_items", "item_count": len(items)})
+        workflow.save(update_fields=["state", "updated_at"])
+        return _inventory_workflow_envelope(workflow, interaction={"interaction_type": "confirmation_request", "title": "Review purchase-order receipt", "description": f"Receive {len(items)} item(s) against purchase order {purchase_order_id}?", "details": str(normalized.get("notes") or "Review quantities, locations, lots, and expiry dates before receiving."), "action_type": "receive_purchase_order_items", "approve_text": "Confirm receipt", "deny_text": "Cancel", "allow_input": False, "items": items, "confirmation_token": workflow.state["confirmation_token"]})
+    finally:
+        close_old_connections()
+
+
+def _purchase_order_receiving_confirm_sync(*, principal: InventoryMcpPrincipal, workflow_id: str, confirmation_token: str) -> dict[str, Any]:
+    require_agent_access(principal)
+    close_old_connections()
+    try:
+        with transaction.atomic():
+            workflow = InventoryMcpWorkflow.objects.select_for_update().filter(id=workflow_id, workflow_type=PURCHASE_ORDER_RECEIVING_WORKFLOW, user_id=str(principal.user_id), profile_id=principal.profile_id).first()
+            if workflow is None:
+                raise InventoryMcpWorkflow.DoesNotExist("Workflow does not exist or is not accessible.")
+            if workflow.status != InventoryMcpWorkflow.STATUS_ACTIVE or workflow.step != "awaiting_confirmation":
+                raise ValueError("Purchase-order receiving workflow is not awaiting confirmation.")
+            if workflow.expires_at <= timezone.now():
+                workflow.status = InventoryMcpWorkflow.STATUS_FAILED
+                workflow.step = "expired"
+                workflow.state = _inventory_workflow_event({**(workflow.state or {}), "confirmation_token": None, "error": "Workflow expired."}, "expired", from_step="awaiting_confirmation", to_step="expired")
+                workflow.save(update_fields=["status", "step", "state", "updated_at"])
+                raise ValueError("Workflow expired. Start a new receipt.")
+            if str(confirmation_token or "") != str((workflow.state or {}).get("confirmation_token") or ""):
+                raise ValueError("Invalid or already-used confirmation token.")
+            workflow.step = "running"
+            workflow.state = _inventory_workflow_event(dict(workflow.state or {}), "confirmed", from_step="awaiting_confirmation", to_step="running")
+            workflow.save(update_fields=["step", "state", "updated_at"])
+            try:
+                result = _purchase_order_action_sync(principal=principal, purchase_order_id=str((workflow.state or {}).get("purchase_order_id")), action="receive_items", data=dict((workflow.state or {}).get("request") or {}))
+            except Exception:
+                workflow.status = InventoryMcpWorkflow.STATUS_FAILED
+                workflow.step = "failed"
+                workflow.state = _inventory_workflow_event({**(workflow.state or {}), "confirmation_token": None, "error": {"code": "purchase_order_receipt_failed", "message": "The purchase-order receipt could not be applied.", "retryable": True}}, "failed", from_step="running", to_step="failed")
+                workflow.save(update_fields=["status", "step", "state", "updated_at"])
+                return _inventory_workflow_envelope(workflow, interaction=_inventory_workflow_failed_interaction(workflow, title="Purchase-order receipt failed", description="The purchase-order receipt could not be applied."))
+            workflow.status = InventoryMcpWorkflow.STATUS_SUCCEEDED
+            workflow.step = "succeeded"
+            workflow.state = _inventory_workflow_event({**(workflow.state or {}), "confirmation_token": None, "result": result}, "succeeded", from_step="running", to_step="succeeded")
+            workflow.save(update_fields=["status", "step", "state", "updated_at"])
+            return _inventory_workflow_envelope(workflow, interaction={"interaction_type": "workflow_result", "title": "Receipt completed", "result": result})
+    finally:
+        close_old_connections()
 
 
 def _create_stock_reservation_via_view_sync(
@@ -2793,12 +4177,12 @@ def _purchase_order_admin_action_sync(
 
 def _build_transport_security_settings() -> TransportSecuritySettings:
     allowed_hosts = ["127.0.0.1:*", "localhost:*", "[::1]:*"]
-    allowed_hosts.extend(_parse_csv(os.getenv("INVENTORY_MCP_ALLOWED_HOSTS") or os.getenv("ALLOWED_HOSTS")))
+    for value in (os.getenv("INVENTORY_MCP_ALLOWED_HOSTS"), os.getenv("ALLOWED_HOSTS")):
+        allowed_hosts.extend(_parse_csv(value))
 
     allowed_origins = ["http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*"]
-    allowed_origins.extend(
-        _parse_csv(os.getenv("INVENTORY_MCP_ALLOWED_ORIGINS") or os.getenv("CORS_ALLOWED_ORIGINS"))
-    )
+    for value in (os.getenv("INVENTORY_MCP_ALLOWED_ORIGINS"), os.getenv("CORS_ALLOWED_ORIGINS")):
+        allowed_origins.extend(_parse_csv(value))
 
     return TransportSecuritySettings(
         enable_dns_rebinding_protection=True,
@@ -2826,6 +4210,255 @@ mcp = FastMCP(
     streamable_http_path="/",
     transport_security=_build_transport_security_settings(),
 )
+
+
+@mcp.tool(name="start_purchase_order_creation_workflow", description="Validate and preview a purchase-order draft before creating it as a pending order.")
+async def start_purchase_order_creation_workflow(payload: dict[str, Any]) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    if not isinstance(payload, dict):
+        raise ValueError("payload must be an object")
+    return await sync_to_async(_purchase_order_creation_start_sync, thread_sensitive=True)(
+        principal=principal,
+        payload=payload,
+    )
+
+
+@mcp.tool(name="confirm_purchase_order_creation_workflow", description="Create an approved purchase-order draft exactly once using its confirmation token.")
+async def confirm_purchase_order_creation_workflow(workflow_id: str, confirmation_token: str) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    return await sync_to_async(_purchase_order_creation_confirm_sync, thread_sensitive=True)(
+        principal=principal,
+        workflow_id=str(workflow_id or "").strip(),
+        confirmation_token=confirmation_token,
+    )
+
+
+@mcp.tool(name="retry_purchase_order_creation_workflow", description="Retry a failed purchase-order creation workflow with a fresh confirmation token.")
+async def retry_purchase_order_creation_workflow(workflow_id: str) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    return await sync_to_async(_purchase_order_creation_retry_sync, thread_sensitive=True)(
+        principal=principal,
+        workflow_id=str(workflow_id or "").strip(),
+    )
+
+
+@mcp.tool(name="start_purchase_order_line_item_workflow", description="Preview and confirm adding a line item to a pending purchase order.")
+async def start_purchase_order_line_item_workflow(purchase_order_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    target_id = str(purchase_order_id or "").strip()
+    if not target_id:
+        raise ValueError("purchase_order_id is required")
+    return await sync_to_async(_purchase_order_line_item_add_start_sync, thread_sensitive=True)(
+        principal=principal,
+        purchase_order_id=target_id,
+        payload=payload or {},
+    )
+
+
+@mcp.tool(name="confirm_purchase_order_line_item_workflow", description="Add an approved purchase-order line item exactly once using its confirmation token.")
+async def confirm_purchase_order_line_item_workflow(workflow_id: str, confirmation_token: str) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    return await sync_to_async(_purchase_order_line_item_add_confirm_sync, thread_sensitive=True)(
+        principal=principal,
+        workflow_id=str(workflow_id or "").strip(),
+        confirmation_token=confirmation_token,
+    )
+
+
+@mcp.tool(name="retry_purchase_order_line_item_workflow", description="Retry a failed purchase-order line-item workflow with a fresh confirmation token.")
+async def retry_purchase_order_line_item_workflow(workflow_id: str) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    return await sync_to_async(_purchase_order_line_item_add_retry_sync, thread_sensitive=True)(
+        principal=principal,
+        workflow_id=str(workflow_id or "").strip(),
+    )
+
+
+@mcp.tool(name="start_inventory_adjustment_workflow", description="Validate and preview a stock adjustment before applying it to an inventory item.")
+async def start_inventory_adjustment_workflow(inventory_item_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    target_id = str(inventory_item_id or "").strip()
+    if not target_id:
+        raise ValueError("inventory_item_id is required")
+    return await sync_to_async(_inventory_adjustment_start_sync, thread_sensitive=True)(principal=principal, inventory_item_id=target_id, payload=payload or {})
+
+
+@mcp.tool(name="start_inventory_item_creation_workflow", description="Validate and preview an inventory item definition before creating it.")
+async def start_inventory_item_creation_workflow(payload: dict[str, Any]) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    if not isinstance(payload, dict):
+        raise ValueError("payload must be an object")
+    return await sync_to_async(_inventory_item_creation_start_sync, thread_sensitive=True)(
+        principal=principal,
+        payload=payload,
+    )
+
+
+@mcp.tool(name="confirm_inventory_item_creation_workflow", description="Create an approved inventory item definition exactly once using its confirmation token.")
+async def confirm_inventory_item_creation_workflow(workflow_id: str, confirmation_token: str) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    return await sync_to_async(_inventory_item_creation_confirm_sync, thread_sensitive=True)(
+        principal=principal,
+        workflow_id=str(workflow_id or "").strip(),
+        confirmation_token=confirmation_token,
+    )
+
+
+@mcp.tool(name="retry_inventory_item_creation_workflow", description="Retry a failed inventory item creation workflow with a fresh confirmation token.")
+async def retry_inventory_item_creation_workflow(workflow_id: str) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    return await sync_to_async(_inventory_workflow_retry_sync, thread_sensitive=True)(
+        principal=principal,
+        workflow_id=str(workflow_id or "").strip(),
+    )
+
+
+@mcp.tool(name="start_inventory_category_creation_workflow", description="Validate and preview an inventory category before creating it.")
+async def start_inventory_category_creation_workflow(payload: dict[str, Any]) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    if not isinstance(payload, dict):
+        raise ValueError("payload must be an object")
+    return await sync_to_async(_inventory_setup_creation_start_sync, thread_sensitive=True)(
+        principal=principal,
+        payload=payload,
+        workflow_type=INVENTORY_CATEGORY_CREATION_WORKFLOW,
+        payload_model=inventory_payloads.InventoryCategoryCreateUpdatePayload,
+        action_type="create_inventory_category",
+        title="Review inventory category",
+        description="Create this inventory category?",
+        details="Review the category name, hierarchy, structural setting, and default location before creating it.",
+    )
+
+
+@mcp.tool(name="confirm_inventory_category_creation_workflow", description="Create an approved inventory category exactly once using its confirmation token.")
+async def confirm_inventory_category_creation_workflow(workflow_id: str, confirmation_token: str) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    return await sync_to_async(_inventory_setup_creation_confirm_sync, thread_sensitive=True)(
+        principal=principal,
+        workflow_id=str(workflow_id or "").strip(),
+        confirmation_token=confirmation_token,
+        workflow_type=INVENTORY_CATEGORY_CREATION_WORKFLOW,
+        action_type="create_inventory_category",
+        action_sync=_inventory_category_action_sync,
+        result_key="category",
+        success_title="Inventory category created",
+    )
+
+
+@mcp.tool(name="retry_inventory_category_creation_workflow", description="Retry a failed inventory category creation workflow with a fresh confirmation token.")
+async def retry_inventory_category_creation_workflow(workflow_id: str) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    return await sync_to_async(_inventory_workflow_retry_sync, thread_sensitive=True)(
+        principal=principal,
+        workflow_id=str(workflow_id or "").strip(),
+    )
+
+
+@mcp.tool(name="start_stock_location_creation_workflow", description="Validate and preview a stock location before creating it.")
+async def start_stock_location_creation_workflow(payload: dict[str, Any]) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    if not isinstance(payload, dict):
+        raise ValueError("payload must be an object")
+    return await sync_to_async(_inventory_setup_creation_start_sync, thread_sensitive=True)(
+        principal=principal,
+        payload=payload,
+        workflow_type=STOCK_LOCATION_CREATION_WORKFLOW,
+        payload_model=stock_payloads.StockLocationCreateUpdatePayload,
+        action_type="create_stock_location",
+        title="Review stock location",
+        description="Create this stock location?",
+        details="Review the location name, code, hierarchy, type, and address before creating it.",
+    )
+
+
+@mcp.tool(name="confirm_stock_location_creation_workflow", description="Create an approved stock location exactly once using its confirmation token.")
+async def confirm_stock_location_creation_workflow(workflow_id: str, confirmation_token: str) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    return await sync_to_async(_inventory_setup_creation_confirm_sync, thread_sensitive=True)(
+        principal=principal,
+        workflow_id=str(workflow_id or "").strip(),
+        confirmation_token=confirmation_token,
+        workflow_type=STOCK_LOCATION_CREATION_WORKFLOW,
+        action_type="create_stock_location",
+        action_sync=_stock_location_action_sync,
+        result_key="location",
+        success_title="Stock location created",
+    )
+
+
+@mcp.tool(name="retry_stock_location_creation_workflow", description="Retry a failed stock location creation workflow with a fresh confirmation token.")
+async def retry_stock_location_creation_workflow(workflow_id: str) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    return await sync_to_async(_inventory_workflow_retry_sync, thread_sensitive=True)(
+        principal=principal,
+        workflow_id=str(workflow_id or "").strip(),
+    )
+
+
+@mcp.tool(name="confirm_inventory_adjustment_workflow", description="Apply an approved inventory adjustment exactly once using its confirmation token.")
+async def confirm_inventory_adjustment_workflow(workflow_id: str, confirmation_token: str) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    return await sync_to_async(_inventory_adjustment_confirm_sync, thread_sensitive=True)(principal=principal, workflow_id=str(workflow_id or "").strip(), confirmation_token=confirmation_token)
+
+
+@mcp.tool(name="retry_inventory_adjustment_workflow", description="Retry a failed inventory adjustment workflow with a fresh confirmation token.")
+async def retry_inventory_adjustment_workflow(workflow_id: str) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    return await sync_to_async(_inventory_workflow_retry_sync, thread_sensitive=True)(principal=principal, workflow_id=str(workflow_id or "").strip())
+
+
+@mcp.tool(name="start_inventory_transfer_workflow", description="Validate and preview a stock transfer before applying it between locations.")
+async def start_inventory_transfer_workflow(location_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    target_id = str(location_id or "").strip()
+    if not target_id:
+        raise ValueError("location_id is required")
+    return await sync_to_async(_inventory_transfer_start_sync, thread_sensitive=True)(principal=principal, location_id=target_id, payload=payload or {})
+
+
+@mcp.tool(name="confirm_inventory_transfer_workflow", description="Apply an approved stock transfer exactly once using its confirmation token.")
+async def confirm_inventory_transfer_workflow(workflow_id: str, confirmation_token: str) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    return await sync_to_async(_inventory_transfer_confirm_sync, thread_sensitive=True)(principal=principal, workflow_id=str(workflow_id or "").strip(), confirmation_token=confirmation_token)
+
+
+@mcp.tool(name="retry_inventory_transfer_workflow", description="Retry a failed inventory transfer workflow with a fresh confirmation token.")
+async def retry_inventory_transfer_workflow(workflow_id: str) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    return await sync_to_async(_inventory_workflow_retry_sync, thread_sensitive=True)(principal=principal, workflow_id=str(workflow_id or "").strip())
+
+
+@mcp.tool(name="get_inventory_workflow_status", description="Retrieve a scoped inventory workflow so an agent can reconnect or resume the conversation.")
+async def get_inventory_workflow_status(workflow_id: str) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    return await sync_to_async(_inventory_workflow_status_sync, thread_sensitive=True)(principal=principal, workflow_id=str(workflow_id or "").strip())
+
+
+@mcp.tool(name="cancel_inventory_workflow", description="Cancel an inventory workflow that is awaiting confirmation without applying a mutation.")
+async def cancel_inventory_workflow(workflow_id: str, reason: str | None = None) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    return await sync_to_async(_inventory_workflow_cancel_sync, thread_sensitive=True)(principal=principal, workflow_id=str(workflow_id or "").strip(), reason=reason)
+
+
+@mcp.tool(name="start_purchase_order_receiving_workflow", description="Preview purchase-order items for receiving before changing stock and purchase-order state.")
+async def start_purchase_order_receiving_workflow(purchase_order_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    target_id = str(purchase_order_id or "").strip()
+    if not target_id:
+        raise ValueError("purchase_order_id is required")
+    return await sync_to_async(_purchase_order_receiving_start_sync, thread_sensitive=True)(principal=principal, purchase_order_id=target_id, payload=payload or {})
+
+
+@mcp.tool(name="confirm_purchase_order_receiving_workflow", description="Apply an approved purchase-order receipt exactly once using its confirmation token.")
+async def confirm_purchase_order_receiving_workflow(workflow_id: str, confirmation_token: str) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    return await sync_to_async(_purchase_order_receiving_confirm_sync, thread_sensitive=True)(principal=principal, workflow_id=str(workflow_id or "").strip(), confirmation_token=confirmation_token)
+
+
+@mcp.tool(name="retry_purchase_order_receiving_workflow", description="Retry a failed purchase-order receiving workflow with a fresh confirmation token.")
+async def retry_purchase_order_receiving_workflow(workflow_id: str) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    return await sync_to_async(_inventory_workflow_retry_sync, thread_sensitive=True)(principal=principal, workflow_id=str(workflow_id or "").strip())
 
 @mcp.tool(
     name="list_inventory_items",
@@ -3618,7 +5251,9 @@ async def adjust_inventory_item_stock(
     payload: stock_payloads.InventoryAdjustmentRequestPayload,
 ) -> stock_payloads.StockAdjustmentResultPayload:
     principal = get_current_principal(required=True)
-    target_id = str(inventory_item_id or "").strip()
+    payload_data = _payload_to_data(payload) or {}
+    first_line = (payload_data.get("adjustments") or [{}])[0]
+    target_id = str(inventory_item_id or first_line.get("inventory_item_id") or "").strip()
     if not target_id:
         raise ValueError("inventory_item_id is required")
     if not payload:
@@ -3626,7 +5261,7 @@ async def adjust_inventory_item_stock(
     return await sync_to_async(_adjust_inventory_item_stock_via_view_sync, thread_sensitive=True)(
         principal=principal,
         inventory_item_id=target_id,
-        data=_payload_to_data(payload),
+        data=payload_data,
     )
 
 
@@ -3639,7 +5274,9 @@ async def transfer_location_stock(
     payload: stock_payloads.StockTransferRequestPayload,
 ) -> stock_payloads.StockTransferResultPayload:
     principal = get_current_principal(required=True)
-    target_id = str(location_id or "").strip()
+    payload_data = _payload_to_data(payload) or {}
+    first_line = (payload_data.get("transfers") or [{}])[0]
+    target_id = str(location_id or first_line.get("from_location_id") or "").strip()
     if not target_id:
         raise ValueError("location_id is required")
     if not payload:
@@ -3647,7 +5284,7 @@ async def transfer_location_stock(
     return await sync_to_async(_transfer_stock_via_view_sync, thread_sensitive=True)(
         principal=principal,
         location_id=target_id,
-        data=_payload_to_data(payload),
+        data=payload_data,
     )
 
 
@@ -3923,6 +5560,35 @@ async def update_inventory_category(
         data=_payload_to_data(payload),
     )
 
+
+@mcp.tool(name="start_inventory_category_update_workflow", description="Validate and preview an inventory category update before applying it.")
+async def start_inventory_category_update_workflow(category_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    return await sync_to_async(_inventory_setup_update_start_sync, thread_sensitive=True)(
+        principal=principal, target_id=str(category_id or "").strip(), payload=payload or {},
+        workflow_type=INVENTORY_CATEGORY_UPDATE_WORKFLOW,
+        payload_model=inventory_payloads.InventoryCategoryCreateUpdatePayload,
+        action_type="update_inventory_category", target_key="category_id",
+        title="Review inventory category update", description="Apply this inventory category update?",
+    )
+
+
+@mcp.tool(name="confirm_inventory_category_update_workflow", description="Apply an approved inventory category update exactly once using its confirmation token.")
+async def confirm_inventory_category_update_workflow(workflow_id: str, confirmation_token: str) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    return await sync_to_async(_inventory_setup_update_confirm_sync, thread_sensitive=True)(
+        principal=principal, workflow_id=str(workflow_id or "").strip(), confirmation_token=confirmation_token,
+        workflow_type=INVENTORY_CATEGORY_UPDATE_WORKFLOW, action_type="update_inventory_category",
+        action_sync=_inventory_category_action_sync, target_key="category_id", result_key="category",
+        success_title="Inventory category updated",
+    )
+
+
+@mcp.tool(name="retry_inventory_category_update_workflow", description="Retry a failed inventory category update with a fresh confirmation token.")
+async def retry_inventory_category_update_workflow(workflow_id: str) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    return await sync_to_async(_inventory_workflow_retry_sync, thread_sensitive=True)(principal=principal, workflow_id=str(workflow_id or "").strip())
+
 @mcp.tool(
     name="create_inventory_item",
     description="Create an inventory item definition. Payload should match the backend create schema.",
@@ -3965,6 +5631,35 @@ async def update_inventory_item(
     )
 
 
+@mcp.tool(name="start_inventory_item_update_workflow", description="Validate and preview an inventory item update before applying it.")
+async def start_inventory_item_update_workflow(inventory_item_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    return await sync_to_async(_inventory_setup_update_start_sync, thread_sensitive=True)(
+        principal=principal, target_id=str(inventory_item_id or "").strip(), payload=payload or {},
+        workflow_type=INVENTORY_ITEM_UPDATE_WORKFLOW,
+        payload_model=inventory_payloads.InventoryItemUpdatePayload,
+        action_type="update_inventory_item", target_key="inventory_item_id",
+        title="Review inventory item update", description="Apply this inventory item update?",
+    )
+
+
+@mcp.tool(name="confirm_inventory_item_update_workflow", description="Apply an approved inventory item update exactly once using its confirmation token.")
+async def confirm_inventory_item_update_workflow(workflow_id: str, confirmation_token: str) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    return await sync_to_async(_inventory_setup_update_confirm_sync, thread_sensitive=True)(
+        principal=principal, workflow_id=str(workflow_id or "").strip(), confirmation_token=confirmation_token,
+        workflow_type=INVENTORY_ITEM_UPDATE_WORKFLOW, action_type="update_inventory_item",
+        action_sync=_inventory_item_crud_action_sync, target_key="inventory_item_id", result_key="inventory_item",
+        success_title="Inventory item updated",
+    )
+
+
+@mcp.tool(name="retry_inventory_item_update_workflow", description="Retry a failed inventory item update with a fresh confirmation token.")
+async def retry_inventory_item_update_workflow(workflow_id: str) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    return await sync_to_async(_inventory_workflow_retry_sync, thread_sensitive=True)(principal=principal, workflow_id=str(workflow_id or "").strip())
+
+
 @mcp.tool(
     name="bulk_update_inventory_item_controls",
     description="Bulk update stock-control thresholds and tracking flags across inventory items.",
@@ -3979,6 +5674,36 @@ async def bulk_update_inventory_item_controls(
         principal=principal,
         data=_payload_to_data(payload),
     )
+
+
+@mcp.tool(name="start_inventory_item_controls_update_workflow", description="Validate and preview bulk inventory stock-control updates before applying them.")
+async def start_inventory_item_controls_update_workflow(payload: dict[str, Any]) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    return await sync_to_async(_inventory_setup_update_start_sync, thread_sensitive=True)(
+        principal=principal, target_id=None, payload=payload or {},
+        workflow_type=INVENTORY_ITEM_CONTROLS_UPDATE_WORKFLOW,
+        payload_model=inventory_payloads.BulkInventoryItemControlsPayload,
+        action_type="bulk_update_inventory_item_controls", target_key=None,
+        title="Review inventory control updates", description="Apply these inventory stock-control updates?",
+        action_name="bulk_update_controls", action_method="post",
+    )
+
+
+@mcp.tool(name="confirm_inventory_item_controls_update_workflow", description="Apply approved bulk inventory stock-control updates exactly once using its confirmation token.")
+async def confirm_inventory_item_controls_update_workflow(workflow_id: str, confirmation_token: str) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    return await sync_to_async(_inventory_setup_update_confirm_sync, thread_sensitive=True)(
+        principal=principal, workflow_id=str(workflow_id or "").strip(), confirmation_token=confirmation_token,
+        workflow_type=INVENTORY_ITEM_CONTROLS_UPDATE_WORKFLOW, action_type="bulk_update_inventory_item_controls",
+        action_sync=_bulk_update_inventory_item_controls_sync, target_key=None, result_key="controls",
+        success_title="Inventory controls updated",
+    )
+
+
+@mcp.tool(name="retry_inventory_item_controls_update_workflow", description="Retry a failed bulk inventory control update with a fresh confirmation token.")
+async def retry_inventory_item_controls_update_workflow(workflow_id: str) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    return await sync_to_async(_inventory_workflow_retry_sync, thread_sensitive=True)(principal=principal, workflow_id=str(workflow_id or "").strip())
 
 
 @mcp.tool(
@@ -4022,6 +5747,35 @@ async def update_stock_location(
     )
 
 
+@mcp.tool(name="start_stock_location_update_workflow", description="Validate and preview a stock-location update before applying it.")
+async def start_stock_location_update_workflow(location_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    return await sync_to_async(_inventory_setup_update_start_sync, thread_sensitive=True)(
+        principal=principal, target_id=str(location_id or "").strip(), payload=payload or {},
+        workflow_type=STOCK_LOCATION_UPDATE_WORKFLOW,
+        payload_model=stock_payloads.StockLocationCreateUpdatePayload,
+        action_type="update_stock_location", target_key="location_id",
+        title="Review stock location update", description="Apply this stock-location update?",
+    )
+
+
+@mcp.tool(name="confirm_stock_location_update_workflow", description="Apply an approved stock-location update exactly once using its confirmation token.")
+async def confirm_stock_location_update_workflow(workflow_id: str, confirmation_token: str) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    return await sync_to_async(_inventory_setup_update_confirm_sync, thread_sensitive=True)(
+        principal=principal, workflow_id=str(workflow_id or "").strip(), confirmation_token=confirmation_token,
+        workflow_type=STOCK_LOCATION_UPDATE_WORKFLOW, action_type="update_stock_location",
+        action_sync=_stock_location_action_sync, target_key="location_id", result_key="location",
+        success_title="Stock location updated",
+    )
+
+
+@mcp.tool(name="retry_stock_location_update_workflow", description="Retry a failed stock-location update with a fresh confirmation token.")
+async def retry_stock_location_update_workflow(workflow_id: str) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    return await sync_to_async(_inventory_workflow_retry_sync, thread_sensitive=True)(principal=principal, workflow_id=str(workflow_id or "").strip())
+
+
 @mcp.tool(
     name="get_inventory_item_tracking_history",
     description="Get the full movement history for an inventory item.",
@@ -4062,6 +5816,46 @@ async def update_inventory_item_status(
         inventory_item_id=target_id,
         data=_payload_to_data(payload),
     )
+
+
+@mcp.tool(name="start_inventory_item_status_update_workflow", description="Validate and preview an inventory item status change before applying it.")
+async def start_inventory_item_status_update_workflow(inventory_item_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    return await sync_to_async(_inventory_setup_update_start_sync, thread_sensitive=True)(
+        principal=principal,
+        target_id=str(inventory_item_id or "").strip(),
+        payload=payload or {},
+        workflow_type=INVENTORY_ITEM_STATUS_UPDATE_WORKFLOW,
+        payload_model=stock_payloads.StockStatusUpdatePayload,
+        action_type="update_inventory_item_status",
+        target_key="inventory_item_id",
+        title="Review inventory status update",
+        description="Apply this inventory item status change?",
+        action_name="update_status",
+        action_method="post",
+    )
+
+
+@mcp.tool(name="confirm_inventory_item_status_update_workflow", description="Apply an approved inventory item status change exactly once using its confirmation token.")
+async def confirm_inventory_item_status_update_workflow(workflow_id: str, confirmation_token: str) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    return await sync_to_async(_inventory_setup_update_confirm_sync, thread_sensitive=True)(
+        principal=principal,
+        workflow_id=str(workflow_id or "").strip(),
+        confirmation_token=confirmation_token,
+        workflow_type=INVENTORY_ITEM_STATUS_UPDATE_WORKFLOW,
+        action_type="update_inventory_item_status",
+        action_sync=_inventory_item_action_sync,
+        target_key="inventory_item_id",
+        result_key="inventory_item",
+        success_title="Inventory item status updated",
+    )
+
+
+@mcp.tool(name="retry_inventory_item_status_update_workflow", description="Retry a failed inventory item status change with a fresh confirmation token.")
+async def retry_inventory_item_status_update_workflow(workflow_id: str) -> dict[str, Any]:
+    principal = get_current_principal(required=True)
+    return await sync_to_async(_inventory_workflow_retry_sync, thread_sensitive=True)(principal=principal, workflow_id=str(workflow_id or "").strip())
 
 
 @mcp.tool(
